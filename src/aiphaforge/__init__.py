@@ -1,8 +1,8 @@
 """
-Backtest Module
-===============
+AIphaForge
+==========
 
-Provides a complete backtest engine and performance analysis toolkit.
+A high-performance backtest engine for AI agent-driven quantitative trading.
 
 Contents:
 ---------
@@ -12,7 +12,7 @@ Contents:
 
 Quick Start:
 ------------
->>> from backtest import BacktestEngine, ChinaAShareFeeModel
+>>> from aiphaforge import BacktestEngine, ChinaAShareFeeModel
 >>> engine = BacktestEngine(
 ...     fee_model=ChinaAShareFeeModel(),
 ...     initial_capital=100000,
@@ -24,13 +24,13 @@ Quick Start:
 
 Using ML model signals:
 -----------------------
->>> from backtest import backtest
+>>> from aiphaforge import backtest
 >>> signals = model.predict(features)  # pd.Series {1, -1, 0}
 >>> results = backtest(data, signals=signals, fee_model='china')
 
 Fee Models:
 -----------
->>> from backtest import (
+>>> from aiphaforge import (
 ...     SimpleFeeModel,
 ...     USStockFeeModel,
 ...     ChinaAShareFeeModel,
@@ -43,7 +43,7 @@ Fee Models:
 
 Performance Analysis:
 --------------------
->>> from backtest import PerformanceAnalyzer, analyze, compare_strategies
+>>> from aiphaforge import PerformanceAnalyzer, analyze, compare_strategies
 >>> analyzer = PerformanceAnalyzer(results)
 >>> print(analyzer.summary())
 >>> report = analyzer.generate_report()

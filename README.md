@@ -1,16 +1,16 @@
-# Backtest Engine
+# AIphaForge
 
 A high-performance backtest engine designed for AI agent-driven quantitative trading systems.
 
 ## Overview
 
-This engine is purpose-built for backtesting trading strategies controlled by AI agents (LLM-based meta-controllers). Unlike traditional backtest frameworks that assume deterministic strategies, this engine provides the infrastructure needed to evaluate agent-based decision systems where:
+AIphaForge is purpose-built for backtesting trading strategies controlled by AI agents (LLM-based meta-controllers). Unlike traditional backtest frameworks that assume deterministic strategies, this engine provides the infrastructure needed to evaluate agent-based decision systems where:
 
 - **Decisions are non-deterministic** — the same market state may produce different agent outputs
 - **Decisions have latency** — LLM inference takes seconds to minutes, not milliseconds
 - **Knowledge leakage is a risk** — LLMs may "remember" historical events from training data
 
-The engine also works perfectly well as a general-purpose backtest framework for traditional rule-based and ML strategies.
+AIphaForge also works perfectly well as a general-purpose backtest framework for traditional rule-based and ML strategies.
 
 ## Features
 
@@ -36,7 +36,7 @@ The engine also works perfectly well as a general-purpose backtest framework for
 ## Quick Start
 
 ```python
-from backtest import BacktestEngine, backtest
+from aiphaforge import BacktestEngine, backtest
 
 # Option 1: Using the convenience function
 result = backtest(
@@ -63,7 +63,7 @@ result = engine.run(data)
 ### Using with an AI Agent
 
 ```python
-from backtest import BacktestEngine, BacktestHook, HookContext
+from aiphaforge import BacktestEngine, BacktestHook, HookContext
 
 class AgentHook(BacktestHook):
     def __init__(self, agent, trigger_interval=20):
@@ -85,7 +85,7 @@ engine = BacktestEngine(
 ## Installation
 
 ```bash
-pip install -e .
+pip install aiphaforge
 ```
 
 ### Requirements
@@ -97,7 +97,7 @@ pip install -e .
 ## Project Structure
 
 ```
-src/backtest/
+src/aiphaforge/
 ├── engine.py          # Main backtest engine (vectorized + event-driven)
 ├── broker.py          # Order execution and fill simulation
 ├── portfolio.py       # Position and cash tracking
@@ -120,7 +120,7 @@ src/backtest/
 | `ZeroFeeModel` | Testing | No fees |
 
 ```python
-from backtest import get_fee_model
+from aiphaforge import get_fee_model
 
 fee_model = get_fee_model('china')
 fee_model = get_fee_model('crypto', maker_fee=0.0008, taker_fee=0.001)
@@ -145,7 +145,7 @@ engine = BacktestEngine(mode='event_driven', fill_model=FillModel.NEXT_BAR_OPEN)
 ## Performance Analysis
 
 ```python
-from backtest import PerformanceAnalyzer, compare_strategies
+from aiphaforge import PerformanceAnalyzer, compare_strategies
 
 analyzer = PerformanceAnalyzer(result)
 print(analyzer.summary())
