@@ -54,6 +54,7 @@ Performance Analysis:
 """
 
 from .broker import Broker, FillModel, SimpleBroker, SlippageModel
+from .config import BacktestConfig
 from .costs import BaseTradeCost, DefaultTradeCost
 from .engine import BacktestEngine, ExecutionMode, PositionSizing, backtest
 from .exit_rules import BaseExitRule, PercentageStopLoss, PercentageTakeProfit
@@ -137,6 +138,9 @@ __all__ = [
     # Hooks
     'HookContext',
     'BacktestHook',
+
+    # Config
+    'BacktestConfig',
 
     # Risk management
     'BaseRiskManager',
