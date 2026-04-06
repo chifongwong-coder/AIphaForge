@@ -9,7 +9,7 @@ They can be used for async triggering, real-time monitoring, logging, etc.
 
 When no hooks are registered, the engine behaves identically to the original code.
 """
-from abc import ABC, abstractmethod
+from abc import ABC
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional, Dict, Any, List
@@ -31,6 +31,7 @@ class HookContext:
         data: All historical data up to and including the current bar.
         portfolio: Current portfolio state.
         symbol: Instrument symbol.
+        broker: Broker instance (typed as Any to avoid coupling).
     """
     bar_index: int
     timestamp: datetime
@@ -38,14 +39,17 @@ class HookContext:
     data: pd.DataFrame
     portfolio: Portfolio
     symbol: str
+    broker: Any = None
 
 
 class BacktestHook(ABC):
     """
     Base class for backtest hooks.
 
-    Subclasses must implement the ``on_bar`` method.
-    ``on_backtest_start`` and ``on_backtest_end`` are optional lifecycle callbacks.
+    All methods have default no-op implementations. Override only the
+    callbacks you need: ``on_pre_signal`` for pre-signal agent logic,
+    ``on_bar`` for post-signal observation, or the lifecycle callbacks
+    ``on_backtest_start`` / ``on_backtest_end``.
     """
 
     def on_backtest_start(
@@ -62,7 +66,18 @@ class BacktestHook(ABC):
         """
         pass
 
-    @abstractmethod
+    def on_pre_signal(self, context: HookContext) -> None:
+        """
+        Called before signal processing on each bar.
+
+        Override this to submit orders directly via ``context.broker``
+        before the engine processes its own signals.
+
+        Parameters:
+            context: Context data for the current bar.
+        """
+        pass
+
     def on_bar(self, context: HookContext) -> Optional[Dict[str, Any]]:
         """
         Called after each bar is processed.
@@ -73,7 +88,7 @@ class BacktestHook(ABC):
         Returns:
             None or a dict containing action instructions.
         """
-        ...
+        return None
 
     def on_backtest_end(self) -> None:
         """Called once when the backtest ends (optional override)."""

@@ -95,6 +95,7 @@ class BacktestEngine:
         agent_enabled_strategies: Optional[Dict[str, bool]] = None,
         hooks: Optional[List[BacktestHook]] = None,
         include_benchmark: bool = True,
+        fee_allocation: str = "proportional",
     ):
         # Fee model
         if isinstance(fee_model, str):
@@ -141,6 +142,9 @@ class BacktestEngine:
 
         # Benchmark
         self.include_benchmark = include_benchmark
+
+        # Fee allocation for partial close trades
+        self.fee_allocation = fee_allocation
 
         # Internal state
         self._strategy = None
@@ -473,7 +477,8 @@ class BacktestEngine:
         portfolio = Portfolio(
             initial_capital=self.initial_capital,
             max_position_size=self.max_position_size,
-            allow_short=self.allow_short
+            allow_short=self.allow_short,
+            fee_allocation=self.fee_allocation,
         )
 
         broker = Broker(
@@ -507,15 +512,8 @@ class BacktestEngine:
                     portfolio, broker, symbol, bar, timestamp
                 )
 
-            # 4. Process new signals
-            signal = signals.iloc[i] if i < len(signals) else 0
-
-            if signal != 0:
-                self._process_signal(
-                    signal, portfolio, broker, symbol, bar, timestamp
-                )
-
-            # 5. Call hooks (no-op when hooks list is empty)
+            # 4. Call hooks: on_pre_signal (before signal processing)
+            pending_before_hooks = len(broker.get_pending_orders(symbol)) if self.hooks else 0
             if self.hooks:
                 ctx = HookContext(
                     bar_index=i,
@@ -523,12 +521,36 @@ class BacktestEngine:
                     bar_data=bar,
                     data=data.iloc[:i + 1],
                     portfolio=portfolio,
-                    symbol=symbol
+                    symbol=symbol,
+                    broker=broker,
                 )
+                for hook in self.hooks:
+                    hook.on_pre_signal(ctx)
+
+            # 5. Process new signals
+            signal = signals.iloc[i] if i < len(signals) else 0
+
+            # Warn if hooks submitted orders AND signal is non-zero
+            if self.hooks and signal != 0:
+                pending_now = len(broker.get_pending_orders(symbol))
+                if pending_now > pending_before_hooks:
+                    warnings.warn(
+                        f"Bar {i}: hook submitted orders while signal={signal}. "
+                        f"Both will execute. Set signals to 0 if hooks manage orders."
+                    )
+
+            if signal != 0:
+                self._process_signal(
+                    signal, portfolio, broker, symbol, bar, timestamp,
+                    bar_index=i,
+                )
+
+            # 6. Call hooks: on_bar (after signal processing)
+            if self.hooks:
                 for hook in self.hooks:
                     hook.on_bar(ctx)
 
-            # 6. Record equity AFTER all position changes
+            # 7. Record equity AFTER all position changes
             portfolio._record_equity(timestamp)
 
         # Notify hooks: backtest end
@@ -580,17 +602,25 @@ class BacktestEngine:
         broker: Broker,
         symbol: str,
         bar: pd.Series,
-        timestamp: pd.Timestamp
+        timestamp: pd.Timestamp,
+        bar_index: Optional[int] = None,
     ):
         """Process a trading signal."""
         current_pos = portfolio.get_position_size(symbol)
+
+        # Build sliced market data visible up to the current bar
+        if bar_index is not None and self._data is not None:
+            sliced_data = self._data.iloc[:bar_index + 1]
+            market_data_dict: Dict[str, pd.DataFrame] = {symbol: sliced_data}
+        else:
+            sliced_data = self._data
+            market_data_dict = {symbol: self._data} if self._data is not None else {}
 
         # Risk manager check (if available)
         if self.risk_manager:
             try:
                 self.risk_manager.sync_from_portfolio(portfolio)
 
-                market_data_dict = {symbol: self._data} if hasattr(self, '_data') else {}
                 risk_signals = self.risk_manager.check_and_apply_risk_rules(
                     portfolio, market_data_dict
                 )
@@ -604,10 +634,14 @@ class BacktestEngine:
 
         # Calculate target position
         if signal == 1:  # Buy signal
-            target_pos = self._calculate_target_position(portfolio, bar['close'], 1, symbol)
+            target_pos = self._calculate_target_position(
+                portfolio, bar['close'], 1, symbol, market_data=sliced_data
+            )
         elif signal == -1:  # Sell signal
             if self.allow_short:
-                target_pos = self._calculate_target_position(portfolio, bar['close'], -1, symbol)
+                target_pos = self._calculate_target_position(
+                    portfolio, bar['close'], -1, symbol, market_data=sliced_data
+                )
             else:
                 target_pos = 0
         else:
@@ -636,7 +670,8 @@ class BacktestEngine:
         portfolio: Portfolio,
         price: float,
         direction: int,
-        symbol: str = "default"
+        symbol: str = "default",
+        market_data: Optional[pd.DataFrame] = None,
     ) -> float:
         """Calculate target position size."""
         if price <= 0:
@@ -644,14 +679,15 @@ class BacktestEngine:
 
         equity = portfolio.total_equity
 
-        # Use risk manager if available
-        if self.risk_manager and hasattr(self._data, 'index'):
+        # Use risk manager if available (pass sliced data to avoid look-ahead)
+        data_for_rm = market_data if market_data is not None else self._data
+        if self.risk_manager and data_for_rm is not None and hasattr(data_for_rm, 'index'):
             try:
                 quantity = self.risk_manager.calculate_position_size(
                     symbol=symbol,
                     signal=direction,
                     current_price=price,
-                    market_data=self._data
+                    market_data=data_for_rm,
                 )
                 return quantity
             except Exception as e:
