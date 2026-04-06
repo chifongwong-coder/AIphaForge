@@ -144,7 +144,7 @@ class BaseFeeModel(ABC):
         self,
         price: float = 100.0,
         size: float = 100.0,
-        side: str = "buy",
+        side: str = "average",
     ) -> float:
         """Estimate commission as a fraction of notional value.
 
@@ -156,7 +156,10 @@ class BaseFeeModel(ABC):
         Parameters:
             price: Representative price for the estimate.
             size: Representative trade size for the estimate.
-            side: Trade direction ('buy' or 'sell').
+            side: Trade direction ('buy', 'sell', or 'average').
+                When ``'average'``, the buy and sell rates are averaged,
+                which gives a more representative estimate for models
+                with asymmetric fees (e.g. stamp duty on sell only).
 
         Returns:
             float: Commission as a fraction of notional (e.g. 0.001 = 0.1%).
@@ -164,6 +167,10 @@ class BaseFeeModel(ABC):
         notional = price * size
         if notional <= 0:
             return 0.0
+        if side == "average":
+            buy_commission = self.calculate_commission(price, size, "buy")
+            sell_commission = self.calculate_commission(price, size, "sell")
+            return (buy_commission + sell_commission) / (2 * notional)
         commission = self.calculate_commission(price, size, side)
         return commission / notional
 

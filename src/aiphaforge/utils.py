@@ -56,6 +56,10 @@ def validate_ohlcv(
         else:
             warnings.warn(message)
 
+    # Check for unsorted (out-of-order) timestamps
+    if hasattr(data.index, 'is_monotonic_increasing') and not data.index.is_monotonic_increasing:
+        _report("OHLCV: index timestamps are not monotonically increasing (unsorted)")
+
     # Only run quality checks if the relevant columns exist
     has_open = "open" in columns_lower
     has_high = "high" in columns_lower
@@ -314,13 +318,8 @@ def extract_trades_vectorized(
     trades: List[Any] = []
 
     # Fee rates for estimated costs
-    if hasattr(fee_model, 'commission_rate'):
-        commission_rate = fee_model.commission_rate
-    else:
-        commission_rate = 0.001
-    slippage_rate = (
-        fee_model.slippage_pct if hasattr(fee_model, 'slippage_pct') else 0.001
-    )
+    commission_rate = fee_model.estimate_commission_rate() if fee_model else 0.001
+    slippage_rate = fee_model.slippage_pct if fee_model else 0.001
 
     # Find position change points
     pos_diff = positions.diff()

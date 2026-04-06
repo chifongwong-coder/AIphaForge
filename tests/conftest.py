@@ -40,6 +40,9 @@ def make_ohlcv(
     open_ = np.empty_like(close)
     open_[0] = start_price
     open_[1:] = close[:-1]  # open equals previous close
+
+    # Clamp open to [low, high] so OHLCV validation never warns
+    open_ = np.clip(open_, low, high)
     volume = rng.integers(100_000, 1_000_000, size=n_bars).astype(float)
 
     dates = pd.bdate_range(start=start_date, periods=n_bars, freq="B")
