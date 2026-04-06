@@ -4,7 +4,8 @@ Utility Functions
 Common constants and helper functions for quantitative finance calculations.
 """
 
-from typing import List, Optional
+import warnings
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -16,6 +17,7 @@ TRADING_DAYS_STOCK: int = 252
 def validate_ohlcv(
     data: pd.DataFrame,
     required: Optional[List[str]] = None,
+    validation_level: str = "warn",
 ) -> None:
     """Validate that a DataFrame contains the required OHLCV columns.
 
@@ -23,9 +25,14 @@ def validate_ohlcv(
         data: DataFrame to validate.
         required: List of required column names. Defaults to
             ["open", "high", "low", "close", "volume"].
+        validation_level: Validation strictness level.
+            ``"strict"``: raise ``ValueError`` on any data quality issue.
+            ``"warn"`` (default): emit ``warnings.warn`` on issues.
+            ``"none"``: only check column existence (legacy behaviour).
 
     Raises:
-        ValueError: If any required columns are missing.
+        ValueError: If required columns are missing, or (in strict mode) if
+            any data quality check fails.
         TypeError: If *data* is not a DataFrame.
     """
     if not isinstance(data, pd.DataFrame):
@@ -38,6 +45,54 @@ def validate_ohlcv(
     missing = [col for col in required if col.lower() not in columns_lower]
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
+
+    # If validation_level is 'none', skip data quality checks
+    if validation_level == "none":
+        return
+
+    def _report(message: str) -> None:
+        if validation_level == "strict":
+            raise ValueError(message)
+        else:
+            warnings.warn(message)
+
+    # Only run quality checks if the relevant columns exist
+    has_open = "open" in columns_lower
+    has_high = "high" in columns_lower
+    has_low = "low" in columns_lower
+
+    # high < low check
+    if has_high and has_low:
+        invalid = data["high"] < data["low"]
+        n_invalid = int(invalid.sum())
+        if n_invalid > 0:
+            _report(f"OHLCV: {n_invalid} rows where high < low")
+
+    # open outside [low, high] range
+    if has_open and has_high and has_low:
+        outside = (data["open"] < data["low"]) | (data["open"] > data["high"])
+        n_outside = int(outside.sum())
+        if n_outside > 0:
+            _report(f"OHLCV: {n_outside} rows where open is outside [low, high]")
+
+    # NaN in price columns
+    price_cols = [c for c in ["open", "high", "low", "close"] if c in columns_lower]
+    if price_cols:
+        n_nan = int(data[price_cols].isna().any(axis=1).sum())
+        if n_nan > 0:
+            _report(f"OHLCV: {n_nan} rows with NaN in price columns")
+
+    # Negative prices
+    if price_cols:
+        n_neg = int((data[price_cols] < 0).any(axis=1).sum())
+        if n_neg > 0:
+            _report(f"OHLCV: {n_neg} rows with negative prices")
+
+    # Duplicate timestamps
+    if isinstance(data.index, pd.DatetimeIndex):
+        n_dup = int(data.index.duplicated().sum())
+        if n_dup > 0:
+            _report(f"OHLCV: {n_dup} duplicate timestamps in index")
 
 
 def ensure_datetime_index(data: pd.DataFrame) -> pd.DataFrame:
@@ -225,3 +280,174 @@ def annualize(
     if is_volatility:
         return float(value * np.sqrt(trading_days))
     return float(value * trading_days)
+
+
+def extract_trades_vectorized(
+    data: pd.DataFrame,
+    positions: pd.Series,
+    signals: pd.Series,
+    equity: pd.Series,
+    fee_model: Any,
+    initial_capital: float,
+    symbol: str = "default",
+) -> List[Any]:
+    """Extract trade records from vectorized backtest results.
+
+    This is a standalone utility function moved out of BacktestEngine so
+    it can be reused by different execution cores.
+
+    Parameters:
+        data: OHLCV DataFrame.
+        positions: Position series (1, -1, 0).
+        signals: Raw signal series.
+        equity: Equity curve series.
+        fee_model: Fee model instance (used to estimate trade costs).
+        initial_capital: Starting capital.
+        symbol: Instrument symbol.
+
+    Returns:
+        List of Trade objects.
+    """
+    # Import here to avoid circular dependency
+    from .results import Trade
+
+    trades: List[Any] = []
+
+    # Fee rates for estimated costs
+    if hasattr(fee_model, 'commission_rate'):
+        commission_rate = fee_model.commission_rate
+    else:
+        commission_rate = 0.001
+    slippage_rate = (
+        fee_model.slippage_pct if hasattr(fee_model, 'slippage_pct') else 0.001
+    )
+
+    # Find position change points
+    pos_diff = positions.diff()
+    entries = pos_diff[pos_diff != 0].dropna()
+
+    entry_time = None
+    entry_price = None
+    entry_direction = None
+    entry_size = None
+    trade_id = 0
+
+    for idx, change in entries.items():
+        price = data.loc[idx, 'close']
+
+        if entry_time is None:
+            # Open position
+            if change != 0:
+                entry_time = idx
+                entry_price = price
+                entry_direction = 1 if change > 0 else -1
+                entry_size = abs(change)
+        else:
+            # Check if closing
+            new_pos = positions.loc[idx]
+            if (
+                new_pos == 0
+                or (entry_direction > 0 and change < 0)
+                or (entry_direction < 0 and change > 0)
+            ):
+                # Estimate real shares from equity at entry time
+                entry_equity = (
+                    equity.loc[entry_time]
+                    if entry_time in equity.index
+                    else initial_capital
+                )
+                estimated_shares = entry_equity * entry_size / entry_price
+
+                # Close position
+                trade_id += 1
+                pnl = entry_direction * (price - entry_price) * estimated_shares
+
+                # Subtract estimated fees (entry + exit)
+                entry_notional = estimated_shares * entry_price
+                exit_notional = estimated_shares * price
+                estimated_fees = (
+                    (entry_notional + exit_notional) * (commission_rate + slippage_rate)
+                )
+                pnl -= estimated_fees
+
+                trades.append(Trade(
+                    trade_id=f"VT{trade_id:04d}",
+                    symbol=symbol,
+                    direction=entry_direction,
+                    entry_time=entry_time,
+                    exit_time=idx,
+                    entry_price=entry_price,
+                    exit_price=price,
+                    size=entry_size,
+                    pnl=pnl,
+                    pnl_pct=(price / entry_price - 1) * entry_direction,
+                    reason="signal",
+                ))
+
+                # If reversing position
+                if new_pos != 0:
+                    entry_time = idx
+                    entry_price = price
+                    entry_direction = 1 if new_pos > 0 else -1
+                    entry_size = abs(new_pos)
+                else:
+                    entry_time = None
+
+    return trades
+
+
+def calculate_trade_metrics(trades: List[Any]) -> Dict[str, float]:
+    """Compute trade-level statistics from a list of Trade objects.
+
+    Each trade must have ``pnl`` (float), ``entry_time``, and ``exit_time``
+    attributes.  The returned dict uses the same keys as
+    ``BacktestEngine._calculate_metrics`` so it can be merged directly.
+
+    Args:
+        trades: List of Trade objects (or any objects with the attributes
+            described above).
+
+    Returns:
+        Dict with keys: num_trades, win_rate, num_winners, num_losers,
+        avg_win, avg_loss, profit_factor, avg_holding_days.
+    """
+    metrics: Dict[str, float] = {}
+    metrics['num_trades'] = len(trades)
+
+    if len(trades) > 0:
+        winners = [t for t in trades if t.pnl > 0]
+        losers = [t for t in trades if t.pnl <= 0]
+
+        metrics['win_rate'] = len(winners) / len(trades)
+        metrics['num_winners'] = len(winners)
+        metrics['num_losers'] = len(losers)
+
+        # Average win/loss
+        metrics['avg_win'] = float(np.mean([t.pnl for t in winners])) if winners else 0.0
+        metrics['avg_loss'] = float(np.mean([t.pnl for t in losers])) if losers else 0.0
+
+        # Profit factor
+        total_wins = sum(t.pnl for t in winners)
+        total_losses = abs(sum(t.pnl for t in losers))
+        if total_losses > 0:
+            metrics['profit_factor'] = total_wins / total_losses
+        else:
+            metrics['profit_factor'] = float('inf') if total_wins > 0 else 0.0
+
+        # Average holding time
+        holding_times = [
+            (t.exit_time - t.entry_time).total_seconds() / 86400
+            for t in trades
+        ]
+        metrics['avg_holding_days'] = float(np.mean(holding_times)) if holding_times else 0.0
+
+    else:
+        metrics['win_rate'] = 0.0
+        metrics['num_winners'] = 0.0
+        metrics['num_losers'] = 0.0
+        metrics['avg_win'] = 0.0
+        metrics['avg_loss'] = 0.0
+        metrics['profit_factor'] = 0.0
+        metrics['avg_holding_days'] = 0.0
+
+    return metrics

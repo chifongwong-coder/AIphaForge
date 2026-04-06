@@ -140,6 +140,33 @@ class BaseFeeModel(ABC):
         else:
             return price - slippage_amount
 
+    def estimate_commission_rate(
+        self,
+        price: float = 100.0,
+        size: float = 100.0,
+        side: str = "buy",
+    ) -> float:
+        """Estimate commission as a fraction of notional value.
+
+        Useful for vectorized mode where a single scalar rate is needed.
+        The default implementation computes the actual commission and divides
+        by notional value.  Subclasses may override for efficiency but the
+        default is always correct.
+
+        Parameters:
+            price: Representative price for the estimate.
+            size: Representative trade size for the estimate.
+            side: Trade direction ('buy' or 'sell').
+
+        Returns:
+            float: Commission as a fraction of notional (e.g. 0.001 = 0.1%).
+        """
+        notional = price * size
+        if notional <= 0:
+            return 0.0
+        commission = self.calculate_commission(price, size, side)
+        return commission / notional
+
     def __repr__(self):
         return f"{self.__class__.__name__}(slippage={self.slippage_pct*100:.2f}%)"
 
