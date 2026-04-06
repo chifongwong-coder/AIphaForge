@@ -4,18 +4,14 @@ Broker Simulation
 Simulates order execution, slippage, and fill logic.
 """
 
-import pandas as pd
-import numpy as np
-from typing import List, Optional, Dict, Tuple
 from enum import Enum
+from typing import Dict, List, Optional, Tuple
 
-from .orders import (
-    Order, OrderType, OrderSide, OrderStatus, OrderManager,
-    should_trigger_stop, should_fill_limit
-)
+import pandas as pd
+
 from .fees import BaseFeeModel, SimpleFeeModel
+from .orders import Order, OrderManager, OrderSide, OrderType, should_fill_limit, should_trigger_stop
 from .portfolio import Portfolio
-from .results import Trade
 
 
 class FillModel(Enum):

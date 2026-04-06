@@ -12,7 +12,7 @@ When no hooks are registered, the engine behaves identically to the original cod
 from abc import ABC
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional, Dict, Any, List
+from typing import Any, Dict, Optional
 
 import pandas as pd
 

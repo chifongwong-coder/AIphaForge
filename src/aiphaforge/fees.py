@@ -9,8 +9,8 @@ Supports transaction cost calculation for multiple markets:
 """
 
 from abc import ABC, abstractmethod
-from typing import Optional
 from enum import Enum
+from typing import Optional
 
 
 class MarketType(Enum):

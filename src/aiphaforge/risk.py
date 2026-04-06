@@ -7,7 +7,7 @@ structure used to communicate risk decisions within the engine.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Dict
+from typing import Dict, List
 
 import pandas as pd
 

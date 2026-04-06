@@ -4,23 +4,25 @@ Performance Analyzer
 Provides comprehensive backtest performance analysis and reporting.
 """
 
-import pandas as pd
-import numpy as np
-from typing import Dict, List, Optional, Tuple, Any
-from dataclasses import dataclass
-import warnings
+from typing import Any, Dict, List, Optional, Tuple
 
-from .results import BacktestResult, Trade
+import numpy as np
+import pandas as pd
+
+from .results import BacktestResult
 
 # Import utility functions
 from .utils import (
     TRADING_DAYS_STOCK,
-    calculate_returns,
     annualize,
     annualize_return,
+    calculate_returns,
+)
+from .utils import (
     sharpe_ratio as calc_sharpe,
+)
+from .utils import (
     sortino_ratio as calc_sortino,
-    max_drawdown as calc_max_drawdown,
 )
 
 

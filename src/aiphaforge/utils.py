@@ -4,9 +4,10 @@ Utility Functions
 Common constants and helper functions for quantitative finance calculations.
 """
 
-import pandas as pd
+from typing import List, Optional
+
 import numpy as np
-from typing import Optional, List
+import pandas as pd
 
 # Standard number of trading days per year for stock markets
 TRADING_DAYS_STOCK: int = 252

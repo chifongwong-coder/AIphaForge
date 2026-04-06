@@ -54,75 +54,45 @@ Performance Analysis:
 """
 
 # Main engine
-from .engine import (
-    BacktestEngine,
-    ExecutionMode,
-    PositionSizing,
-    backtest
-)
+# Broker simulation
+from .broker import Broker, FillModel, SimpleBroker, SlippageModel
+from .engine import BacktestEngine, ExecutionMode, PositionSizing, backtest
 
 # Fee models
 from .fees import (
     BaseFeeModel,
+    ChinaAShareFeeModel,
+    CryptoFuturesFeeModel,
+    CryptoSpotFeeModel,
+    MarketType,
     SimpleFeeModel,
     USStockFeeModel,
-    ChinaAShareFeeModel,
-    CryptoSpotFeeModel,
-    CryptoFuturesFeeModel,
     ZeroFeeModel,
-    MarketType,
-    get_fee_model
-)
-
-# Order management
-from .orders import (
-    Order,
-    OrderType,
-    OrderSide,
-    OrderStatus,
-    OrderManager
-)
-
-# Portfolio management
-from .portfolio import (
-    Position,
-    Portfolio
-)
-
-# Broker simulation
-from .broker import (
-    Broker,
-    SimpleBroker,
-    FillModel,
-    SlippageModel
+    get_fee_model,
 )
 
 # Hook framework
 from .hooks import (
-    HookContext,
     BacktestHook,
+    HookContext,
 )
+
+# Order management
+from .orders import Order, OrderManager, OrderSide, OrderStatus, OrderType
+
+# Performance analysis
+from .performance import PerformanceAnalyzer, analyze, compare_strategies
+
+# Portfolio management
+from .portfolio import Portfolio, Position
+
+# Result data structures
+from .results import BacktestResult, EquityPoint, PositionSnapshot, Trade, trades_to_dataframe
 
 # Risk management
 from .risk import (
     BaseRiskManager,
     RiskSignal,
-)
-
-# Result data structures
-from .results import (
-    Trade,
-    BacktestResult,
-    PositionSnapshot,
-    EquityPoint,
-    trades_to_dataframe
-)
-
-# Performance analysis
-from .performance import (
-    PerformanceAnalyzer,
-    analyze,
-    compare_strategies
 )
 
 __version__ = '0.3.0'

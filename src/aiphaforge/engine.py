@@ -4,29 +4,35 @@ Backtest Engine
 Main backtest executor supporting both vectorized and event-driven modes.
 """
 
-import pandas as pd
-import numpy as np
-from typing import Optional, Dict, List, Union, Callable, Any
-from enum import Enum
 import warnings
+from enum import Enum
+from typing import Dict, List, Optional, Union
 
+import numpy as np
+import pandas as pd
+
+from .broker import Broker, FillModel
 from .fees import BaseFeeModel, SimpleFeeModel, get_fee_model
 from .hooks import BacktestHook, HookContext
-from .orders import Order, OrderSide, OrderType
 from .portfolio import Portfolio
-from .broker import Broker, FillModel, SimpleBroker
-from .results import BacktestResult, Trade, trades_to_dataframe
+from .results import BacktestResult, Trade
 
 # Import utility functions
 from .utils import (
     TRADING_DAYS_STOCK,
-    validate_ohlcv,
-    ensure_datetime_index,
-    calculate_returns,
-    sharpe_ratio as calc_sharpe,
-    sortino_ratio as calc_sortino,
-    max_drawdown as calc_max_drawdown,
     annualize_return,
+    calculate_returns,
+    ensure_datetime_index,
+    validate_ohlcv,
+)
+from .utils import (
+    max_drawdown as calc_max_drawdown,
+)
+from .utils import (
+    sharpe_ratio as calc_sharpe,
+)
+from .utils import (
+    sortino_ratio as calc_sortino,
 )
 
 
