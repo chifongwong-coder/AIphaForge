@@ -253,8 +253,8 @@ class Portfolio:
 
     @property
     def total_equity(self) -> float:
-        """Total equity = cash + position value."""
-        return self.cash + self.position_value
+        """Total equity = cash + net position value (signed)."""
+        return self.cash + sum(pos.notional_value for pos in self.positions.values())
 
     @property
     def unrealized_pnl(self) -> float:
@@ -332,7 +332,8 @@ class Portfolio:
                 'entry_price': price,
                 'direction': 1 if size_change > 0 else -1,
                 'size': abs(size_change),
-                'entry_commission': commission
+                'entry_commission': commission,
+                'entry_slippage': slippage
             }
 
         # Update position
@@ -352,6 +353,7 @@ class Portfolio:
             entry_info = self._pending_entries.pop(symbol)
             self._trade_counter += 1
 
+            entry_slippage = entry_info.get('entry_slippage', 0.0)
             trade = Trade(
                 trade_id=f"T{self._trade_counter:06d}",
                 symbol=symbol,
@@ -361,10 +363,10 @@ class Portfolio:
                 entry_price=entry_info['entry_price'],
                 exit_price=price,
                 size=entry_info['size'],
-                pnl=realized - commission - slippage - entry_info['entry_commission'],
+                pnl=realized - commission - slippage - entry_info['entry_commission'] - entry_slippage,
                 pnl_pct=(price / entry_info['entry_price'] - 1) * entry_info['direction'],
                 commission=commission + entry_info['entry_commission'],
-                slippage_cost=slippage,
+                slippage_cost=slippage + entry_slippage,
                 reason="signal"
             )
             self.trade_history.append(trade)
@@ -407,7 +409,8 @@ class Portfolio:
     def update_prices(
         self,
         prices: Dict[str, float],
-        timestamp: pd.Timestamp
+        timestamp: pd.Timestamp,
+        record: bool = True
     ):
         """
         Update prices for all held positions.
@@ -415,6 +418,7 @@ class Portfolio:
         Parameters:
             prices: Price dict {symbol: price}.
             timestamp: Timestamp.
+            record: Whether to record an equity snapshot (default True).
         """
         for symbol, price in prices.items():
             if symbol in self.positions:
@@ -426,7 +430,8 @@ class Portfolio:
             self._peak_equity = equity
 
         # Record equity snapshot
-        self._record_equity(timestamp)
+        if record:
+            self._record_equity(timestamp)
 
     def _record_equity(self, timestamp: pd.Timestamp):
         """Record an equity snapshot."""
