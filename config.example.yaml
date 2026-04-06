@@ -1,0 +1,54 @@
+# ==============================================================
+# AIphaForge Backtest Configuration Example
+# ==============================================================
+# Copy this file to config.yaml and adjust to your needs.
+# This file is for reference only -- the engine accepts all
+# configuration via constructor parameters, not config files.
+# You can use this as a template for your own config loader.
+# ==============================================================
+
+# ----- Engine Settings -----
+engine:
+  initial_capital: 100000
+  mode: "event_driven"           # "vectorized" or "event_driven"
+  position_sizing: "fixed_fraction"  # "fixed_fraction", "fixed_size", "all_in"
+  position_size: 0.95            # fraction of equity (for fixed_fraction/all_in)
+  max_position_size: 1.0         # max single position as fraction of equity
+  allow_short: true
+  include_benchmark: true
+
+# ----- Risk Management -----
+risk:
+  stop_loss: 0.05               # 5% stop loss (null to disable)
+  take_profit: 0.15             # 15% take profit (null to disable)
+
+# ----- Fee Model -----
+# Supported: "us", "china", "crypto", "crypto_futures", "simple", "zero"
+fee_model:
+  market: "china"
+  # Override defaults (optional):
+  # commission_rate: 0.0003
+  # slippage_pct: 0.001
+
+# ----- Broker Settings (event-driven mode) -----
+broker:
+  fill_model: "next_bar_open"   # "next_bar_open", "current_close", "vwap", "worst_case"
+  slippage_model: "fixed"       # "fixed", "volume_based", "volatility_based"
+  partial_fills: false
+  volume_limit_pct: 0.1
+  stop_fill_pessimistic: true   # true: fills at bar extreme; false: fills at stop price
+
+# ----- Data Settings -----
+data:
+  symbol: "AAPL"
+  start: "2020-01-01"
+  end: "2024-12-31"
+  # source: "csv"               # your data loading method
+  # path: "data/aapl_daily.csv"
+
+# ----- Agent Settings (for hook-based agent integration) -----
+agent:
+  enabled: false
+  trigger_interval: 20          # call agent every N bars
+  # model: "gpt-4o"
+  # timeout: 120

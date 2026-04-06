@@ -23,6 +23,8 @@ ENV/
 env/
 .env
 .env.*
+config.yaml
+config.yml
 
 # ============================================================
 # IDE / Editor
