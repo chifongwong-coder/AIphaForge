@@ -11,17 +11,22 @@ from typing import Dict, List, Optional, Union
 import numpy as np
 import pandas as pd
 
-from .broker import Broker, FillModel
+from .broker import FillModel
+from .config import BacktestConfig
+from .core_event_driven import run_event_driven
+from .core_vectorized import run_vectorized
+from .costs import DefaultTradeCost
+from .exit_rules import PercentageStopLoss, PercentageTakeProfit
 from .fees import BaseFeeModel, SimpleFeeModel, get_fee_model
-from .hooks import BacktestHook, HookContext
-from .portfolio import Portfolio
+from .hooks import BacktestHook
+from .position_sizing import AllInSizer, FixedSizer, FractionSizer
 from .results import BacktestResult, Trade
 
 # Import utility functions
 from .utils import (
     TRADING_DAYS_STOCK,
     annualize_return,
-    calculate_returns,
+    calculate_trade_metrics,
     ensure_datetime_index,
     validate_ohlcv,
 )
@@ -102,6 +107,7 @@ class BacktestEngine:
         hooks: Optional[List[BacktestHook]] = None,
         include_benchmark: bool = True,
         fee_allocation: str = "proportional",
+        data_validation: str = "warn",
     ):
         # Fee model
         if isinstance(fee_model, str):
@@ -152,10 +158,39 @@ class BacktestEngine:
         # Fee allocation for partial close trades
         self.fee_allocation = fee_allocation
 
+        # Data validation level ('strict', 'warn', 'none')
+        self.data_validation = data_validation
+
+        # Feature modules
+        self._stop_loss_rule = (
+            PercentageStopLoss(stop_loss) if stop_loss else None
+        )
+        self._take_profit_rule = (
+            PercentageTakeProfit(take_profit) if take_profit else None
+        )
+        self._trade_cost = DefaultTradeCost()
+        self._position_sizer = self._create_position_sizer()
+
         # Internal state
         self._strategy = None
         self._signals = None
         self._data = None
+
+    def _create_position_sizer(self):
+        """Create the appropriate position sizer based on config."""
+        if self.position_sizing == PositionSizing.FIXED_SIZE:
+            return FixedSizer(self.position_size)
+        elif self.position_sizing == PositionSizing.ALL_IN:
+            return AllInSizer(self.position_size)
+        elif self.position_sizing == PositionSizing.FIXED_FRACTION:
+            return FractionSizer(self.position_size)
+        else:
+            # RISK_BASED falls back to FractionSizer
+            warnings.warn(
+                "RISK_BASED position sizing is not yet implemented, "
+                "falling back to FIXED_FRACTION"
+            )
+            return FractionSizer(self.position_size)
 
     # ========== Setup Methods ==========
 
@@ -234,11 +269,19 @@ class BacktestEngine:
         # Generate signals
         signals = self._get_signals(data)
 
-        # Run based on mode
+        # Build config bundle
+        config = self._build_config()
+
+        # Dispatch to execution core
         if self.mode == ExecutionMode.VECTORIZED:
-            return self._run_vectorized(data, signals, symbol)
+            raw = run_vectorized(data, signals, config, symbol)
         else:
-            return self._run_event_driven(data, signals, symbol)
+            raw = run_event_driven(
+                data, signals, config, symbol,
+                strategy=self._strategy, full_data=self._data,
+            )
+
+        return self._build_result(raw, data)
 
     def _prepare_data(
         self,
@@ -247,7 +290,11 @@ class BacktestEngine:
         end: Optional[str]
     ) -> pd.DataFrame:
         """Validate and prepare data."""
-        validate_ohlcv(data, required=['open', 'high', 'low', 'close'])
+        validate_ohlcv(
+            data,
+            required=['open', 'high', 'low', 'close'],
+            validation_level=self.data_validation,
+        )
         data = ensure_datetime_index(data)
         data = data.sort_index()
 
@@ -273,312 +320,53 @@ class BacktestEngine:
         signals = signals.replace([np.inf, -np.inf], 0).fillna(0)
         return signals
 
-    # ========== Vectorized Backtest ==========
+    # ========== Config and Result Building ==========
 
-    def _run_vectorized(
-        self,
-        data: pd.DataFrame,
-        signals: pd.Series,
-        symbol: str
-    ) -> BacktestResult:
-        """
-        Vectorized backtest.
-
-        Fast but simplified backtest mode.
-        """
-        # Compute positions (forward-fill signals)
-        positions = signals.replace(0, np.nan).ffill().fillna(0)
-
-        # Clip short positions if not allowed
-        if not self.allow_short:
-            positions = positions.clip(lower=0)
-
-        # Compute returns
-        returns = data['close'].pct_change()
-
-        # Strategy returns = position * returns (lagged by 1 to avoid lookahead bias)
-        strategy_returns = positions.shift(1) * returns
-
-        # Compute trade signals (position changes)
-        trades_signal = positions.diff().abs()
-        trade_days = trades_signal > 0
-
-        # Compute transaction costs (simplified: fixed rate)
-        if hasattr(self.fee_model, 'commission_rate'):
-            commission_rate = self.fee_model.commission_rate
-        else:
-            commission_rate = 0.001
-
-        slippage_rate = self.fee_model.slippage_pct if hasattr(self.fee_model, 'slippage_pct') else 0.001
-
-        # Transaction costs (applied on trade days, both sides)
-        position_notional = positions.abs() * data['close']
-        trade_cost = trade_days * position_notional * (commission_rate + slippage_rate) * 2 / self.initial_capital
-
-        # Net returns
-        net_returns = strategy_returns - trade_cost
-
-        # Apply stop loss
-        if self.stop_loss is not None:
-            net_returns = self._apply_vectorized_stop_loss(
-                net_returns, positions, data, self.stop_loss
-            )
-
-        # Fill NaN values (first row from pct_change and shift)
-        net_returns = net_returns.fillna(0)
-
-        # Compute equity curve
-        equity_curve = self.initial_capital * (1 + net_returns).cumprod()
-
-        # Extract trade records
-        trades = self._extract_trades_vectorized(data, positions, signals, equity_curve, symbol=symbol)
-
-        # Compute performance metrics
-        metrics = self._calculate_metrics(net_returns, equity_curve, trades)
-
-        # Build positions DataFrame
-        positions_df = pd.DataFrame({
-            'position': positions,
-            'value': positions * data['close'],
-            'signal': signals
-        }, index=data.index)
-
-        # Strategy name
-        strategy_name = getattr(self._strategy, 'name', 'Custom') if self._strategy else "Custom"
-
-        # Buy-and-hold benchmark
-        benchmark_equity = None
-        benchmark_metrics = None
-        if self.include_benchmark:
-            benchmark_equity, benchmark_metrics = self._compute_benchmark(data)
-
-        return BacktestResult(
-            equity_curve=equity_curve,
-            trades=trades,
-            positions=positions_df,
-            metrics=metrics,
+    def _build_config(self) -> BacktestConfig:
+        """Build a BacktestConfig from the engine's attributes."""
+        return BacktestConfig(
             initial_capital=self.initial_capital,
-            strategy_name=strategy_name,
-            parameters=getattr(self._strategy, 'params', {}) if self._strategy else {},
-            daily_returns=net_returns,
-            benchmark_equity=benchmark_equity,
-            benchmark_metrics=benchmark_metrics,
-        )
-
-    def _apply_vectorized_stop_loss(
-        self,
-        returns: pd.Series,
-        positions: pd.Series,
-        data: pd.DataFrame,
-        stop_loss: float
-    ) -> pd.Series:
-        """Per-position vectorized stop loss."""
-        close = data['close']
-        pos_changes = positions.diff().fillna(positions.iloc[0])
-        entry_mask = pos_changes != 0
-        entry_prices = close[entry_mask].reindex(close.index).ffill()
-
-        pos_pnl_pct = (close / entry_prices - 1) * positions.shift(1).apply(np.sign)
-        stop_triggered = pos_pnl_pct < -stop_loss
-
-        returns_with_stop = returns.copy()
-        returns_with_stop[stop_triggered] = 0
-        return returns_with_stop
-
-    def _extract_trades_vectorized(
-        self,
-        data: pd.DataFrame,
-        positions: pd.Series,
-        signals: pd.Series,
-        equity: pd.Series,
-        symbol: str = "default"
-    ) -> List[Trade]:
-        """Extract trade records from vectorized results."""
-        trades = []
-
-        # Fee rates for estimated costs
-        if hasattr(self.fee_model, 'commission_rate'):
-            commission_rate = self.fee_model.commission_rate
-        else:
-            commission_rate = 0.001
-        slippage_rate = self.fee_model.slippage_pct if hasattr(self.fee_model, 'slippage_pct') else 0.001
-
-        # Find position change points
-        pos_diff = positions.diff()
-        entries = pos_diff[pos_diff != 0].dropna()
-
-        entry_time = None
-        entry_price = None
-        entry_direction = None
-        entry_size = None
-        trade_id = 0
-
-        for idx, change in entries.items():
-            price = data.loc[idx, 'close']
-
-            if entry_time is None:
-                # Open position
-                if change != 0:
-                    entry_time = idx
-                    entry_price = price
-                    entry_direction = 1 if change > 0 else -1
-                    entry_size = abs(change)
-            else:
-                # Check if closing
-                new_pos = positions.loc[idx]
-                if new_pos == 0 or (entry_direction > 0 and change < 0) or (entry_direction < 0 and change > 0):
-                    # Estimate real shares from equity at entry time
-                    entry_equity = equity.loc[entry_time] if entry_time in equity.index else self.initial_capital
-                    estimated_shares = entry_equity * entry_size / entry_price
-
-                    # Close position
-                    trade_id += 1
-                    pnl = entry_direction * (price - entry_price) * estimated_shares
-
-                    # Subtract estimated fees (entry + exit)
-                    entry_notional = estimated_shares * entry_price
-                    exit_notional = estimated_shares * price
-                    estimated_fees = (entry_notional + exit_notional) * (commission_rate + slippage_rate)
-                    pnl -= estimated_fees
-
-                    trades.append(Trade(
-                        trade_id=f"VT{trade_id:04d}",
-                        symbol=symbol,
-                        direction=entry_direction,
-                        entry_time=entry_time,
-                        exit_time=idx,
-                        entry_price=entry_price,
-                        exit_price=price,
-                        size=entry_size,
-                        pnl=pnl,
-                        pnl_pct=(price / entry_price - 1) * entry_direction,
-                        reason="signal"
-                    ))
-
-                    # If reversing position
-                    if new_pos != 0:
-                        entry_time = idx
-                        entry_price = price
-                        entry_direction = 1 if new_pos > 0 else -1
-                        entry_size = abs(new_pos)
-                    else:
-                        entry_time = None
-
-        return trades
-
-    # ========== Event-Driven Backtest ==========
-
-    def _run_event_driven(
-        self,
-        data: pd.DataFrame,
-        signals: pd.Series,
-        symbol: str
-    ) -> BacktestResult:
-        """
-        Event-driven backtest.
-
-        Processes each bar sequentially for precise simulation.
-        """
-        # Initialize components
-        portfolio = Portfolio(
-            initial_capital=self.initial_capital,
-            max_position_size=self.max_position_size,
+            fee_model=self.fee_model,
             allow_short=self.allow_short,
             fee_allocation=self.fee_allocation,
+            fill_model=self.fill_model,
+            stop_loss_rule=self._stop_loss_rule,
+            take_profit_rule=self._take_profit_rule,
+            trade_cost=self._trade_cost,
+            position_sizer=self._position_sizer,
+            risk_manager=self.risk_manager,
+            hooks=self.hooks,
+            include_benchmark=self.include_benchmark,
+            data_validation=self.data_validation,
+            max_position_size=self.max_position_size,
         )
 
-        broker = Broker(
-            fee_model=self.fee_model,
-            fill_model=self.fill_model
-        )
-        broker.set_portfolio(portfolio)
+    def _build_result(
+        self, raw: dict, data: pd.DataFrame,
+    ) -> BacktestResult:
+        """Build a BacktestResult from raw core output."""
+        equity_curve = raw['equity_curve']
+        trades = raw['trades']
+        positions_df = raw['positions_df']
+        net_returns = raw.get('net_returns')
+        daily_returns = raw.get('daily_returns')
+        orders_df = raw.get('orders_df', pd.DataFrame())
+        final_capital = raw.get('final_capital', 0.0)
 
-        # Notify hooks: backtest start
-        for hook in self.hooks:
-            hook.on_backtest_start(data, symbol)
-
-        # Process each bar
-        for i, (timestamp, bar) in enumerate(data.iterrows()):
-            # 1. Update prices (don't record equity yet)
-            portfolio.update_prices({symbol: bar['close']}, timestamp, record=False)
-
-            # 2. Process pending orders
-            filled_orders = broker.process_bar(bar, timestamp, symbol)
-            for order in filled_orders:
-                portfolio.update_from_order(order, timestamp)
-
-            # 3. Check stop loss / take profit
-            if self.stop_loss is not None:
-                self._check_and_execute_stop_loss(
-                    portfolio, broker, symbol, bar, timestamp
-                )
-
-            if self.take_profit is not None:
-                self._check_and_execute_take_profit(
-                    portfolio, broker, symbol, bar, timestamp
-                )
-
-            # 4. Call hooks: on_pre_signal (before signal processing)
-            pending_before_hooks = len(broker.get_pending_orders(symbol)) if self.hooks else 0
-            if self.hooks:
-                ctx = HookContext(
-                    bar_index=i,
-                    timestamp=timestamp,
-                    bar_data=bar,
-                    data=data.iloc[:i + 1],
-                    portfolio=portfolio,
-                    symbol=symbol,
-                    broker=broker,
-                )
-                for hook in self.hooks:
-                    hook.on_pre_signal(ctx)
-
-            # 5. Process new signals
-            signal = signals.iloc[i] if i < len(signals) else 0
-
-            # Warn if hooks submitted orders AND signal is non-zero
-            if self.hooks and signal != 0:
-                pending_now = len(broker.get_pending_orders(symbol))
-                if pending_now > pending_before_hooks:
-                    warnings.warn(
-                        f"Bar {i}: hook submitted orders while signal={signal}. "
-                        f"Both will execute. Set signals to 0 if hooks manage orders."
-                    )
-
-            if signal != 0:
-                self._process_signal(
-                    signal, portfolio, broker, symbol, bar, timestamp,
-                    bar_index=i,
-                )
-
-            # 6. Call hooks: on_bar (after signal processing)
-            if self.hooks:
-                for hook in self.hooks:
-                    hook.on_bar(ctx)
-
-            # 7. Record equity AFTER all position changes
-            portfolio._record_equity(timestamp)
-
-        # Notify hooks: backtest end
-        for hook in self.hooks:
-            hook.on_backtest_end()
-
-        # Build results
-        equity_curve = portfolio.get_equity_curve()
-        trades = portfolio.trade_history
-        positions_df = portfolio.get_positions_df()
-        orders_df = broker.get_orders_df()
+        # Determine which returns series to use for metrics
+        returns_for_metrics = net_returns if net_returns is not None else daily_returns
 
         # Compute metrics
-        daily_returns = None
-        if len(equity_curve) > 0:
-            returns = calculate_returns(equity_curve)
-            metrics = self._calculate_metrics(returns, equity_curve, trades)
-            daily_returns = returns
+        if returns_for_metrics is not None and len(returns_for_metrics) > 0:
+            metrics = self._calculate_metrics(returns_for_metrics, equity_curve, trades)
         else:
             metrics = {}
 
-        strategy_name = getattr(self._strategy, 'name', 'Custom') if self._strategy else "Custom"
+        # Strategy name
+        strategy_name = (
+            getattr(self._strategy, 'name', 'Custom')
+            if self._strategy else "Custom"
+        )
 
         # Buy-and-hold benchmark
         benchmark_equity = None
@@ -586,188 +374,32 @@ class BacktestEngine:
         if self.include_benchmark:
             benchmark_equity, benchmark_metrics = self._compute_benchmark(data)
 
-        return BacktestResult(
+        # Use net_returns or daily_returns for the result
+        result_returns = net_returns if net_returns is not None else daily_returns
+
+        result_kwargs = dict(
             equity_curve=equity_curve,
             trades=trades,
             positions=positions_df,
             metrics=metrics,
-            orders=orders_df,
             initial_capital=self.initial_capital,
-            final_capital=portfolio.total_equity,
             strategy_name=strategy_name,
-            parameters=getattr(self._strategy, 'params', {}) if self._strategy else {},
-            daily_returns=daily_returns,
+            parameters=(
+                getattr(self._strategy, 'params', {})
+                if self._strategy else {}
+            ),
+            daily_returns=result_returns,
             benchmark_equity=benchmark_equity,
             benchmark_metrics=benchmark_metrics,
         )
 
-    def _process_signal(
-        self,
-        signal: int,
-        portfolio: Portfolio,
-        broker: Broker,
-        symbol: str,
-        bar: pd.Series,
-        timestamp: pd.Timestamp,
-        bar_index: Optional[int] = None,
-    ):
-        """Process a trading signal."""
-        current_pos = portfolio.get_position_size(symbol)
+        if orders_df is not None and len(orders_df) > 0:
+            result_kwargs['orders'] = orders_df
 
-        # Build sliced market data visible up to the current bar
-        if bar_index is not None and self._data is not None:
-            sliced_data = self._data.iloc[:bar_index + 1]
-            market_data_dict: Dict[str, pd.DataFrame] = {symbol: sliced_data}
-        else:
-            sliced_data = self._data
-            market_data_dict = {symbol: self._data} if self._data is not None else {}
+        if final_capital:
+            result_kwargs['final_capital'] = final_capital
 
-        # Risk manager check (if available)
-        if self.risk_manager:
-            try:
-                self.risk_manager.sync_from_portfolio(portfolio)
-
-                risk_signals = self.risk_manager.check_and_apply_risk_rules(
-                    portfolio, market_data_dict
-                )
-
-                for risk_signal in risk_signals:
-                    if risk_signal.severity == 'critical' and risk_signal.action in ['reject_new', 'close_all']:
-                        warnings.warn(f"Risk limit triggered: {risk_signal.message}")
-                        return
-            except Exception as e:
-                warnings.warn(f"Risk check failed: {e}")
-
-        # Calculate target position
-        if signal == 1:  # Buy signal
-            target_pos = self._calculate_target_position(
-                portfolio, bar['close'], 1, symbol, market_data=sliced_data
-            )
-        elif signal == -1:  # Sell signal
-            if self.allow_short:
-                target_pos = self._calculate_target_position(
-                    portfolio, bar['close'], -1, symbol, market_data=sliced_data
-                )
-            else:
-                target_pos = 0
-        else:
-            return
-
-        # Calculate required trade
-        size_change = target_pos - current_pos
-
-        if abs(size_change) < 0.001:  # Ignore tiny changes
-            return
-
-        # Create order
-        if size_change > 0:
-            order = broker.create_market_order(
-                symbol, "buy", size_change, "signal", timestamp
-            )
-        else:
-            order = broker.create_market_order(
-                symbol, "sell", abs(size_change), "signal", timestamp
-            )
-
-        broker.submit_order(order, timestamp)
-
-    def _calculate_target_position(
-        self,
-        portfolio: Portfolio,
-        price: float,
-        direction: int,
-        symbol: str = "default",
-        market_data: Optional[pd.DataFrame] = None,
-    ) -> float:
-        """Calculate target position size."""
-        if price <= 0:
-            return 0
-
-        equity = portfolio.total_equity
-
-        # Use risk manager if available (pass sliced data to avoid look-ahead)
-        data_for_rm = market_data if market_data is not None else self._data
-        if self.risk_manager and data_for_rm is not None and hasattr(data_for_rm, 'index'):
-            try:
-                quantity = self.risk_manager.calculate_position_size(
-                    symbol=symbol,
-                    signal=direction,
-                    current_price=price,
-                    market_data=data_for_rm,
-                )
-                return quantity
-            except Exception as e:
-                warnings.warn(f"Risk manager sizing failed: {e}, using default method")
-
-        # Default position sizing logic
-        if self.position_sizing == PositionSizing.FIXED_SIZE:
-            # FIXED_SIZE sets quantity directly (no division by price)
-            size = self.position_size
-        else:
-            if self.position_sizing == PositionSizing.ALL_IN:
-                position_value = equity * self.position_size
-            elif self.position_sizing == PositionSizing.FIXED_FRACTION:
-                position_value = equity * self.position_size
-            else:
-                warnings.warn(
-                    "RISK_BASED position sizing is not yet implemented, "
-                    "falling back to FIXED_FRACTION"
-                )
-                position_value = equity * self.position_size
-            # Convert to quantity
-            size = position_value / price
-
-        # Apply max position limit
-        max_size = (equity * self.max_position_size) / price
-        size = min(size, max_size)
-
-        return size * direction
-
-    def _check_and_execute_stop_loss(
-        self,
-        portfolio: Portfolio,
-        broker: Broker,
-        symbol: str,
-        bar: pd.Series,
-        timestamp: pd.Timestamp
-    ):
-        """Check and execute stop loss."""
-        position = portfolio.get_position(symbol)
-        if position is None or position.is_flat:
-            return
-
-        if position.unrealized_pnl_pct <= -self.stop_loss:
-            order = broker.create_market_order(
-                symbol,
-                "sell" if position.is_long else "buy",
-                abs(position.size),
-                "stop_loss",
-                timestamp
-            )
-            broker.submit_order(order, timestamp)
-
-    def _check_and_execute_take_profit(
-        self,
-        portfolio: Portfolio,
-        broker: Broker,
-        symbol: str,
-        bar: pd.Series,
-        timestamp: pd.Timestamp
-    ):
-        """Check and execute take profit."""
-        position = portfolio.get_position(symbol)
-        if position is None or position.is_flat:
-            return
-
-        if position.unrealized_pnl_pct >= self.take_profit:
-            order = broker.create_market_order(
-                symbol,
-                "sell" if position.is_long else "buy",
-                abs(position.size),
-                "take_profit",
-                timestamp
-            )
-            broker.submit_order(order, timestamp)
+        return BacktestResult(**result_kwargs)
 
     # ========== Performance Calculation ==========
 
@@ -777,84 +409,43 @@ class BacktestEngine:
         equity: pd.Series,
         trades: List[Trade]
     ) -> Dict[str, float]:
-        """Calculate performance metrics."""
-        metrics = {}
+        """Calculate performance metrics.
+
+        Delegates to shared utility functions so that the engine and
+        PerformanceAnalyzer use the same calculations.
+        """
+        metrics: Dict[str, float] = {}
 
         if len(returns) == 0:
             return metrics
 
-        # Basic return metrics
+        # --- Return metrics ---
         if len(equity) > 0 and equity.iloc[0] != 0:
             total_return = equity.iloc[-1] / equity.iloc[0] - 1
         else:
-            total_return = 0
+            total_return = 0.0
         metrics['total_return'] = total_return
 
-        # Annualized return
         n_days = len(returns)
-        if n_days > 0:
-            metrics['annualized_return'] = annualize_return(
-                total_return, n_days, TRADING_DAYS_STOCK
-            )
-        else:
-            metrics['annualized_return'] = 0
+        metrics['annualized_return'] = (
+            annualize_return(total_return, n_days, TRADING_DAYS_STOCK) if n_days > 0 else 0.0
+        )
 
-        # Sharpe ratio
+        # --- Risk metrics ---
         metrics['sharpe_ratio'] = calc_sharpe(returns, trading_days=TRADING_DAYS_STOCK)
-
-        # Sortino ratio
         metrics['sortino_ratio'] = calc_sortino(returns, trading_days=TRADING_DAYS_STOCK)
-
-        # Max drawdown
         metrics['max_drawdown'] = calc_max_drawdown(equity)
+        metrics['calmar_ratio'] = (
+            metrics['annualized_return'] / metrics['max_drawdown']
+            if metrics['max_drawdown'] > 0 else 0.0
+        )
 
-        # Calmar ratio
-        if metrics['max_drawdown'] > 0:
-            metrics['calmar_ratio'] = metrics['annualized_return'] / metrics['max_drawdown']
-        else:
-            metrics['calmar_ratio'] = 0
+        # --- Trade metrics (delegated to utils) ---
+        metrics.update(calculate_trade_metrics(trades))
 
-        # Trade statistics
-        metrics['num_trades'] = len(trades)
-
-        if len(trades) > 0:
-            winners = [t for t in trades if t.pnl > 0]
-            losers = [t for t in trades if t.pnl <= 0]
-
-            metrics['win_rate'] = len(winners) / len(trades)
-            metrics['num_winners'] = len(winners)
-            metrics['num_losers'] = len(losers)
-
-            # Average win/loss
-            metrics['avg_win'] = np.mean([t.pnl for t in winners]) if winners else 0
-            metrics['avg_loss'] = np.mean([t.pnl for t in losers]) if losers else 0
-
-            # Profit factor
-            total_wins = sum(t.pnl for t in winners)
-            total_losses = abs(sum(t.pnl for t in losers))
-            if total_losses > 0:
-                metrics['profit_factor'] = total_wins / total_losses
-            else:
-                metrics['profit_factor'] = float('inf') if total_wins > 0 else 0
-
-            # Average holding time
-            holding_times = [(t.exit_time - t.entry_time).total_seconds() / 86400 for t in trades]
-            metrics['avg_holding_days'] = np.mean(holding_times) if holding_times else 0
-
-        else:
-            metrics['win_rate'] = 0
-            metrics['num_winners'] = 0
-            metrics['num_losers'] = 0
-            metrics['avg_win'] = 0
-            metrics['avg_loss'] = 0
-            metrics['profit_factor'] = 0
-            metrics['avg_holding_days'] = 0
-
-        # Volatility & daily return
-        metrics['volatility'] = returns.std() * np.sqrt(TRADING_DAYS_STOCK)
-        metrics['mean_daily_return'] = returns.mean()
-
-        # Win/lose/flat days
+        # --- Simple inline metrics ---
+        metrics['volatility'] = float(returns.std() * np.sqrt(TRADING_DAYS_STOCK))
+        metrics['mean_daily_return'] = float(returns.mean())
         metrics['win_days'] = int((returns > 1e-8).sum())
         metrics['lose_days'] = int((returns < -1e-8).sum())
         metrics['flat_days'] = int(len(returns) - metrics['win_days'] - metrics['lose_days'])

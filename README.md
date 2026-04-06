@@ -18,13 +18,13 @@ AIphaForge also works perfectly well as a general-purpose backtest framework for
 - **Dual execution modes**: Vectorized (fast, for parameter sweeps) and Event-Driven (precise, bar-by-bar simulation)
 - **Realistic order simulation**: Market, limit, stop, and stop-limit orders with configurable fill and slippage models
 - **Multi-market fee models**: US stocks, China A-shares, crypto spot, and crypto futures with accurate fee structures
-- **Portfolio management**: Multi-asset position tracking, cash management, equity curve recording
+- **Portfolio management**: Multi-symbol position tracking, cash management, equity curve recording
 
 ### Extensibility
 - **Hook framework**: Plug in custom logic at every bar — agent triggers, monitors, custom risk rules
 - **Strategy interface**: Any object with a `generate_signals()` method works as a strategy
 - **Risk manager interface**: Inject your own risk management system via constructor
-- **Agent integration interface**: Built-in hooks for connecting LLM-based decision agents
+- **Agent integration interface**: Hook framework for building LLM-based decision agent integrations
 - **Fee model extensibility**: Subclass `BaseFeeModel` to support any market
 
 ### Performance Analysis
@@ -70,11 +70,14 @@ class AgentHook(BacktestHook):
         self.agent = agent
         self.trigger_interval = trigger_interval
 
-    def on_bar(self, ctx: HookContext):
+    def on_pre_signal(self, ctx: HookContext):
         if ctx.bar_index % self.trigger_interval == 0:
             decision = self.agent.analyze(ctx.data, ctx.portfolio)
-            # Apply agent decision to strategy parameters...
-        return None
+            if decision.action == 'buy':
+                order = ctx.broker.create_market_order(
+                    ctx.symbol, 'buy', decision.size, 'agent'
+                )
+                ctx.broker.submit_order(order, ctx.timestamp)
 
 engine = BacktestEngine(
     mode='event_driven',
@@ -98,15 +101,22 @@ pip install aiphaforge
 
 ```
 src/aiphaforge/
-├── engine.py          # Main backtest engine (vectorized + event-driven)
-├── broker.py          # Order execution and fill simulation
-├── portfolio.py       # Position and cash tracking
-├── orders.py          # Order types and lifecycle management
-├── fees.py            # Multi-market fee models
-├── hooks.py           # Hook framework for extensibility
-├── results.py         # Result data structures
-├── performance.py     # Performance analysis and reporting
-└── utils.py           # Common utilities and financial calculations
+├── engine.py              # Backtest engine orchestrator
+├── config.py              # BacktestConfig dataclass
+├── core_vectorized.py     # Vectorized execution core
+├── core_event_driven.py   # Event-driven execution core
+├── exit_rules.py          # Stop-loss / take-profit modules (pluggable)
+├── costs.py               # Trade cost modules (pluggable)
+├── position_sizing.py     # Position sizing modules (pluggable)
+├── broker.py              # Order execution and fill simulation
+├── portfolio.py           # Position and cash tracking
+├── orders.py              # Order types and lifecycle management
+├── fees.py                # Multi-market fee models
+├── hooks.py               # Hook framework for extensibility
+├── risk.py                # Risk manager ABC
+├── results.py             # Result data structures
+├── performance.py         # Performance analysis and reporting
+└── utils.py               # Common utilities and financial calculations
 ```
 
 ## Fee Models

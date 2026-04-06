@@ -53,12 +53,10 @@ Performance Analysis:
 ... })
 """
 
-# Main engine
-# Broker simulation
 from .broker import Broker, FillModel, SimpleBroker, SlippageModel
+from .costs import BaseTradeCost, DefaultTradeCost
 from .engine import BacktestEngine, ExecutionMode, PositionSizing, backtest
-
-# Fee models
+from .exit_rules import BaseExitRule, PercentageStopLoss, PercentageTakeProfit
 from .fees import (
     BaseFeeModel,
     ChinaAShareFeeModel,
@@ -70,32 +68,21 @@ from .fees import (
     ZeroFeeModel,
     get_fee_model,
 )
-
-# Hook framework
 from .hooks import (
     BacktestHook,
     HookContext,
 )
-
-# Order management
 from .orders import Order, OrderManager, OrderSide, OrderStatus, OrderType
-
-# Performance analysis
 from .performance import PerformanceAnalyzer, analyze, compare_strategies
-
-# Portfolio management
 from .portfolio import Portfolio, Position
-
-# Result data structures
+from .position_sizing import AllInSizer, BasePositionSizer, FixedSizer, FractionSizer
 from .results import BacktestResult, EquityPoint, PositionSnapshot, Trade, trades_to_dataframe
-
-# Risk management
 from .risk import (
     BaseRiskManager,
     RiskSignal,
 )
 
-__version__ = '0.3.0'
+__version__ = '0.4.0'
 
 __all__ = [
     # Main engine
@@ -131,6 +118,21 @@ __all__ = [
     'SimpleBroker',
     'FillModel',
     'SlippageModel',
+
+    # Exit rules
+    'BaseExitRule',
+    'PercentageStopLoss',
+    'PercentageTakeProfit',
+
+    # Trade costs
+    'BaseTradeCost',
+    'DefaultTradeCost',
+
+    # Position sizing
+    'BasePositionSizer',
+    'FractionSizer',
+    'FixedSizer',
+    'AllInSizer',
 
     # Hooks
     'HookContext',
