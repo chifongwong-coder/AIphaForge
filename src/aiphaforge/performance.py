@@ -13,7 +13,7 @@ import warnings
 from .results import BacktestResult, Trade
 
 # Import utility functions
-from ..utils import (
+from .utils import (
     TRADING_DAYS_STOCK,
     calculate_returns,
     annualize,
@@ -57,7 +57,7 @@ class PerformanceAnalyzer:
             return 0.0
         first_val = self.equity.iloc[0]
         last_val = self.equity.iloc[-1]
-        if np.isnan(first_val) or np.isnan(last_val) or first_val == 0:
+        if np.isnan(first_val) or np.isnan(last_val) or np.isinf(first_val) or np.isinf(last_val) or first_val == 0:
             return 0.0
         return (last_val / first_val) - 1
 
@@ -162,12 +162,7 @@ class PerformanceAnalyzer:
 
     @property
     def sortino_ratio(self) -> float:
-        if len(self.returns) < 2 or self.downside_volatility == 0:
-            return 0.0
-        annual_ret = self.annualized_return
-        if np.isnan(annual_ret):
-            return 0.0
-        return annual_ret / self.downside_volatility
+        return calc_sortino(self.returns, trading_days=TRADING_DAYS_STOCK)
 
     @property
     def calmar_ratio(self) -> float:
@@ -178,13 +173,13 @@ class PerformanceAnalyzer:
             return 0.0
         return annual_ret / self.max_drawdown
 
-    @property
     def omega_ratio(self, threshold: float = 0.0) -> float:
         if len(self.returns) < 2:
             return 0.0
 
-        gains = self.returns[self.returns > threshold].sum()
-        losses = abs(self.returns[self.returns < threshold].sum())
+        excess = self.returns - threshold
+        gains = excess[excess > 0].sum()
+        losses = abs(excess[excess < 0].sum())
 
         if losses == 0:
             return float('inf') if gains > 0 else 0.0
@@ -262,7 +257,7 @@ class PerformanceAnalyzer:
         """Average holding period in days."""
         if not self.trades:
             return 0.0
-        holding_days = [(t.exit_time - t.entry_time).days for t in self.trades]
+        holding_days = [(t.exit_time - t.entry_time).total_seconds() / 86400 for t in self.trades]
         return np.mean(holding_days)
 
     @property
