@@ -18,7 +18,7 @@ from .broker import Broker, FillModel, SimpleBroker
 from .results import BacktestResult, Trade, trades_to_dataframe
 
 # Import utility functions
-from ..utils import (
+from .utils import (
     TRADING_DAYS_STOCK,
     validate_ohlcv,
     ensure_datetime_index,
@@ -97,7 +97,10 @@ class BacktestEngine:
         include_benchmark: bool = True,
     ):
         # Fee model
-        self.fee_model = fee_model or SimpleFeeModel()
+        if isinstance(fee_model, str):
+            self.fee_model = get_fee_model(fee_model)
+        else:
+            self.fee_model = fee_model or SimpleFeeModel()
 
         # Capital
         self.initial_capital = initial_capital
@@ -215,6 +218,9 @@ class BacktestEngine:
         data = self._prepare_data(data, start, end)
         self._data = data
 
+        # Reset per-run state
+        self._agent_bar_count = 0
+
         # Generate signals
         signals = self._get_signals(data)
 
@@ -254,6 +260,7 @@ class BacktestEngine:
         else:
             raise ValueError("Must set either a strategy or signals")
 
+        signals = signals.replace([np.inf, -np.inf], 0).fillna(0)
         return signals
 
     # ========== Vectorized Backtest ==========
@@ -295,7 +302,8 @@ class BacktestEngine:
         slippage_rate = self.fee_model.slippage_pct if hasattr(self.fee_model, 'slippage_pct') else 0.001
 
         # Transaction costs (applied on trade days, both sides)
-        trade_cost = trade_days * (commission_rate + slippage_rate) * 2
+        position_notional = positions.abs() * data['close']
+        trade_cost = trade_days * position_notional * (commission_rate + slippage_rate) * 2 / self.initial_capital
 
         # Net returns
         net_returns = strategy_returns - trade_cost
@@ -313,7 +321,7 @@ class BacktestEngine:
         equity_curve = self.initial_capital * (1 + net_returns).cumprod()
 
         # Extract trade records
-        trades = self._extract_trades_vectorized(data, positions, signals, equity_curve)
+        trades = self._extract_trades_vectorized(data, positions, signals, equity_curve, symbol=symbol)
 
         # Compute performance metrics
         metrics = self._calculate_metrics(net_returns, equity_curve, trades)
@@ -326,7 +334,7 @@ class BacktestEngine:
         }, index=data.index)
 
         # Strategy name
-        strategy_name = self._strategy.name if self._strategy else "Custom"
+        strategy_name = getattr(self._strategy, 'name', 'Custom') if self._strategy else "Custom"
 
         # Buy-and-hold benchmark
         benchmark_equity = None
@@ -341,7 +349,7 @@ class BacktestEngine:
             metrics=metrics,
             initial_capital=self.initial_capital,
             strategy_name=strategy_name,
-            parameters=self._strategy.params if self._strategy else {},
+            parameters=getattr(self._strategy, 'params', {}) if self._strategy else {},
             daily_returns=net_returns,
             benchmark_equity=benchmark_equity,
             benchmark_metrics=benchmark_metrics,
@@ -354,16 +362,17 @@ class BacktestEngine:
         data: pd.DataFrame,
         stop_loss: float
     ) -> pd.Series:
-        """Simplified vectorized stop loss."""
-        cumulative = (1 + returns).cumprod()
-        running_max = cumulative.expanding().max()
-        drawdown = (cumulative - running_max) / running_max
+        """Per-position vectorized stop loss."""
+        close = data['close']
+        pos_changes = positions.diff().fillna(positions.iloc[0])
+        entry_mask = pos_changes != 0
+        entry_prices = close[entry_mask].reindex(close.index).ffill()
 
-        # Zero out returns when stop loss is triggered
-        stop_triggered = drawdown < -stop_loss
+        pos_pnl_pct = (close / entry_prices - 1) * positions.shift(1).apply(np.sign)
+        stop_triggered = pos_pnl_pct < -stop_loss
+
         returns_with_stop = returns.copy()
         returns_with_stop[stop_triggered] = 0
-
         return returns_with_stop
 
     def _extract_trades_vectorized(
@@ -371,10 +380,18 @@ class BacktestEngine:
         data: pd.DataFrame,
         positions: pd.Series,
         signals: pd.Series,
-        equity: pd.Series
+        equity: pd.Series,
+        symbol: str = "default"
     ) -> List[Trade]:
         """Extract trade records from vectorized results."""
         trades = []
+
+        # Fee rates for estimated costs
+        if hasattr(self.fee_model, 'commission_rate'):
+            commission_rate = self.fee_model.commission_rate
+        else:
+            commission_rate = 0.001
+        slippage_rate = self.fee_model.slippage_pct if hasattr(self.fee_model, 'slippage_pct') else 0.001
 
         # Find position change points
         pos_diff = positions.diff()
@@ -400,13 +417,23 @@ class BacktestEngine:
                 # Check if closing
                 new_pos = positions.loc[idx]
                 if new_pos == 0 or (entry_direction > 0 and change < 0) or (entry_direction < 0 and change > 0):
+                    # Estimate real shares from equity at entry time
+                    entry_equity = equity.loc[entry_time] if entry_time in equity.index else self.initial_capital
+                    estimated_shares = entry_equity * entry_size / entry_price
+
                     # Close position
                     trade_id += 1
-                    pnl = entry_direction * (price - entry_price) * entry_size * self.initial_capital / entry_price
+                    pnl = entry_direction * (price - entry_price) * estimated_shares
+
+                    # Subtract estimated fees (entry + exit)
+                    entry_notional = estimated_shares * entry_price
+                    exit_notional = estimated_shares * price
+                    estimated_fees = (entry_notional + exit_notional) * (commission_rate + slippage_rate)
+                    pnl -= estimated_fees
 
                     trades.append(Trade(
                         trade_id=f"VT{trade_id:04d}",
-                        symbol="default",
+                        symbol=symbol,
                         direction=entry_direction,
                         entry_time=entry_time,
                         exit_time=idx,
@@ -461,8 +488,8 @@ class BacktestEngine:
 
         # Process each bar
         for i, (timestamp, bar) in enumerate(data.iterrows()):
-            # 1. Update prices
-            portfolio.update_prices({symbol: bar['close']}, timestamp)
+            # 1. Update prices (don't record equity yet)
+            portfolio.update_prices({symbol: bar['close']}, timestamp, record=False)
 
             # 2. Process pending orders
             filled_orders = broker.process_bar(bar, timestamp, symbol)
@@ -501,6 +528,9 @@ class BacktestEngine:
                 for hook in self.hooks:
                     hook.on_bar(ctx)
 
+            # 6. Record equity AFTER all position changes
+            portfolio._record_equity(timestamp)
+
         # Notify hooks: backtest end
         for hook in self.hooks:
             hook.on_backtest_end()
@@ -520,7 +550,7 @@ class BacktestEngine:
         else:
             metrics = {}
 
-        strategy_name = self._strategy.name if self._strategy else "Custom"
+        strategy_name = getattr(self._strategy, 'name', 'Custom') if self._strategy else "Custom"
 
         # Buy-and-hold benchmark
         benchmark_equity = None
@@ -537,68 +567,11 @@ class BacktestEngine:
             initial_capital=self.initial_capital,
             final_capital=portfolio.total_equity,
             strategy_name=strategy_name,
-            parameters=self._strategy.params if self._strategy else {},
+            parameters=getattr(self._strategy, 'params', {}) if self._strategy else {},
             daily_returns=daily_returns,
             benchmark_equity=benchmark_equity,
             benchmark_metrics=benchmark_metrics,
         )
-
-    def _maybe_call_agent(
-        self,
-        data: pd.DataFrame,
-        current_idx: int,
-        portfolio: Portfolio,
-        symbol: str,
-        interval: str = "daily"
-    ) -> Optional[Dict]:
-        """
-        Optionally call the AI Agent (if enabled).
-
-        Returns:
-            Optional[Dict]: Agent decision result including strategy_changes.
-        """
-        if self.agent_expert is None:
-            return None
-
-        # Check trigger interval
-        self._agent_bar_count += 1
-        if self._agent_bar_count % self.agent_trigger_interval != 0:
-            return None
-
-        try:
-            from ..agent import create_strategy_states, create_portfolio_state, MarketSnapshotGenerator
-        except ImportError:
-            warnings.warn("Agent module not installed, skipping agent call")
-            return None
-
-        # Generate agent input
-        generator = MarketSnapshotGenerator(lookback_bars=20)
-
-        strategies = create_strategy_states(
-            enabled_strategies=list(self.agent_enabled_strategies.keys()),
-            strategy_params={}
-        )
-
-        portfolio_state = create_portfolio_state(portfolio, data.iloc[current_idx]['close'])
-
-        agent_input = generator.generate(
-            data=data,
-            current_idx=current_idx,
-            symbol=symbol,
-            interval=interval,
-            strategies=strategies,
-            portfolio=portfolio_state
-        )
-
-        agent_output = self.agent_expert.analyze(agent_input, verbose=False)
-
-        from ..agent import execute_agent_decision
-        result = execute_agent_decision(agent_output, self.agent_enabled_strategies)
-
-        if result['changed']:
-            self.agent_enabled_strategies.update(result['strategy_changes'])
-
-        return result
 
     def _process_signal(
         self,
@@ -634,7 +607,7 @@ class BacktestEngine:
             target_pos = self._calculate_target_position(portfolio, bar['close'], 1, symbol)
         elif signal == -1:  # Sell signal
             if self.allow_short:
-                target_pos = -self._calculate_target_position(portfolio, bar['close'], -1, symbol)
+                target_pos = self._calculate_target_position(portfolio, bar['close'], -1, symbol)
             else:
                 target_pos = 0
         else:
@@ -666,6 +639,9 @@ class BacktestEngine:
         symbol: str = "default"
     ) -> float:
         """Calculate target position size."""
+        if price <= 0:
+            return 0
+
         equity = portfolio.total_equity
 
         # Use risk manager if available
@@ -682,17 +658,22 @@ class BacktestEngine:
                 warnings.warn(f"Risk manager sizing failed: {e}, using default method")
 
         # Default position sizing logic
-        if self.position_sizing == PositionSizing.ALL_IN:
-            position_value = equity * self.position_size
-        elif self.position_sizing == PositionSizing.FIXED_SIZE:
-            return self.position_size * direction
-        elif self.position_sizing == PositionSizing.FIXED_FRACTION:
-            position_value = equity * self.position_size
+        if self.position_sizing == PositionSizing.FIXED_SIZE:
+            # FIXED_SIZE sets quantity directly (no division by price)
+            size = self.position_size
         else:
-            position_value = equity * self.position_size
-
-        # Convert to quantity
-        size = position_value / price
+            if self.position_sizing == PositionSizing.ALL_IN:
+                position_value = equity * self.position_size
+            elif self.position_sizing == PositionSizing.FIXED_FRACTION:
+                position_value = equity * self.position_size
+            else:
+                warnings.warn(
+                    "RISK_BASED position sizing is not yet implemented, "
+                    "falling back to FIXED_FRACTION"
+                )
+                position_value = equity * self.position_size
+            # Convert to quantity
+            size = position_value / price
 
         # Apply max position limit
         max_size = (equity * self.max_position_size) / price
@@ -761,7 +742,10 @@ class BacktestEngine:
             return metrics
 
         # Basic return metrics
-        total_return = (equity.iloc[-1] / equity.iloc[0] - 1) if len(equity) > 0 else 0
+        if len(equity) > 0 and equity.iloc[0] != 0:
+            total_return = equity.iloc[-1] / equity.iloc[0] - 1
+        else:
+            total_return = 0
         metrics['total_return'] = total_return
 
         # Annualized return
@@ -812,7 +796,7 @@ class BacktestEngine:
                 metrics['profit_factor'] = float('inf') if total_wins > 0 else 0
 
             # Average holding time
-            holding_times = [(t.exit_time - t.entry_time).days for t in trades]
+            holding_times = [(t.exit_time - t.entry_time).total_seconds() / 86400 for t in trades]
             metrics['avg_holding_days'] = np.mean(holding_times) if holding_times else 0
 
         else:
@@ -841,7 +825,10 @@ class BacktestEngine:
     ) -> tuple:
         """Compute buy-and-hold benchmark."""
         close = data['close']
-        benchmark_equity = self.initial_capital * (close / close.iloc[0])
+        if close.iloc[0] <= 0:
+            benchmark_equity = pd.Series(self.initial_capital, index=close.index)
+        else:
+            benchmark_equity = self.initial_capital * (close / close.iloc[0])
         bh_returns = close.pct_change().fillna(0)
         benchmark_metrics = self._calculate_metrics(bh_returns, benchmark_equity, trades=[])
         return benchmark_equity, benchmark_metrics

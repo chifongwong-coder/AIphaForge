@@ -60,7 +60,8 @@ class Broker:
         slippage_model: SlippageModel = SlippageModel.FIXED,
         partial_fills: bool = False,
         volume_limit_pct: float = 0.1,
-        check_buying_power: bool = True
+        check_buying_power: bool = True,
+        stop_fill_pessimistic: bool = True
     ):
         self.fee_model = fee_model or SimpleFeeModel()
         self.fill_model = fill_model
@@ -68,6 +69,7 @@ class Broker:
         self.partial_fills = partial_fills
         self.volume_limit_pct = volume_limit_pct
         self.check_buying_power = check_buying_power
+        self.stop_fill_pessimistic = stop_fill_pessimistic
 
         # Order management
         self.order_manager = OrderManager()
@@ -235,10 +237,13 @@ class Broker:
 
         elif order.order_type == OrderType.STOP_LIMIT:
             if should_trigger_stop(order.stop_price, order.side, high, low):
-                # Triggered: check if limit can be filled
+                # Stop triggered: check if limit can also be filled on this bar
                 if should_fill_limit(order.price, order.side, high, low):
                     fill_price = order.price
                     return self._execute_fill(order, fill_price, order.size, timestamp, bar.get('volume', float('inf')))
+                else:
+                    # Stop triggered but limit not filled: convert to limit order
+                    order.order_type = OrderType.LIMIT
 
         return False
 
@@ -259,11 +264,22 @@ class Broker:
 
     def _get_stop_fill_price(self, order: Order, bar: pd.Series) -> float:
         """Get fill price after a stop is triggered."""
-        # Stop orders typically fill at worse prices
-        if order.is_sell:
-            return min(order.stop_price, bar['low'])
+        if self.stop_fill_pessimistic:
+            # Conservative: fill at bar extreme (worst case for stops)
+            if order.is_sell:
+                return min(order.stop_price, bar['low'])
+            else:
+                return max(order.stop_price, bar['high'])
         else:
-            return max(order.stop_price, bar['high'])
+            # Realistic: fill at stop price, or gap open if price gaps past
+            if order.is_sell:
+                if bar['open'] <= order.stop_price:
+                    return bar['open']  # Gapped past stop
+                return order.stop_price
+            else:
+                if bar['open'] >= order.stop_price:
+                    return bar['open']  # Gapped past stop
+                return order.stop_price
 
     def _execute_fill(
         self,
