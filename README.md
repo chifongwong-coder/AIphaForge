@@ -105,7 +105,8 @@ src/aiphaforge/
 ├── fees.py            # Multi-market fee models
 ├── hooks.py           # Hook framework for extensibility
 ├── results.py         # Result data structures
-└── performance.py     # Performance analysis and reporting
+├── performance.py     # Performance analysis and reporting
+└── utils.py           # Common utilities and financial calculations
 ```
 
 ## Fee Models
