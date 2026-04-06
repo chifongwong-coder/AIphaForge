@@ -225,7 +225,8 @@ class Portfolio:
         initial_capital: float = 100000,
         max_position_size: float = 1.0,
         allow_short: bool = True,
-        margin_requirement: float = 1.0
+        margin_requirement: float = 1.0,
+        fee_allocation: str = "proportional",
     ):
         self.initial_capital = initial_capital
         self.cash = initial_capital
@@ -233,6 +234,7 @@ class Portfolio:
         self.max_position_size = max_position_size
         self.allow_short = allow_short
         self.margin_requirement = margin_requirement
+        self.fee_allocation = fee_allocation
 
         # History
         self.equity_history: List[EquityPoint] = []
@@ -305,6 +307,10 @@ class Portfolio:
         """
         Update a position.
 
+        Handles new entries, add-to-position, partial close, full close,
+        and reversal scenarios.  Returns a Trade record when a position is
+        fully or partially closed.
+
         Parameters:
             symbol: Instrument symbol.
             size_change: Position change (positive=buy, negative=sell).
@@ -314,8 +320,11 @@ class Portfolio:
             slippage: Slippage cost.
 
         Returns:
-            Optional[Trade]: Trade record if a round-trip was completed.
+            Optional[Trade]: Trade record if a (partial or full) close occurred.
         """
+        if size_change == 0:
+            return None
+
         trade = None
 
         # Get or create position
@@ -325,51 +334,173 @@ class Portfolio:
         position = self.positions[symbol]
         old_size = position.size
 
-        # Record entry info for new positions
-        if old_size == 0 and size_change != 0:
+        # Determine scenario before mutating position
+        is_new_entry = (old_size == 0 and size_change != 0)
+        is_same_direction = (
+            old_size != 0
+            and size_change != 0
+            and ((old_size > 0 and size_change > 0)
+                 or (old_size < 0 and size_change < 0))
+        )
+        is_reducing = (
+            old_size != 0
+            and size_change != 0
+            and not is_same_direction
+        )
+
+        # --- New entry ---
+        if is_new_entry:
             self._pending_entries[symbol] = {
                 'entry_time': timestamp,
                 'entry_price': price,
                 'direction': 1 if size_change > 0 else -1,
                 'size': abs(size_change),
                 'entry_commission': commission,
-                'entry_slippage': slippage
+                'entry_slippage': slippage,
             }
 
-        # Update position
+        # --- Add-to-position (same direction) ---
+        if is_same_direction and symbol in self._pending_entries:
+            # Position.add will be called below; capture pending info for update
+            pass  # handled after position.add
+
+        # Update position (this computes realized PnL for reductions)
         realized = position.add(size_change, price, timestamp)
 
         # Update cash
         trade_value = abs(size_change) * price
         if size_change > 0:
-            # Buy: spend cash
             self.cash -= trade_value + commission + slippage
         else:
-            # Sell: receive cash
             self.cash += trade_value - commission - slippage
 
-        # Generate trade record when a round-trip is completed
-        if old_size != 0 and position.size == 0 and symbol in self._pending_entries:
-            entry_info = self._pending_entries.pop(symbol)
-            self._trade_counter += 1
+        # --- Post-update bookkeeping ---
 
-            entry_slippage = entry_info.get('entry_slippage', 0.0)
-            trade = Trade(
-                trade_id=f"T{self._trade_counter:06d}",
-                symbol=symbol,
-                direction=entry_info['direction'],
-                entry_time=entry_info['entry_time'],
-                exit_time=timestamp,
-                entry_price=entry_info['entry_price'],
-                exit_price=price,
-                size=entry_info['size'],
-                pnl=realized - commission - slippage - entry_info['entry_commission'] - entry_slippage,
-                pnl_pct=(price / entry_info['entry_price'] - 1) * entry_info['direction'],
-                commission=commission + entry_info['entry_commission'],
-                slippage_cost=slippage + entry_slippage,
-                reason="signal"
-            )
-            self.trade_history.append(trade)
+        if is_same_direction and symbol in self._pending_entries:
+            # Sync pending entry info with the updated average position
+            entry_info = self._pending_entries[symbol]
+            entry_info['entry_price'] = position.avg_entry_price
+            entry_info['size'] = abs(position.size)
+            entry_info['entry_commission'] += commission
+            entry_info['entry_slippage'] += slippage
+
+        elif is_reducing and symbol in self._pending_entries:
+            entry_info = self._pending_entries[symbol]
+            closed_qty = min(abs(old_size), abs(size_change))
+            pending_size = entry_info['size']
+
+            # Calculate proportional entry fees for the closed portion
+            if pending_size > 0:
+                if self.fee_allocation == "first_close":
+                    alloc_entry_commission = entry_info['entry_commission']
+                    alloc_entry_slippage = entry_info['entry_slippage']
+                else:
+                    # Proportional allocation
+                    close_ratio = closed_qty / pending_size
+                    alloc_entry_commission = entry_info['entry_commission'] * close_ratio
+                    alloc_entry_slippage = entry_info['entry_slippage'] * close_ratio
+            else:
+                alloc_entry_commission = 0.0
+                alloc_entry_slippage = 0.0
+
+            total_fees = commission + slippage + alloc_entry_commission + alloc_entry_slippage
+
+            # Determine whether this is a full close, partial close, or reversal
+            if position.size == 0:
+                # --- Full close ---
+                self._pending_entries.pop(symbol)
+                self._trade_counter += 1
+                trade = Trade(
+                    trade_id=f"T{self._trade_counter:06d}",
+                    symbol=symbol,
+                    direction=entry_info['direction'],
+                    entry_time=entry_info['entry_time'],
+                    exit_time=timestamp,
+                    entry_price=entry_info['entry_price'],
+                    exit_price=price,
+                    size=closed_qty,
+                    pnl=realized - total_fees,
+                    pnl_pct=(price / entry_info['entry_price'] - 1) * entry_info['direction'],
+                    commission=commission + alloc_entry_commission,
+                    slippage_cost=slippage + alloc_entry_slippage,
+                    reason="signal",
+                )
+                self.trade_history.append(trade)
+
+            elif (old_size > 0 and position.size > 0) or (old_size < 0 and position.size < 0):
+                # --- Partial close (position reduced but not flipped) ---
+                self._trade_counter += 1
+                trade = Trade(
+                    trade_id=f"T{self._trade_counter:06d}",
+                    symbol=symbol,
+                    direction=entry_info['direction'],
+                    entry_time=entry_info['entry_time'],
+                    exit_time=timestamp,
+                    entry_price=entry_info['entry_price'],
+                    exit_price=price,
+                    size=closed_qty,
+                    pnl=realized - total_fees,
+                    pnl_pct=(price / entry_info['entry_price'] - 1) * entry_info['direction'],
+                    commission=commission + alloc_entry_commission,
+                    slippage_cost=slippage + alloc_entry_slippage,
+                    reason="signal",
+                )
+                self.trade_history.append(trade)
+
+                # Update pending entry to reflect remaining size
+                entry_info['size'] -= closed_qty
+                if self.fee_allocation == "first_close":
+                    entry_info['entry_commission'] = 0.0
+                    entry_info['entry_slippage'] = 0.0
+                else:
+                    entry_info['entry_commission'] -= alloc_entry_commission
+                    entry_info['entry_slippage'] -= alloc_entry_slippage
+
+            else:
+                # --- Reversal (position crossed zero) ---
+                # Split exit-side fees between close and new entry proportionally
+                total_change = abs(size_change)
+                if total_change > 0:
+                    close_share = abs(old_size) / total_change
+                else:
+                    close_share = 1.0
+                new_entry_share = 1.0 - close_share
+
+                close_commission = commission * close_share
+                close_slippage = slippage * close_share
+                new_entry_commission = commission * new_entry_share
+                new_entry_slippage = slippage * new_entry_share
+
+                close_total_fees = close_commission + close_slippage + alloc_entry_commission + alloc_entry_slippage
+
+                # Close Trade for old position (full close)
+                self._trade_counter += 1
+                trade = Trade(
+                    trade_id=f"T{self._trade_counter:06d}",
+                    symbol=symbol,
+                    direction=entry_info['direction'],
+                    entry_time=entry_info['entry_time'],
+                    exit_time=timestamp,
+                    entry_price=entry_info['entry_price'],
+                    exit_price=price,
+                    size=abs(old_size),
+                    pnl=realized - close_total_fees,
+                    pnl_pct=(price / entry_info['entry_price'] - 1) * entry_info['direction'],
+                    commission=close_commission + alloc_entry_commission,
+                    slippage_cost=close_slippage + alloc_entry_slippage,
+                    reason="signal",
+                )
+                self.trade_history.append(trade)
+
+                # Create new pending entry for the reversed direction
+                self._pending_entries[symbol] = {
+                    'entry_time': timestamp,
+                    'entry_price': price,
+                    'direction': 1 if position.size > 0 else -1,
+                    'size': abs(position.size),
+                    'entry_commission': new_entry_commission,
+                    'entry_slippage': new_entry_slippage,
+                }
 
         return trade
 
