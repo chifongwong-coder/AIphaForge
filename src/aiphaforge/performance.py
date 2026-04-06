@@ -40,11 +40,12 @@ class PerformanceAnalyzer:
         >>> report = analyzer.generate_report()
     """
 
-    def __init__(self, result: BacktestResult):
+    def __init__(self, result: BacktestResult, downside_method: str = "full"):
         self.result = result
         self.equity = result.equity_curve
         self.returns = calculate_returns(self.equity) if len(self.equity) > 1 else pd.Series()
         self.trades = result.trades
+        self._downside_method = downside_method
 
         # Cached results
         self._metrics_cache = {}
@@ -106,10 +107,18 @@ class PerformanceAnalyzer:
     def downside_volatility(self) -> float:
         if len(self.returns) < 2:
             return 0.0
-        negative_returns = self.returns[self.returns < 0]
-        if len(negative_returns) == 0:
+        if self._downside_method == "negative_only":
+            negative_returns = self.returns[self.returns < 0]
+            if len(negative_returns) == 0:
+                return 0.0
+            daily_downside = np.sqrt((negative_returns ** 2).mean())
+        else:
+            # "full": root-mean-square of min(r, 0) over ALL observations
+            clipped = np.minimum(self.returns, 0.0)
+            daily_downside = np.sqrt((clipped ** 2).mean())
+        if daily_downside == 0 or np.isnan(daily_downside):
             return 0.0
-        return annualize(negative_returns.std(), TRADING_DAYS_STOCK, is_volatility=True)
+        return annualize(daily_downside, TRADING_DAYS_STOCK, is_volatility=True)
 
     @property
     def max_drawdown(self) -> float:
@@ -162,7 +171,11 @@ class PerformanceAnalyzer:
 
     @property
     def sortino_ratio(self) -> float:
-        return calc_sortino(self.returns, trading_days=TRADING_DAYS_STOCK)
+        return calc_sortino(
+            self.returns,
+            trading_days=TRADING_DAYS_STOCK,
+            downside_method=self._downside_method,
+        )
 
     @property
     def calmar_ratio(self) -> float:
