@@ -103,6 +103,12 @@ from .hooks import (
     BacktestHook,
 )
 
+# Risk management
+from .risk import (
+    BaseRiskManager,
+    RiskSignal,
+)
+
 # Result data structures
 from .results import (
     Trade,
@@ -119,7 +125,7 @@ from .performance import (
     compare_strategies
 )
 
-__version__ = '0.2.0'
+__version__ = '0.3.0'
 
 __all__ = [
     # Main engine
@@ -159,6 +165,10 @@ __all__ = [
     # Hooks
     'HookContext',
     'BacktestHook',
+
+    # Risk management
+    'BaseRiskManager',
+    'RiskSignal',
 
     # Results
     'Trade',

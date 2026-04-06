@@ -66,6 +66,13 @@ class Trade:
             raise ValueError(f"size must be positive, got: {self.size}")
 
     @property
+    def net_pnl_pct(self) -> float:
+        """Net P&L as a percentage of entry notional value."""
+        if self.entry_price == 0 or self.size == 0:
+            return 0.0
+        return self.pnl / (self.entry_price * self.size)
+
+    @property
     def gross_pnl(self) -> float:
         """Gross P&L (before fees)."""
         return self.pnl + self.commission + self.slippage_cost
@@ -94,6 +101,7 @@ class Trade:
             'slippage_cost': self.slippage_cost,
             'reason': self.reason,
             'holding_bars': self.holding_bars,
+            'net_pnl_pct': self.net_pnl_pct,
             'is_winner': self.is_winner,
             'gross_pnl': self.gross_pnl
         }
@@ -420,7 +428,7 @@ def trades_to_dataframe(trades: List[Trade]) -> pd.DataFrame:
             'trade_id', 'symbol', 'direction', 'entry_time', 'exit_time',
             'entry_price', 'exit_price', 'size', 'pnl', 'pnl_pct',
             'commission', 'slippage_cost', 'reason', 'holding_bars',
-            'is_winner', 'gross_pnl'
+            'net_pnl_pct', 'is_winner', 'gross_pnl'
         ])
 
     return pd.DataFrame([t.to_dict() for t in trades])

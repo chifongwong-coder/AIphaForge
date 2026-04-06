@@ -113,15 +113,19 @@ def sortino_ratio(
     returns: pd.Series,
     trading_days: int = TRADING_DAYS_STOCK,
     risk_free_rate: float = 0.0,
+    downside_method: str = "full",
 ) -> float:
     """Calculate the annualized Sortino ratio.
-
-    Uses only downside deviation (negative returns) as the risk measure.
 
     Args:
         returns: Series of periodic returns.
         trading_days: Number of trading days per year for annualization.
         risk_free_rate: Annualized risk-free rate.
+        downside_method: Method for computing downside deviation.
+            ``"full"`` (default): standard formula using all observations,
+            ``sqrt(mean(min(excess, 0)^2))``.
+            ``"negative_only"``: use only negative excess returns,
+            ``sqrt(mean(neg^2))``.
 
     Returns:
         Annualized Sortino ratio, or 0.0 if downside deviation is zero.
@@ -131,12 +135,16 @@ def sortino_ratio(
 
     rf_per_period = risk_free_rate / trading_days
     excess = returns - rf_per_period
-    downside = excess[excess < 0]
 
-    if len(downside) == 0:
-        return 0.0
-
-    downside_std = np.sqrt((downside**2).mean())
+    if downside_method == "negative_only":
+        downside = excess[excess < 0]
+        if len(downside) == 0:
+            return 0.0
+        downside_std = np.sqrt((downside ** 2).mean())
+    else:
+        # "full": compute min(excess, 0) for ALL observations
+        clipped = np.minimum(excess, 0.0)
+        downside_std = np.sqrt((clipped ** 2).mean())
 
     if downside_std == 0 or np.isnan(downside_std):
         return 0.0
