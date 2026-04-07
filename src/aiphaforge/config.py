@@ -6,7 +6,10 @@ event-driven execution cores.
 """
 
 from dataclasses import dataclass, field
+from datetime import time
 from typing import Any, List, Optional
+
+import pandas as pd
 
 from .broker import FillModel
 from .costs import BaseTradeCost, DefaultTradeCost
@@ -40,3 +43,10 @@ class BacktestConfig:
     include_benchmark: bool = True
     data_validation: str = "warn"
     max_position_size: float = 1.0
+    session_end_time: Optional[time] = None
+    mode: str = "event_driven"
+    has_signals: bool = False
+    has_strategy: bool = False
+    benchmark: Optional[pd.Series] = None
+    benchmark_type: str = "auto"
+    benchmark_name: str = "Buy & Hold"

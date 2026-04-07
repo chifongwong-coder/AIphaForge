@@ -55,7 +55,9 @@ class BacktestHook(ABC):
     def on_backtest_start(
         self,
         data: pd.DataFrame,
-        symbol: str
+        symbol: str,
+        *,
+        config: Any = None,
     ) -> None:
         """
         Called once when the backtest starts (optional override).
@@ -63,6 +65,8 @@ class BacktestHook(ABC):
         Parameters:
             data: Full backtest dataset.
             symbol: Instrument symbol.
+            config: Backtest configuration (keyword-only, optional).
+                    Passed by the engine so hooks can inspect settings.
         """
         pass
 
