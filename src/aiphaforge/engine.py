@@ -5,6 +5,7 @@ Main backtest executor supporting both vectorized and event-driven modes.
 """
 
 import warnings
+from datetime import time
 from enum import Enum
 from typing import Dict, List, Optional, Union
 
@@ -27,6 +28,7 @@ from .utils import (
     TRADING_DAYS_STOCK,
     annualize_return,
     calculate_trade_metrics,
+    compute_buy_and_hold,
     ensure_datetime_index,
     validate_ohlcv,
 )
@@ -108,6 +110,7 @@ class BacktestEngine:
         include_benchmark: bool = True,
         fee_allocation: str = "proportional",
         data_validation: str = "warn",
+        session_end_time: Optional[time] = None,
     ):
         # Fee model
         if isinstance(fee_model, str):
@@ -160,6 +163,14 @@ class BacktestEngine:
 
         # Data validation level ('strict', 'warn', 'none')
         self.data_validation = data_validation
+
+        # Session end time for DAY order expiration
+        self.session_end_time = session_end_time
+
+        # Custom benchmark config defaults
+        self._config_benchmark: Optional[pd.Series] = None
+        self._config_benchmark_type: str = "auto"
+        self._config_benchmark_name: str = "Buy & Hold"
 
         # Feature modules
         self._stop_loss_rule = (
@@ -245,7 +256,10 @@ class BacktestEngine:
         data: pd.DataFrame,
         start: Optional[str] = None,
         end: Optional[str] = None,
-        symbol: str = "default"
+        symbol: str = "default",
+        *,
+        benchmark: Optional[pd.Series] = None,
+        benchmark_type: Optional[str] = None,
     ) -> BacktestResult:
         """
         Run the backtest.
@@ -255,6 +269,11 @@ class BacktestEngine:
             start: Start date (optional).
             end: End date (optional).
             symbol: Instrument symbol.
+            benchmark: Custom benchmark series (prices or returns).
+                Overrides the value set in BacktestConfig when provided.
+            benchmark_type: Type of benchmark data — ``"prices"``,
+                ``"returns"``, or ``"auto"``.  Overrides BacktestConfig
+                when provided.
 
         Returns:
             BacktestResult: Backtest results.
@@ -269,8 +288,11 @@ class BacktestEngine:
         # Generate signals
         signals = self._get_signals(data)
 
-        # Build config bundle
-        config = self._build_config()
+        # Build config bundle (with run-time benchmark overrides)
+        config = self._build_config(
+            benchmark=benchmark,
+            benchmark_type=benchmark_type,
+        )
 
         # Dispatch to execution core
         if self.mode == ExecutionMode.VECTORIZED:
@@ -281,7 +303,7 @@ class BacktestEngine:
                 strategy=self._strategy, full_data=self._data,
             )
 
-        return self._build_result(raw, data)
+        return self._build_result(raw, data, config)
 
     def _prepare_data(
         self,
@@ -322,8 +344,18 @@ class BacktestEngine:
 
     # ========== Config and Result Building ==========
 
-    def _build_config(self) -> BacktestConfig:
-        """Build a BacktestConfig from the engine's attributes."""
+    def _build_config(
+        self,
+        benchmark: Optional[pd.Series] = None,
+        benchmark_type: Optional[str] = None,
+    ) -> BacktestConfig:
+        """Build a BacktestConfig from the engine's attributes.
+
+        Parameters:
+            benchmark: Run-time benchmark override (takes precedence over
+                the engine-level config).
+            benchmark_type: Run-time benchmark_type override.
+        """
         return BacktestConfig(
             initial_capital=self.initial_capital,
             fee_model=self.fee_model,
@@ -339,10 +371,20 @@ class BacktestEngine:
             include_benchmark=self.include_benchmark,
             data_validation=self.data_validation,
             max_position_size=self.max_position_size,
+            session_end_time=self.session_end_time,
+            mode=self.mode.value,
+            has_signals=self._signals is not None,
+            has_strategy=self._strategy is not None,
+            benchmark=benchmark if benchmark is not None else self._config_benchmark,
+            benchmark_type=benchmark_type if benchmark_type is not None else self._config_benchmark_type,
+            benchmark_name=self._config_benchmark_name,
         )
 
     def _build_result(
-        self, raw: dict, data: pd.DataFrame,
+        self,
+        raw: dict,
+        data: pd.DataFrame,
+        config: Optional[BacktestConfig] = None,
     ) -> BacktestResult:
         """Build a BacktestResult from raw core output."""
         equity_curve = raw['equity_curve']
@@ -368,11 +410,14 @@ class BacktestEngine:
             if self._strategy else "Custom"
         )
 
-        # Buy-and-hold benchmark
+        # Benchmark
         benchmark_equity = None
         benchmark_metrics = None
+        benchmark_name = "Buy & Hold"
         if self.include_benchmark:
-            benchmark_equity, benchmark_metrics = self._compute_benchmark(data)
+            benchmark_equity, benchmark_metrics, benchmark_name = (
+                self._compute_benchmark(data, config)
+            )
 
         # Use net_returns or daily_returns for the result
         result_returns = net_returns if net_returns is not None else daily_returns
@@ -391,12 +436,13 @@ class BacktestEngine:
             daily_returns=result_returns,
             benchmark_equity=benchmark_equity,
             benchmark_metrics=benchmark_metrics,
+            benchmark_name=benchmark_name,
         )
 
         if orders_df is not None and len(orders_df) > 0:
             result_kwargs['orders'] = orders_df
 
-        if final_capital:
+        if final_capital is not None:
             result_kwargs['final_capital'] = final_capital
 
         return BacktestResult(**result_kwargs)
@@ -455,16 +501,75 @@ class BacktestEngine:
     def _compute_benchmark(
         self,
         data: pd.DataFrame,
+        config: Optional[BacktestConfig] = None,
     ) -> tuple:
-        """Compute buy-and-hold benchmark."""
-        close = data['close']
-        if close.iloc[0] <= 0:
-            benchmark_equity = pd.Series(self.initial_capital, index=close.index)
+        """Compute benchmark equity and metrics.
+
+        If a custom benchmark series is available (via *config*), it is
+        used after type detection and alignment.  Otherwise the default
+        buy-and-hold benchmark is computed via :func:`compute_buy_and_hold`.
+
+        Returns:
+            (benchmark_equity, benchmark_metrics, benchmark_name) tuple.
+        """
+        custom = config.benchmark if config is not None else None
+        btype = config.benchmark_type if config is not None else "auto"
+        bname = config.benchmark_name if config is not None else "Buy & Hold"
+
+        if custom is not None:
+            # --- Determine benchmark type ---
+            if btype == "auto":
+                # Heuristic: all positive and minimum > 1.0 → prices
+                if (custom > 0).all() and custom.min() > 1.0:
+                    detected = "prices"
+                else:
+                    detected = "returns"
+                warnings.warn(
+                    f"benchmark_type='auto': detected as '{detected}'. "
+                    "Consider specifying benchmark_type explicitly.",
+                    stacklevel=2,
+                )
+                btype = detected
+
+            # --- Convert to equity curve ---
+            if btype == "prices":
+                if custom.iloc[0] != 0:
+                    benchmark_equity = custom / custom.iloc[0] * self.initial_capital
+                else:
+                    benchmark_equity = pd.Series(
+                        self.initial_capital, index=custom.index
+                    )
+            else:
+                # returns
+                benchmark_equity = (1 + custom).cumprod() * self.initial_capital
+
+            # --- Align to data index ---
+            benchmark_equity = benchmark_equity.reindex(data.index).ffill()
+
+            # Warn if >5% missing after alignment
+            n_missing = int(benchmark_equity.isna().sum())
+            if n_missing > 0:
+                pct_missing = n_missing / len(data.index)
+                if pct_missing > 0.05:
+                    warnings.warn(
+                        f"Custom benchmark has {pct_missing:.1%} missing values "
+                        f"after alignment ({n_missing}/{len(data.index)} bars). "
+                        "Results may be unreliable.",
+                        stacklevel=2,
+                    )
+                # Fill any remaining leading NaN with the initial capital
+                benchmark_equity = benchmark_equity.bfill()
+
         else:
-            benchmark_equity = self.initial_capital * (close / close.iloc[0])
-        bh_returns = close.pct_change().fillna(0)
-        benchmark_metrics = self._calculate_metrics(bh_returns, benchmark_equity, trades=[])
-        return benchmark_equity, benchmark_metrics
+            # Default: buy-and-hold
+            benchmark_equity = compute_buy_and_hold(data, self.initial_capital)
+            bname = "Buy & Hold"
+
+        bh_returns = benchmark_equity.pct_change().fillna(0)
+        benchmark_metrics = self._calculate_metrics(
+            bh_returns, benchmark_equity, trades=[]
+        )
+        return benchmark_equity, benchmark_metrics, bname
 
     def __repr__(self):
         return (f"BacktestEngine(mode={self.mode.value}, "
@@ -482,6 +587,9 @@ def backtest(
     fee_model: Union[BaseFeeModel, str] = None,
     mode: str = "vectorized",
     stop_loss: float = None,
+    benchmark: Optional[pd.Series] = None,
+    benchmark_type: Optional[str] = None,
+    benchmark_name: Optional[str] = None,
     **kwargs
 ) -> BacktestResult:
     """
@@ -495,6 +603,10 @@ def backtest(
         fee_model: Fee model.
         mode: Execution mode.
         stop_loss: Stop loss percentage.
+        benchmark: Custom benchmark series (prices or returns).
+        benchmark_type: Benchmark type — ``"prices"``, ``"returns"``,
+            or ``"auto"``.
+        benchmark_name: Display name for the benchmark in results.
         **kwargs: Additional engine parameters.
 
     Returns:
@@ -514,6 +626,9 @@ def backtest(
     if fee_model:
         engine.set_fee_model(fee_model)
 
+    if benchmark_name is not None:
+        engine._config_benchmark_name = benchmark_name
+
     if strategy:
         engine.set_strategy(strategy)
     elif signals is not None:
@@ -521,4 +636,4 @@ def backtest(
     else:
         raise ValueError("Must provide either strategy or signals")
 
-    return engine.run(data)
+    return engine.run(data, benchmark=benchmark, benchmark_type=benchmark_type)

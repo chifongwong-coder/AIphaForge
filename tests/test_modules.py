@@ -3,8 +3,6 @@ Tests for v0.4 modules: exit rules, position sizing, fee model improvements,
 OHLCV validation, and trade costs.
 """
 
-import warnings
-from unittest.mock import MagicMock
 
 import numpy as np
 import pandas as pd
@@ -19,7 +17,6 @@ from aiphaforge.position_sizing import FixedSizer, FractionSizer
 from aiphaforge.utils import validate_ohlcv
 
 from .conftest import make_ohlcv
-
 
 # ---------- Exit Rules ----------
 

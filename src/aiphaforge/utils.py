@@ -286,6 +286,25 @@ def annualize(
     return float(value * trading_days)
 
 
+def compute_buy_and_hold(data: pd.DataFrame, initial_capital: float) -> pd.Series:
+    """Compute the buy-and-hold equity curve from OHLCV data.
+
+    Assumes the entire capital is invested at the first close price
+    and held throughout.
+
+    Args:
+        data: OHLCV DataFrame with a ``close`` column.
+        initial_capital: Starting capital.
+
+    Returns:
+        pd.Series: Buy-and-hold equity curve indexed by ``data.index``.
+    """
+    close = data["close"]
+    if close.iloc[0] <= 0:
+        return pd.Series(initial_capital, index=close.index)
+    return close / close.iloc[0] * initial_capital
+
+
 def extract_trades_vectorized(
     data: pd.DataFrame,
     positions: pd.Series,

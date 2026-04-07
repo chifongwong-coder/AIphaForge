@@ -50,12 +50,13 @@ def run_event_driven(
     broker = Broker(
         fee_model=config.fee_model,
         fill_model=config.fill_model,
+        session_end_time=config.session_end_time,
     )
     broker.set_portfolio(portfolio)
 
     # Notify hooks: backtest start
     for hook in config.hooks:
-        hook.on_backtest_start(data, symbol)
+        hook.on_backtest_start(data, symbol, config=config)
 
     # Process each bar
     for i, (timestamp, bar) in enumerate(data.iterrows()):

@@ -73,6 +73,7 @@ from .hooks import (
     BacktestHook,
     HookContext,
 )
+from .latency import LatencyHook, SimpleLatencyHook
 from .orders import Order, OrderManager, OrderSide, OrderStatus, OrderType
 from .performance import PerformanceAnalyzer, analyze, compare_strategies
 from .portfolio import Portfolio, Position
@@ -83,7 +84,7 @@ from .risk import (
     RiskSignal,
 )
 
-__version__ = '0.4.0'
+__version__ = '0.5.0'
 
 __all__ = [
     # Main engine
@@ -138,6 +139,8 @@ __all__ = [
     # Hooks
     'HookContext',
     'BacktestHook',
+    'LatencyHook',
+    'SimpleLatencyHook',
 
     # Config
     'BacktestConfig',

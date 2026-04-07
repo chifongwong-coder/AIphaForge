@@ -17,6 +17,7 @@ AIphaForge also works perfectly well as a general-purpose backtest framework for
 ### Core Engine
 - **Dual execution modes**: Vectorized (fast, for parameter sweeps) and Event-Driven (precise, bar-by-bar simulation)
 - **Realistic order simulation**: Market, limit, stop, and stop-limit orders with configurable fill and slippage models
+- **Time-in-force support**: GTC, IOC, FOK, and DAY order expiration with session-aware DAY semantics
 - **Multi-market fee models**: US stocks, China A-shares, crypto spot, and crypto futures with accurate fee structures
 - **Portfolio management**: Multi-symbol position tracking, cash management, equity curve recording
 
@@ -25,13 +26,14 @@ AIphaForge also works perfectly well as a general-purpose backtest framework for
 - **Strategy interface**: Any object with a `generate_signals()` method works as a strategy
 - **Risk manager interface**: Inject your own risk management system via constructor
 - **Agent integration interface**: Hook framework for building LLM-based decision agent integrations
+- **Agent latency simulation**: Model LLM inference delays with `LatencyHook` (fixed, statistical, or custom delay models)
 - **Fee model extensibility**: Subclass `BaseFeeModel` to support any market
 
 ### Performance Analysis
 - 30+ metrics: Sharpe, Sortino, Calmar, max drawdown, VaR, CVaR, profit factor, and more
 - Monthly/yearly return breakdowns
 - Multi-strategy comparison
-- Buy-and-hold benchmark
+- Custom benchmark comparison (or automatic buy-and-hold)
 
 ## Quick Start
 
@@ -85,6 +87,42 @@ engine = BacktestEngine(
 )
 ```
 
+### Simulating Agent Latency
+
+LLM inference takes seconds to minutes. Use `LatencyHook` to model this delay in backtests:
+
+```python
+from aiphaforge import LatencyHook, BacktestEngine
+
+# Wrap any hook with latency simulation
+latency_hook = LatencyHook(
+    inner_hook=AgentHook(my_agent, trigger_interval=20),
+    latency_model="fixed",
+    latency_params={"bars": 3},  # 3-bar delay between decision and execution
+)
+
+engine = BacktestEngine(
+    mode='event_driven',
+    hooks=[latency_hook]
+)
+result = engine.run(data)
+```
+
+Or subclass `SimpleLatencyHook` for a more concise approach:
+
+```python
+from aiphaforge import SimpleLatencyHook
+
+class MyLatencyAgent(SimpleLatencyHook):
+    def __init__(self):
+        super().__init__(latency_model="fixed", latency_params={"bars": 3})
+
+    def make_decision(self, ctx):
+        if ctx.bar_data['close'] > ctx.data['close'].mean():
+            return ctx.broker.create_market_order(ctx.symbol, 'buy', 100)
+        return None
+```
+
 ## Installation
 
 ```bash
@@ -113,6 +151,7 @@ src/aiphaforge/
 ├── orders.py              # Order types and lifecycle management
 ├── fees.py                # Multi-market fee models
 ├── hooks.py               # Hook framework for extensibility
+├── latency.py             # Agent latency simulation (LatencyHook)
 ├── risk.py                # Risk manager ABC
 ├── results.py             # Result data structures
 ├── performance.py         # Performance analysis and reporting

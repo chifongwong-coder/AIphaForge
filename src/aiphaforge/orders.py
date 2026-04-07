@@ -34,6 +34,7 @@ class OrderStatus(Enum):
     CANCELLED = "cancelled"
     REJECTED = "rejected"
     EXPIRED = "expired"
+    PARTIALLY_EXPIRED = "partially_expired"
 
 
 @dataclass
@@ -189,11 +190,31 @@ class Order:
             raise ValueError(f"Cannot cancel inactive order, current status: {self.status}")
         self.status = OrderStatus.CANCELLED
 
+    def expire(self, reason: str = ""):
+        """Expire the order.
+
+        If the order has been partially filled, transitions to
+        PARTIALLY_EXPIRED; otherwise transitions to EXPIRED.
+
+        Parameters:
+            reason: Expiry reason (written to metadata["expiry_reason"]).
+        """
+        if not self.is_active:
+            raise ValueError(
+                f"Cannot expire inactive order, current status: {self.status}"
+            )
+        if self.filled_size > 0:
+            self.status = OrderStatus.PARTIALLY_EXPIRED
+        else:
+            self.status = OrderStatus.EXPIRED
+        if reason:
+            self.metadata["expiry_reason"] = reason
+
     def reject(self, reason: str = ""):
         """Reject the order."""
         self.status = OrderStatus.REJECTED
         if reason:
-            self.reason = reason
+            self.metadata["reject_reason"] = reason
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
@@ -213,6 +234,8 @@ class Order:
             'commission': self.commission,
             'slippage': self.slippage,
             'reason': self.reason,
+            'time_in_force': self.time_in_force,
+            'metadata': dict(self.metadata),
             'remaining_size': self.remaining_size,
             'notional_value': self.notional_value
         }
@@ -224,7 +247,8 @@ class Order:
             OrderStatus.PARTIALLY_FILLED: "[PARTIAL]",
             OrderStatus.CANCELLED: "[CANCELLED]",
             OrderStatus.REJECTED: "[REJECTED]",
-            OrderStatus.EXPIRED: "[EXPIRED]"
+            OrderStatus.EXPIRED: "[EXPIRED]",
+            OrderStatus.PARTIALLY_EXPIRED: "[PART_EXPIRED]",
         }
         sym = status_sym.get(self.status, "")
         side_str = "BUY" if self.is_buy else "SELL"
@@ -270,6 +294,7 @@ class OrderManager:
         stop_price: Optional[float] = None,
         reason: str = "",
         timestamp: Optional[pd.Timestamp] = None,
+        time_in_force: str = "GTC",
         **kwargs
     ) -> Order:
         """
@@ -284,6 +309,7 @@ class OrderManager:
             stop_price: Stop trigger price.
             reason: Order reason/tag.
             timestamp: Creation time.
+            time_in_force: Order validity type ('GTC', 'IOC', 'FOK', 'DAY').
             **kwargs: Additional metadata.
 
         Returns:
@@ -299,6 +325,7 @@ class OrderManager:
             stop_price=stop_price,
             reason=reason,
             created_time=timestamp,
+            time_in_force=time_in_force,
             metadata=kwargs
         )
         return order
@@ -309,12 +336,14 @@ class OrderManager:
         side: str,
         size: float,
         reason: str = "",
-        timestamp: Optional[pd.Timestamp] = None
+        timestamp: Optional[pd.Timestamp] = None,
+        time_in_force: str = "GTC",
     ) -> Order:
         """Create a market order."""
         return self.create_order(
             symbol=symbol, side=side, order_type="market",
-            size=size, reason=reason, timestamp=timestamp
+            size=size, reason=reason, timestamp=timestamp,
+            time_in_force=time_in_force,
         )
 
     def create_limit_order(
@@ -324,12 +353,14 @@ class OrderManager:
         size: float,
         price: float,
         reason: str = "",
-        timestamp: Optional[pd.Timestamp] = None
+        timestamp: Optional[pd.Timestamp] = None,
+        time_in_force: str = "GTC",
     ) -> Order:
         """Create a limit order."""
         return self.create_order(
             symbol=symbol, side=side, order_type="limit",
-            size=size, price=price, reason=reason, timestamp=timestamp
+            size=size, price=price, reason=reason, timestamp=timestamp,
+            time_in_force=time_in_force,
         )
 
     def create_stop_order(
@@ -339,12 +370,14 @@ class OrderManager:
         size: float,
         stop_price: float,
         reason: str = "",
-        timestamp: Optional[pd.Timestamp] = None
+        timestamp: Optional[pd.Timestamp] = None,
+        time_in_force: str = "GTC",
     ) -> Order:
         """Create a stop order."""
         return self.create_order(
             symbol=symbol, side=side, order_type="stop",
-            size=size, stop_price=stop_price, reason=reason, timestamp=timestamp
+            size=size, stop_price=stop_price, reason=reason, timestamp=timestamp,
+            time_in_force=time_in_force,
         )
 
     def submit(self, order: Order) -> str:

@@ -2,7 +2,6 @@
 Tests for BacktestEngine — vectorized and event-driven modes.
 """
 
-import warnings
 
 import numpy as np
 import pandas as pd

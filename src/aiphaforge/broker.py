@@ -4,6 +4,7 @@ Broker Simulation
 Simulates order execution, slippage, and fill logic.
 """
 
+from datetime import time
 from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
@@ -57,7 +58,8 @@ class Broker:
         partial_fills: bool = False,
         volume_limit_pct: float = 0.1,
         check_buying_power: bool = True,
-        stop_fill_pessimistic: bool = True
+        stop_fill_pessimistic: bool = True,
+        session_end_time: Optional[time] = None
     ):
         self.fee_model = fee_model or SimpleFeeModel()
         self.fill_model = fill_model
@@ -66,6 +68,7 @@ class Broker:
         self.volume_limit_pct = volume_limit_pct
         self.check_buying_power = check_buying_power
         self.stop_fill_pessimistic = stop_fill_pessimistic
+        self.session_end_time = session_end_time
 
         # Order management
         self.order_manager = OrderManager()
@@ -90,11 +93,13 @@ class Broker:
         side: str,
         size: float,
         reason: str = "",
-        timestamp: Optional[pd.Timestamp] = None
+        timestamp: Optional[pd.Timestamp] = None,
+        time_in_force: str = "GTC",
     ) -> Order:
         """Create a market order."""
         return self.order_manager.create_market_order(
-            symbol, side, size, reason, timestamp
+            symbol, side, size, reason, timestamp,
+            time_in_force=time_in_force,
         )
 
     def create_limit_order(
@@ -104,11 +109,13 @@ class Broker:
         size: float,
         price: float,
         reason: str = "",
-        timestamp: Optional[pd.Timestamp] = None
+        timestamp: Optional[pd.Timestamp] = None,
+        time_in_force: str = "GTC",
     ) -> Order:
         """Create a limit order."""
         return self.order_manager.create_limit_order(
-            symbol, side, size, price, reason, timestamp
+            symbol, side, size, price, reason, timestamp,
+            time_in_force=time_in_force,
         )
 
     def create_stop_order(
@@ -118,11 +125,13 @@ class Broker:
         size: float,
         stop_price: float,
         reason: str = "",
-        timestamp: Optional[pd.Timestamp] = None
+        timestamp: Optional[pd.Timestamp] = None,
+        time_in_force: str = "GTC",
     ) -> Order:
         """Create a stop order."""
         return self.order_manager.create_stop_order(
-            symbol, side, size, stop_price, reason, timestamp
+            symbol, side, size, stop_price, reason, timestamp,
+            time_in_force=time_in_force,
         )
 
     # ========== Order Submission ==========
@@ -144,6 +153,12 @@ class Broker:
         """
         if timestamp and order.created_time is None:
             order.created_time = timestamp
+
+        # DAY orders must have a created_time for session expiration logic
+        if order.time_in_force == "DAY" and order.created_time is None:
+            raise ValueError(
+                "DAY orders must have created_time set at submission"
+            )
 
         # Buying power check
         if self.check_buying_power and self._portfolio and order.is_buy:
@@ -179,6 +194,11 @@ class Broker:
         """
         Process a bar and attempt to fill pending orders.
 
+        Uses a two-phase approach:
+        - Pre-phase: expire stale DAY orders from a previous session.
+        - Phase 1: process IOC/FOK orders (one-shot semantics).
+        - Phase 2: process GTC/DAY orders (normal persistent logic).
+
         Parameters:
             bar: Bar data containing open, high, low, close, volume.
             timestamp: Timestamp.
@@ -187,56 +207,137 @@ class Broker:
         Returns:
             List[Order]: Orders filled during this bar.
         """
-        filled_orders = []
+        filled_orders: List[Order] = []
         pending = self.order_manager.get_pending_orders(symbol)
 
+        # Pre-phase: expire stale DAY orders
         for order in pending:
             if order.symbol != symbol:
                 continue
+            if order.time_in_force != "DAY":
+                continue
+            if self._is_day_order_stale(order, timestamp):
+                order.expire("day_session_end")
 
-            filled = self._try_fill_order(order, bar, timestamp)
-            if filled:
-                filled_orders.append(order)
-                self.filled_orders += 1
+        # Refresh the pending list after expiring DAY orders
+        pending = self.order_manager.get_pending_orders(symbol)
+
+        # Phase 1: IOC and FOK orders (one chance to fill)
+        for order in pending:
+            if order.symbol != symbol:
+                continue
+            if order.time_in_force == "IOC":
+                filled = self._try_fill_order(order, bar, timestamp)
+                if filled and order.is_filled:
+                    filled_orders.append(order)
+                    self.filled_orders += 1
+                elif filled and order.is_active:
+                    # Partially filled IOC: expire the remainder
+                    order.expire("ioc_timeout")
+                    filled_orders.append(order)
+                else:
+                    # Not filled at all
+                    order.expire("ioc_timeout")
+            elif order.time_in_force == "FOK":
+                volume = bar.get('volume', float('inf'))
+                if volume < float('inf'):
+                    available = volume * self.volume_limit_pct
+                    if available < order.size:
+                        order.expire("fok_volume")
+                        continue
+                # FOK pre-check passed: attempt full fill (bypass partial clip)
+                filled = self._try_fill_order(
+                    order, bar, timestamp, bypass_partial_clip=True
+                )
+                if filled:
+                    filled_orders.append(order)
+                    self.filled_orders += 1
+                else:
+                    order.expire("fok_price")
+
+        # Phase 2: GTC and DAY orders (normal processing)
+        pending = self.order_manager.get_pending_orders(symbol)
+        for order in pending:
+            if order.symbol != symbol:
+                continue
+            if order.time_in_force in ("GTC", "DAY"):
+                filled = self._try_fill_order(order, bar, timestamp)
+                if filled:
+                    filled_orders.append(order)
+                    self.filled_orders += 1
 
         return filled_orders
+
+    def _is_day_order_stale(
+        self, order: Order, current_timestamp: pd.Timestamp
+    ) -> bool:
+        """Check whether a DAY order belongs to a previous session.
+
+        If ``session_end_time`` is configured, the order is stale when the
+        current bar timestamp is past that time on the same day *or* on a
+        later calendar day.  Without ``session_end_time``, stale simply
+        means the order's creation date differs from the bar's date.
+        """
+        if order.created_time is None:
+            return False
+        if self.session_end_time is not None:
+            # Session-based: stale if bar is past session_end_time on the
+            # creation day, or on a later calendar day.
+            if current_timestamp.date() > order.created_time.date():
+                return True
+            if (
+                current_timestamp.date() == order.created_time.date()
+                and current_timestamp.time() > self.session_end_time
+            ):
+                return True
+            return False
+        # Calendar-day based: stale when date changes
+        return current_timestamp.date() != order.created_time.date()
 
     def _try_fill_order(
         self,
         order: Order,
         bar: pd.Series,
-        timestamp: pd.Timestamp
+        timestamp: pd.Timestamp,
+        bypass_partial_clip: bool = False
     ) -> bool:
         """
         Attempt to fill an order against a bar.
 
+        Parameters:
+            order: The order to fill.
+            bar: Bar OHLCV data.
+            timestamp: Current bar timestamp.
+            bypass_partial_clip: If True, skip the partial_fills volume
+                clipping inside _execute_fill (used by FOK after its own
+                pre-check).
+
         Returns:
-            bool: Whether the order was filled.
+            bool: Whether (any part of) the order was filled.
         """
         high = bar['high']
         low = bar['low']
+        volume = bar.get('volume', float('inf'))
 
         if order.order_type == OrderType.MARKET:
             fill_price = self._get_fill_price(order, bar)
-            return self._execute_fill(order, fill_price, order.size, timestamp, bar.get('volume', float('inf')))
+            return self._execute_fill(order, fill_price, order.size, timestamp, volume, bypass_partial_clip)
 
         elif order.order_type == OrderType.LIMIT:
             if should_fill_limit(order.price, order.side, high, low):
                 fill_price = order.price
-                return self._execute_fill(order, fill_price, order.size, timestamp, bar.get('volume', float('inf')))
+                return self._execute_fill(order, fill_price, order.size, timestamp, volume, bypass_partial_clip)
 
         elif order.order_type == OrderType.STOP:
             if should_trigger_stop(order.stop_price, order.side, high, low):
-                # Triggered: fill at market price
                 fill_price = self._get_stop_fill_price(order, bar)
-                return self._execute_fill(order, fill_price, order.size, timestamp, bar.get('volume', float('inf')))
+                return self._execute_fill(order, fill_price, order.size, timestamp, volume, bypass_partial_clip)
 
         elif order.order_type == OrderType.STOP_LIMIT:
             if should_trigger_stop(order.stop_price, order.side, high, low):
-                # Stop triggered: check if limit can also be filled on this bar
                 if should_fill_limit(order.price, order.side, high, low):
                     fill_price = order.price
-                    return self._execute_fill(order, fill_price, order.size, timestamp, bar.get('volume', float('inf')))
+                    return self._execute_fill(order, fill_price, order.size, timestamp, volume, bypass_partial_clip)
                 else:
                     # Stop triggered but limit not filled: convert to limit order
                     order.order_type = OrderType.LIMIT
@@ -283,16 +384,26 @@ class Broker:
         price: float,
         size: float,
         timestamp: pd.Timestamp,
-        volume: float
+        volume: float,
+        bypass_partial_clip: bool = False
     ) -> bool:
         """
         Execute an order fill.
 
+        Parameters:
+            order: The order to fill.
+            price: Fill price.
+            size: Requested fill quantity.
+            timestamp: Fill timestamp.
+            volume: Bar volume.
+            bypass_partial_clip: If True, skip the partial_fills volume
+                clipping (used by FOK which performs its own pre-check).
+
         Returns:
             bool: Whether the fill was successful.
         """
-        # Volume limit check
-        if self.partial_fills and volume < float('inf'):
+        # Volume limit check (skipped for FOK which does its own pre-check)
+        if not bypass_partial_clip and self.partial_fills and volume < float('inf'):
             max_fill = volume * self.volume_limit_pct
             if size > max_fill:
                 size = max_fill

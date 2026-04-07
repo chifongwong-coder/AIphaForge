@@ -153,6 +153,7 @@ class BacktestResult:
     daily_returns: Optional[pd.Series] = None
     benchmark_equity: Optional[pd.Series] = None
     benchmark_metrics: Optional[Dict[str, float]] = None
+    benchmark_name: str = "Buy & Hold"
 
     def __post_init__(self):
         if self.final_capital == 0.0 and len(self.equity_curve) > 0:
@@ -299,7 +300,7 @@ class BacktestResult:
             excess = self.total_return - bm_ret
             lines += [
                 "",
-                "[Benchmark - Buy & Hold]",
+                f"[Benchmark - {self.benchmark_name}]",
                 f"  Benchmark Return: {bm_ret*100:+.2f}%",
                 f"  Benchmark Sharpe: {bm_sharpe:.3f}",
                 f"  Benchmark MDD:    {bm_mdd*100:.2f}%",
