@@ -417,5 +417,22 @@ class SymbolRoutingLatencyHook(LatencyHook):
         order = self._current_order
         if order is not None and order.symbol in self._symbol_overrides:
             model, params = self._symbol_overrides[order.symbol]
-            return self._calculate_delay_for_model(bar_index, ctx, model, params)
+            value = self._calculate_delay_for_model(bar_index, ctx, model, params)
+            # Apply same guard+clamp as base class for custom callables
+            if model == "custom":
+                if not isinstance(value, (int, float)) or math.isnan(value) or math.isinf(value):
+                    raise ValueError(
+                        f"Custom latency callable returned invalid value: {value}"
+                    )
+                clamped = max(1, int(value))
+                if clamped != int(value) and not self._warned_custom_clamp:
+                    warnings.warn(
+                        f"Custom latency callable returned {value} at bar "
+                        f"{bar_index}, clamped to {clamped} (minimum delay "
+                        f"is 1 bar). Further clamp warnings suppressed.",
+                        stacklevel=2,
+                    )
+                    self._warned_custom_clamp = True
+                return clamped
+            return value
         return super()._calculate_delay(bar_index, ctx)

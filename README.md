@@ -108,6 +108,19 @@ engine = BacktestEngine(
 result = engine.run(data)
 ```
 
+For per-symbol latency (e.g., different LLM inference times for different assets), use `SymbolRoutingLatencyHook`:
+
+```python
+from aiphaforge import SymbolRoutingLatencyHook
+
+hook = SymbolRoutingLatencyHook(
+    inner_hook=AgentHook(my_agent),
+    default_latency_model="fixed",
+    default_latency_params={"bars": 3},
+    symbol_overrides={"AAPL": ("fixed", {"bars": 1})},
+)
+```
+
 Or subclass `SimpleLatencyHook` for a more concise approach:
 
 ```python

@@ -70,6 +70,11 @@ class Broker:
         self.check_buying_power = check_buying_power
         self.stop_fill_pessimistic = stop_fill_pessimistic
         self.session_end_time = session_end_time
+        if immediate_fill_price not in ("close", "open", "vwap"):
+            raise ValueError(
+                f"immediate_fill_price must be 'close', 'open', or 'vwap', "
+                f"got {immediate_fill_price!r}"
+            )
         self.immediate_fill_price = immediate_fill_price
 
         # Order management
@@ -289,12 +294,14 @@ class Broker:
                 else:
                     # Not filled at all
                     order.expire("ioc_timeout")
+                    processed.append(order)
             elif order.time_in_force == "FOK":
                 volume = bar.get('volume', float('inf'))
                 if volume < float('inf'):
                     available = volume * self.volume_limit_pct
                     if available < order.size:
                         order.expire("fok_volume")
+                        processed.append(order)
                         continue
                 # FOK pre-check passed: attempt full fill
                 if fill_price_override is not None and order.order_type == OrderType.MARKET:
@@ -311,6 +318,7 @@ class Broker:
                     self.filled_orders += 1
                 else:
                     order.expire("fok_price")
+                    processed.append(order)
 
         return processed
 
