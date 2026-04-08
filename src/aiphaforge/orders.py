@@ -423,6 +423,24 @@ class OrderManager:
             filled = [o for o in filled if o.symbol == symbol]
         return filled
 
+    def get_orders_with_fills(self, symbol: Optional[str] = None) -> List[Order]:
+        """Get orders that have any fills (FILLED + PARTIALLY_EXPIRED).
+
+        Unlike ``get_filled_orders`` which only returns fully filled orders,
+        this method also includes partially expired orders that received
+        partial fills before expiration.
+
+        Parameters:
+            symbol: Optional symbol filter.
+
+        Returns:
+            List[Order]: Orders with ``filled_size > 0``.
+        """
+        result = [o for o in self.orders.values() if o.filled_size > 0]
+        if symbol:
+            result = [o for o in result if o.symbol == symbol]
+        return result
+
     def get_all_orders(self) -> List[Order]:
         return list(self.orders.values())
 

@@ -519,7 +519,7 @@ class Portfolio:
         Returns:
             Optional[Trade]: Trade record if a round-trip was completed.
         """
-        if not order.is_filled:
+        if order.filled_size == 0:
             return None
 
         size_change = order.filled_size

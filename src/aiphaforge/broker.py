@@ -59,7 +59,8 @@ class Broker:
         volume_limit_pct: float = 0.1,
         check_buying_power: bool = True,
         stop_fill_pessimistic: bool = True,
-        session_end_time: Optional[time] = None
+        session_end_time: Optional[time] = None,
+        immediate_fill_price: str = "close",
     ):
         self.fee_model = fee_model or SimpleFeeModel()
         self.fill_model = fill_model
@@ -69,6 +70,7 @@ class Broker:
         self.check_buying_power = check_buying_power
         self.stop_fill_pessimistic = stop_fill_pessimistic
         self.session_end_time = session_end_time
+        self.immediate_fill_price = immediate_fill_price
 
         # Order management
         self.order_manager = OrderManager()
@@ -223,37 +225,8 @@ class Broker:
         pending = self.order_manager.get_pending_orders(symbol)
 
         # Phase 1: IOC and FOK orders (one chance to fill)
-        for order in pending:
-            if order.symbol != symbol:
-                continue
-            if order.time_in_force == "IOC":
-                filled = self._try_fill_order(order, bar, timestamp)
-                if filled and order.is_filled:
-                    filled_orders.append(order)
-                    self.filled_orders += 1
-                elif filled and order.is_active:
-                    # Partially filled IOC: expire the remainder
-                    order.expire("ioc_timeout")
-                    filled_orders.append(order)
-                else:
-                    # Not filled at all
-                    order.expire("ioc_timeout")
-            elif order.time_in_force == "FOK":
-                volume = bar.get('volume', float('inf'))
-                if volume < float('inf'):
-                    available = volume * self.volume_limit_pct
-                    if available < order.size:
-                        order.expire("fok_volume")
-                        continue
-                # FOK pre-check passed: attempt full fill (bypass partial clip)
-                filled = self._try_fill_order(
-                    order, bar, timestamp, bypass_partial_clip=True
-                )
-                if filled:
-                    filled_orders.append(order)
-                    self.filled_orders += 1
-                else:
-                    order.expire("fok_price")
+        processed = self._process_ioc_fok_orders(bar, timestamp, symbol)
+        filled_orders.extend(processed)
 
         # Phase 2: GTC and DAY orders (normal processing)
         pending = self.order_manager.get_pending_orders(symbol)
@@ -267,6 +240,115 @@ class Broker:
                     self.filled_orders += 1
 
         return filled_orders
+
+    def _process_ioc_fok_orders(
+        self,
+        bar: pd.Series,
+        timestamp: pd.Timestamp,
+        symbol: str,
+        fill_price_override: Optional[float] = None,
+    ) -> List[Order]:
+        """Process pending IOC and FOK orders.
+
+        Shared helper used by both ``process_bar`` (Phase 1) and
+        ``process_immediate_orders`` (second pass).
+
+        Parameters:
+            bar: Bar OHLCV data.
+            timestamp: Current bar timestamp.
+            symbol: Instrument symbol.
+            fill_price_override: If provided, market orders use this price
+                instead of the configured fill model.  Limit/stop orders
+                keep their own price logic.
+
+        Returns:
+            List[Order]: All processed IOC/FOK orders (filled, partially
+                expired, or fully expired).
+        """
+        processed: List[Order] = []
+        pending = self.order_manager.get_pending_orders(symbol)
+
+        for order in pending:
+            if order.symbol != symbol:
+                continue
+            if order.time_in_force == "IOC":
+                if fill_price_override is not None and order.order_type == OrderType.MARKET:
+                    filled = self._execute_fill(
+                        order, fill_price_override, order.size, timestamp,
+                        bar.get('volume', float('inf')),
+                    )
+                else:
+                    filled = self._try_fill_order(order, bar, timestamp)
+                if filled and order.is_filled:
+                    processed.append(order)
+                    self.filled_orders += 1
+                elif filled and order.is_active:
+                    # Partially filled IOC: expire the remainder
+                    order.expire("ioc_timeout")
+                    processed.append(order)
+                else:
+                    # Not filled at all
+                    order.expire("ioc_timeout")
+            elif order.time_in_force == "FOK":
+                volume = bar.get('volume', float('inf'))
+                if volume < float('inf'):
+                    available = volume * self.volume_limit_pct
+                    if available < order.size:
+                        order.expire("fok_volume")
+                        continue
+                # FOK pre-check passed: attempt full fill
+                if fill_price_override is not None and order.order_type == OrderType.MARKET:
+                    filled = self._execute_fill(
+                        order, fill_price_override, order.size, timestamp,
+                        volume, bypass_partial_clip=True,
+                    )
+                else:
+                    filled = self._try_fill_order(
+                        order, bar, timestamp, bypass_partial_clip=True,
+                    )
+                if filled:
+                    processed.append(order)
+                    self.filled_orders += 1
+                else:
+                    order.expire("fok_price")
+
+        return processed
+
+    def process_immediate_orders(
+        self,
+        bar: pd.Series,
+        timestamp: pd.Timestamp,
+        symbol: str = "default",
+    ) -> List[Order]:
+        """Process pending IOC/FOK orders submitted during the current bar.
+
+        This is the "second pass" for same-bar IOC/FOK semantics.  Only
+        IOC and FOK orders participate; GTC/DAY orders are untouched.
+
+        The fill price for market orders is determined by
+        ``self.immediate_fill_price``:
+            - ``"close"``: current bar's close price.
+            - ``"open"``: current bar's open price.
+            - ``"vwap"``: ``(high + low + close) / 3``.
+
+        Parameters:
+            bar: Current bar OHLCV data.
+            timestamp: Current bar timestamp.
+            symbol: Instrument symbol.
+
+        Returns:
+            List[Order]: Orders that were processed (filled/expired).
+        """
+        if self.immediate_fill_price == "open":
+            price = bar['open']
+        elif self.immediate_fill_price == "vwap":
+            price = (bar['high'] + bar['low'] + bar['close']) / 3
+        else:  # "close" (default)
+            price = bar['close']
+
+        return self._process_ioc_fok_orders(
+            bar, timestamp, symbol, fill_price_override=price,
+        )
 
     def _is_day_order_stale(
         self, order: Order, current_timestamp: pd.Timestamp
@@ -468,6 +550,13 @@ class Broker:
 
     def get_filled_orders(self, symbol: Optional[str] = None) -> List[Order]:
         return self.order_manager.get_filled_orders(symbol)
+
+    def get_orders_with_fills(self, symbol: Optional[str] = None) -> List[Order]:
+        """Get orders that have any fills (FILLED + PARTIALLY_EXPIRED).
+
+        Passthrough to ``OrderManager.get_orders_with_fills``.
+        """
+        return self.order_manager.get_orders_with_fills(symbol)
 
     def get_order(self, order_id: str) -> Optional[Order]:
         return self.order_manager.get_order(order_id)
