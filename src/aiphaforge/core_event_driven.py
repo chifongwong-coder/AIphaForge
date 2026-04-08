@@ -51,6 +51,7 @@ def run_event_driven(
         fee_model=config.fee_model,
         fill_model=config.fill_model,
         session_end_time=config.session_end_time,
+        immediate_fill_price=config.immediate_fill_price,
     )
     broker.set_portfolio(portfolio)
 
@@ -96,6 +97,11 @@ def run_event_driven(
             for hook in config.hooks:
                 hook.on_pre_signal(ctx)
 
+        # 4b. Process immediate IOC/FOK orders submitted by hooks
+        immediate = broker.process_immediate_orders(bar, timestamp, symbol)
+        for order in immediate:
+            portfolio.update_from_order(order, timestamp)
+
         # 5. Process new signals
         signal = signals.iloc[i] if i < len(signals) else 0
 
@@ -115,6 +121,11 @@ def run_event_driven(
                 bar_index=i,
                 full_data=full_data,
             )
+
+        # 5b. Process immediate IOC/FOK orders submitted by signals
+        immediate = broker.process_immediate_orders(bar, timestamp, symbol)
+        for order in immediate:
+            portfolio.update_from_order(order, timestamp)
 
         # 6. Call hooks: on_bar (after signal processing)
         if config.hooks:

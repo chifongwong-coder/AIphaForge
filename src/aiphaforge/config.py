@@ -44,6 +44,7 @@ class BacktestConfig:
     data_validation: str = "warn"
     max_position_size: float = 1.0
     session_end_time: Optional[time] = None
+    immediate_fill_price: str = "close"
     mode: str = "event_driven"
     has_signals: bool = False
     has_strategy: bool = False

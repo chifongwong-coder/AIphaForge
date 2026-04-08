@@ -20,6 +20,7 @@ from .costs import DefaultTradeCost
 from .exit_rules import PercentageStopLoss, PercentageTakeProfit
 from .fees import BaseFeeModel, SimpleFeeModel, get_fee_model
 from .hooks import BacktestHook
+from .latency import LatencyHook
 from .position_sizing import AllInSizer, FixedSizer, FractionSizer
 from .results import BacktestResult, Trade
 
@@ -111,6 +112,7 @@ class BacktestEngine:
         fee_allocation: str = "proportional",
         data_validation: str = "warn",
         session_end_time: Optional[time] = None,
+        immediate_fill_price: str = "close",
     ):
         # Fee model
         if isinstance(fee_model, str):
@@ -166,6 +168,9 @@ class BacktestEngine:
 
         # Session end time for DAY order expiration
         self.session_end_time = session_end_time
+
+        # Fill price for same-bar IOC/FOK second pass
+        self.immediate_fill_price = immediate_fill_price
 
         # Custom benchmark config defaults
         self._config_benchmark: Optional[pd.Series] = None
@@ -294,6 +299,20 @@ class BacktestEngine:
             benchmark_type=benchmark_type,
         )
 
+        # Guard: multiple LatencyHook instances wrapping the same inner_hook
+        latency_hooks = [h for h in self.hooks if isinstance(h, LatencyHook)]
+        if len(latency_hooks) > 1:
+            inner_ids: list[int] = []
+            for lh in latency_hooks:
+                iid = id(lh.inner_hook)
+                if iid in inner_ids:
+                    raise ValueError(
+                        "Multiple LatencyHook instances wrap the same "
+                        "inner_hook. Use a single LatencyHook per agent, or "
+                        "SymbolRoutingLatencyHook for per-symbol latency."
+                    )
+                inner_ids.append(iid)
+
         # Dispatch to execution core
         if self.mode == ExecutionMode.VECTORIZED:
             raw = run_vectorized(data, signals, config, symbol)
@@ -372,6 +391,7 @@ class BacktestEngine:
             data_validation=self.data_validation,
             max_position_size=self.max_position_size,
             session_end_time=self.session_end_time,
+            immediate_fill_price=self.immediate_fill_price,
             mode=self.mode.value,
             has_signals=self._signals is not None,
             has_strategy=self._strategy is not None,
