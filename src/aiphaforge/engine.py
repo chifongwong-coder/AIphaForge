@@ -116,6 +116,10 @@ class BacktestEngine:
         capital_allocator=None,
         asset_fee_models: Optional[Dict] = None,
         asset_fill_models: Optional[Dict] = None,
+        margin_config=None,
+        asset_margin_configs: Optional[Dict] = None,
+        periodic_cost_model=None,
+        portfolio_exit_rules: Optional[List] = None,
     ):
         # Fee model
         if isinstance(fee_model, str):
@@ -179,6 +183,12 @@ class BacktestEngine:
         self.capital_allocator = capital_allocator
         self.asset_fee_models: Dict = asset_fee_models or {}
         self.asset_fill_models: Dict = asset_fill_models or {}
+
+        # Margin (v0.8)
+        self.margin_config = margin_config
+        self.asset_margin_configs: Dict = asset_margin_configs or {}
+        self.periodic_cost_model = periodic_cost_model
+        self.portfolio_exit_rules: List = portfolio_exit_rules or []
 
         # Custom benchmark config defaults
         self._config_benchmark: Optional[pd.Series] = None
@@ -384,20 +394,21 @@ class BacktestEngine:
 
         # Auto-set allocator for multi-asset if not provided
         if config.capital_allocator is None:
-            warnings.warn(
-                "No capital_allocator set for multi-asset mode. "
-                "Using EqualWeightAllocator (equal budget per signal). "
-                "Set capital_allocator explicitly to suppress this warning."
-            )
-            config.capital_allocator = EqualWeightAllocator()
-
-        # LatencyHook guard for multi-asset
-        for hook in self.hooks:
-            if isinstance(hook, LatencyHook):
-                raise ValueError(
-                    "LatencyHook does not support multi-asset mode. "
-                    "Implement latency logic in your multi-asset hook."
+            if config.margin_config is not None:
+                from .capital_allocator import MarginAllocator
+                warnings.warn(
+                    "No capital_allocator set for multi-asset margin mode. "
+                    "Using MarginAllocator (buying_power based). "
+                    "Set capital_allocator explicitly to suppress."
                 )
+                config.capital_allocator = MarginAllocator()
+            else:
+                warnings.warn(
+                    "No capital_allocator set for multi-asset mode. "
+                    "Using EqualWeightAllocator (equal budget per signal). "
+                    "Set capital_allocator explicitly to suppress."
+                )
+                config.capital_allocator = EqualWeightAllocator()
 
         # Dispatch
         if self.mode == ExecutionMode.VECTORIZED:
@@ -628,6 +639,10 @@ class BacktestEngine:
             capital_allocator=self.capital_allocator,
             asset_fee_models=self.asset_fee_models,
             asset_fill_models=self.asset_fill_models,
+            margin_config=self.margin_config,
+            asset_margin_configs=self.asset_margin_configs,
+            periodic_cost_model=self.periodic_cost_model,
+            portfolio_exit_rules=self.portfolio_exit_rules,
         )
 
     def _build_result(

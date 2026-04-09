@@ -58,6 +58,7 @@ from .capital_allocator import (
     BaseCapitalAllocator,
     EqualWeightAllocator,
     FixedWeightAllocator,
+    MarginAllocator,
     ProRataAllocator,
 )
 from .config import BacktestConfig, resolve_config
@@ -80,6 +81,14 @@ from .hooks import (
     HookContext,
 )
 from .latency import LatencyHook, SimpleLatencyHook, SymbolRoutingLatencyHook
+from .margin import (
+    BasePortfolioExitRule,
+    BorrowingCostModel,
+    FundingRateModel,
+    MarginCallExitRule,
+    MarginConfig,
+    PeriodicCostModel,
+)
 from .orders import Order, OrderManager, OrderSide, OrderStatus, OrderType
 from .performance import PerformanceAnalyzer, analyze, compare_strategies
 from .portfolio import Portfolio, Position
@@ -90,7 +99,7 @@ from .risk import (
     RiskSignal,
 )
 
-__version__ = '0.7.0'
+__version__ = '0.8.0'
 
 __all__ = [
     # Main engine
@@ -157,7 +166,16 @@ __all__ = [
     'BaseCapitalAllocator',
     'EqualWeightAllocator',
     'FixedWeightAllocator',
+    'MarginAllocator',
     'ProRataAllocator',
+
+    # Margin
+    'MarginConfig',
+    'MarginCallExitRule',
+    'BasePortfolioExitRule',
+    'PeriodicCostModel',
+    'BorrowingCostModel',
+    'FundingRateModel',
 
     # Risk management
     'BaseRiskManager',
