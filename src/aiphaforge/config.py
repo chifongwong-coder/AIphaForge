@@ -54,15 +54,16 @@ class BacktestConfig:
     # Multi-asset fields (v0.7)
     asset_fee_models: Dict[str, BaseFeeModel] = field(default_factory=dict)
     asset_fill_models: Dict[str, FillModel] = field(default_factory=dict)
-    weights: Optional[Dict[str, float]] = None
     capital_allocator: Any = None  # BaseCapitalAllocator; typed Any to avoid cycle
-    trading_days: Optional[int] = None
     symbols: List[str] = field(default_factory=list)
     # Margin (v0.8)
     margin_config: Any = None  # MarginConfig; typed Any to avoid cycle
     asset_margin_configs: Dict = field(default_factory=dict)
     periodic_cost_model: Any = None  # PeriodicCostModel
     portfolio_exit_rules: List = field(default_factory=list)
+    # Lot sizes (v0.8)
+    lot_size: int = 1  # default 1 = fractional allowed
+    asset_lot_sizes: Dict[str, int] = field(default_factory=dict)
 
 
 def resolve_config(default: Any, overrides: Dict, symbol: str) -> Any:

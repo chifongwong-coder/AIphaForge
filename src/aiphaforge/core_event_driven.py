@@ -116,6 +116,16 @@ def run_event_driven(
             'bar_realized': {sym: 0.0 for sym in symbols},
         }
 
+    # --- Validate periodic cost config ---
+    if (config.periodic_cost_model is not None
+            and config.margin_config is None
+            and not config.asset_margin_configs):
+        warnings.warn(
+            "periodic_cost_model is set but margin_config is None. "
+            "Periodic costs require margin_config to calculate borrowing. "
+            "Costs will be zero for all symbols."
+        )
+
     # --- Notify hooks: backtest start (per symbol) ---
     for sym in sorted(symbols):
         for hook in config.hooks:
@@ -452,6 +462,12 @@ def _process_signal(
         max_size = budget / price
         if abs(size_change) > max_size:
             size_change = max_size * (1 if size_change > 0 else -1)
+
+    # Lot-size rounding (e.g., A-share 100-share lots)
+    lot = resolve_config(config.lot_size, config.asset_lot_sizes, symbol)
+    if lot > 1:
+        direction = 1 if size_change > 0 else -1
+        size_change = (int(abs(size_change)) // lot) * lot * direction
 
     if abs(size_change) < 0.001:  # Ignore tiny changes
         return

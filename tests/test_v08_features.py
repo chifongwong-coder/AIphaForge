@@ -14,6 +14,7 @@ from aiphaforge import (
     BacktestEngine,
     BacktestResult,
     Broker,
+    EqualWeightAllocator,
     OrderStatus,
     Portfolio,
 )
@@ -286,3 +287,68 @@ class TestCryptoFunding:
         result_no_fund = engine_no_fund.run(data)
 
         assert result.final_capital < result_no_fund.final_capital
+
+
+class TestLotSize:
+    """Lot-size rounding for A-share and per-asset isolation."""
+
+    def test_lot_size_rounds_down(self):
+        """A-share 100-lot: position sizer wants 950 shares → rounds to 900."""
+        data = make_ohlcv(10, start_price=100)
+        signals = pd.Series(0, index=data.index, dtype=float)
+        signals.iloc[1] = 1
+
+        # With lot_size=100, buy signal at ~$100 with $100k capital
+        # FractionSizer(0.95) targets 950 shares → rounds to 900
+        engine = BacktestEngine(
+            fee_model=ZeroFeeModel(),
+            mode="event_driven",
+            initial_capital=100_000,
+            lot_size=100,
+            include_benchmark=False,
+        )
+        engine.set_signals(signals)
+        result = engine.run(data)
+
+        # Check that all trades have sizes that are multiples of 100
+        for trade in result.trades:
+            assert trade.size % 100 == 0 or trade.size == 0
+
+    def test_per_asset_lot_size_isolation(self):
+        """A-share gets 100-lot, crypto gets fractional (lot=1)."""
+        data = {
+            "600519.SH": make_ohlcv(10, start_price=100),
+            "BTC": make_ohlcv(10, start_price=50000),
+        }
+        signals = {
+            "600519.SH": pd.Series(0, index=data["600519.SH"].index, dtype=float),
+            "BTC": pd.Series(0, index=data["BTC"].index, dtype=float),
+        }
+        signals["600519.SH"].iloc[1] = 1
+        signals["BTC"].iloc[1] = 1
+        signals["600519.SH"].iloc[7] = -1
+        signals["BTC"].iloc[7] = -1
+
+        engine = BacktestEngine(
+            fee_model=ZeroFeeModel(),
+            mode="event_driven",
+            initial_capital=200_000,
+            capital_allocator=EqualWeightAllocator(),
+            lot_size=1,  # default: fractional
+            asset_lot_sizes={"600519.SH": 100},  # A-share: 100 lots
+            include_benchmark=False,
+        )
+        engine.set_signals(signals)
+        result = engine.run(data)
+
+        assert isinstance(result, BacktestResult)
+        # Verify isolation: A-share trades in multiples of 100
+        for trade in result.trades:
+            if trade.symbol == "600519.SH":
+                assert trade.size % 100 == 0, (
+                    f"A-share trade size {trade.size} not multiple of 100")
+        # BTC should have trades (fractional allowed, no rounding)
+        btc_trades = [t for t in result.trades if t.symbol == "BTC"]
+        ashare_trades = [t for t in result.trades if t.symbol == "600519.SH"]
+        assert len(btc_trades) > 0, "BTC should have trades"
+        assert len(ashare_trades) > 0, "A-share should have trades"

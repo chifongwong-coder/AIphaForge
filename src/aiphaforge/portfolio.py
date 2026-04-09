@@ -212,8 +212,6 @@ class Portfolio:
         positions: Position dict {symbol: Position}.
         max_position_size: Max single position as fraction of equity.
         allow_short: Whether short selling is allowed.
-        margin_requirement: Margin requirement multiplier.
-
     Example:
         >>> portfolio = Portfolio(initial_capital=100000)
         >>> portfolio.update_position("AAPL", 100, 150.0, timestamp)
@@ -225,7 +223,6 @@ class Portfolio:
         initial_capital: float = 100000,
         max_position_size: float = 1.0,
         allow_short: bool = True,
-        margin_requirement: float = 1.0,
         fee_allocation: str = "proportional",
         margin_config: Any = None,
     ):
@@ -234,7 +231,6 @@ class Portfolio:
         self.positions: Dict[str, Position] = {}
         self.max_position_size = max_position_size
         self.allow_short = allow_short
-        self.margin_requirement = margin_requirement
         self.fee_allocation = fee_allocation
         # Margin config (v0.8); import lazily to avoid circular deps
         self._margin_config = margin_config
@@ -290,10 +286,8 @@ class Portfolio:
             total_pos = sum(
                 abs(p.market_value) for p in self.positions.values())
             return max(0.0, self.total_equity / imr - total_pos)
-        # Legacy fallback (no margin config)
-        if self.margin_requirement <= 0:
-            return float('inf')
-        return self.cash / self.margin_requirement
+        # No margin config: buying power = available cash
+        return max(0.0, self.cash)
 
     @property
     def maintenance_requirement(self) -> float:

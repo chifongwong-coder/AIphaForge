@@ -120,6 +120,8 @@ class BacktestEngine:
         asset_margin_configs: Optional[Dict] = None,
         periodic_cost_model=None,
         portfolio_exit_rules: Optional[List] = None,
+        lot_size: int = 1,
+        asset_lot_sizes: Optional[Dict] = None,
     ):
         # Fee model
         if isinstance(fee_model, str):
@@ -189,6 +191,16 @@ class BacktestEngine:
         self.asset_margin_configs: Dict = asset_margin_configs or {}
         self.periodic_cost_model = periodic_cost_model
         self.portfolio_exit_rules: List = portfolio_exit_rules or []
+
+        # Lot sizes (v0.8)
+        if lot_size < 1:
+            raise ValueError(f"lot_size must be >= 1, got {lot_size}")
+        self.lot_size = lot_size
+        self.asset_lot_sizes: Dict = asset_lot_sizes or {}
+        for sym, ls in self.asset_lot_sizes.items():
+            if ls < 1:
+                raise ValueError(
+                    f"lot_size for '{sym}' must be >= 1, got {ls}")
 
         # Custom benchmark config defaults
         self._config_benchmark: Optional[pd.Series] = None
@@ -643,6 +655,8 @@ class BacktestEngine:
             asset_margin_configs=self.asset_margin_configs,
             periodic_cost_model=self.periodic_cost_model,
             portfolio_exit_rules=self.portfolio_exit_rules,
+            lot_size=self.lot_size,
+            asset_lot_sizes=self.asset_lot_sizes,
         )
 
     def _build_result(
