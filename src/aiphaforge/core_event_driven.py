@@ -1,45 +1,60 @@
 """
 Event-Driven Backtest Core
+==========================
 
-Standalone function that runs an event-driven (bar-by-bar) backtest.
-Extracted from BacktestEngine._run_event_driven to keep engine.py thin.
+Unified function that runs an event-driven (bar-by-bar) backtest for
+both single-asset and multi-asset modes.  The engine always passes
+dict-based data; single-asset input is wrapped before calling.
 """
 
 import warnings
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import pandas as pd
 
 from .broker import Broker
-from .config import BacktestConfig
+from .config import BacktestConfig, resolve_config
 from .hooks import HookContext
 from .portfolio import Portfolio
-from .utils import calculate_returns
+from .utils import build_unified_timeline, calculate_returns
 
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
 
 def run_event_driven(
-    data: pd.DataFrame,
-    signals: pd.Series,
+    data_dict: Dict[str, pd.DataFrame],
+    signals_dict: Dict[str, pd.Series],
     config: BacktestConfig,
-    symbol: str = "default",
+    symbols: List[str],
     strategy=None,
-    full_data: Optional[pd.DataFrame] = None,
 ) -> dict:
     """Run an event-driven backtest and return raw results.
 
     Parameters:
-        data: OHLCV DataFrame (already validated and sorted).
-        signals: Trading signal series aligned with *data*.
+        data_dict: Per-symbol OHLCV DataFrames (validated and sorted).
+        signals_dict: Per-symbol trading signal Series.
         config: Backtest configuration bundle.
-        symbol: Instrument symbol.
-        strategy: Strategy object (used to check for risk_manager attributes).
-        full_data: Full dataset reference (for risk manager slicing).
+        symbols: Ordered list of symbol names.
+        strategy: Strategy object (for risk_manager attributes).
 
     Returns:
         Dictionary with keys: equity_curve, trades, positions_df,
-        orders_df, daily_returns, final_capital.
+        orders_df, daily_returns, final_capital, and optionally
+        per_asset_pnl.
     """
-    # Initialize components
+    if not symbols:
+        raise ValueError("No symbols provided (empty data_dict)")
+
+    # Ensure signals_dict covers all symbols
+    for sym in symbols:
+        if sym not in signals_dict:
+            signals_dict[sym] = pd.Series(dtype=float)
+
+    is_single = len(symbols) == 1
+
+    # --- Initialize portfolio ---
     portfolio = Portfolio(
         initial_capital=config.initial_capital,
         max_position_size=config.max_position_size,
@@ -47,110 +62,243 @@ def run_event_driven(
         fee_allocation=config.fee_allocation,
     )
 
-    broker = Broker(
-        fee_model=config.fee_model,
-        fill_model=config.fill_model,
-        session_end_time=config.session_end_time,
-        immediate_fill_price=config.immediate_fill_price,
-    )
-    broker.set_portfolio(portfolio)
-
-    # Notify hooks: backtest start
-    for hook in config.hooks:
-        hook.on_backtest_start(data, symbol, config=config)
-
-    # Process each bar
-    for i, (timestamp, bar) in enumerate(data.iterrows()):
-        # 1. Update prices (don't record equity yet)
-        portfolio.update_prices({symbol: bar['close']}, timestamp, record=False)
-
-        # 2. Process pending orders
-        filled_orders = broker.process_bar(bar, timestamp, symbol)
-        for order in filled_orders:
-            portfolio.update_from_order(order, timestamp)
-
-        # 3. Check stop loss / take profit
-        if config.stop_loss_rule is not None:
-            config.stop_loss_rule.check_event_driven(
-                portfolio, broker, symbol, bar, timestamp,
-            )
-
-        if config.take_profit_rule is not None:
-            config.take_profit_rule.check_event_driven(
-                portfolio, broker, symbol, bar, timestamp,
-            )
-
-        # 4. Call hooks: on_pre_signal (before signal processing)
-        pending_before_hooks = (
-            len(broker.get_pending_orders(symbol)) if config.hooks else 0
+    # --- Initialize per-symbol brokers ---
+    brokers: Dict[str, Broker] = {}
+    for symbol in sorted(symbols):
+        brokers[symbol] = Broker(
+            fee_model=resolve_config(
+                config.fee_model, config.asset_fee_models, symbol),
+            fill_model=resolve_config(
+                config.fill_model, config.asset_fill_models, symbol),
+            session_end_time=config.session_end_time,
+            immediate_fill_price=config.immediate_fill_price,
+            assigned_symbol=symbol,
         )
-        if config.hooks:
-            ctx = HookContext(
-                bar_index=i,
-                timestamp=timestamp,
-                bar_data=bar,
-                data=data.iloc[:i + 1],
-                portfolio=portfolio,
-                symbol=symbol,
-                broker=broker,
+        brokers[symbol].set_portfolio(portfolio)
+
+    # --- Build unified timeline ---
+    timeline, bar_avail = build_unified_timeline(data_dict)
+
+    # --- Convert signal Series to dicts for O(1) lookup ---
+    signals_as_dict: Dict[str, dict] = {
+        sym: sig.to_dict() for sym, sig in signals_dict.items()
+    }
+
+    # --- Validate signal / data overlap ---
+    for sym in symbols:
+        sig_idx = signals_dict[sym].index
+        data_idx = data_dict[sym].index
+        if len(sig_idx.intersection(data_idx)) == 0 and len(sig_idx) > 0:
+            warnings.warn(
+                f"Zero overlap between signal index and data index "
+                f"for symbol '{sym}'."
             )
+
+    # --- Initialize last known prices ---
+    last_known: Dict[str, float] = {}
+    for sym in symbols:
+        df = data_dict[sym]
+        if len(df) > 0:
+            last_known[sym] = float(df.iloc[0]['close'])
+        else:
+            last_known[sym] = 0.0
+
+    # --- Per-asset PnL tracker (multi-asset only) ---
+    # NOTE: per_asset_pnl tracks GROSS PnL (before fees/slippage).
+    # This is intentional for attribution: each asset's raw P&L
+    # contribution.  sum(per_asset_pnl) will exceed portfolio equity
+    # change by the total fees paid.  Portfolio equity curve is net.
+    pnl_tracker: Optional[dict] = None
+    if not is_single:
+        pnl_tracker = {
+            'series': {sym: [] for sym in symbols},
+            'prev_unrealized': {sym: 0.0 for sym in symbols},
+            'bar_realized': {sym: 0.0 for sym in symbols},
+        }
+
+    # --- Notify hooks: backtest start (per symbol) ---
+    for sym in sorted(symbols):
+        for hook in config.hooks:
+            hook.on_backtest_start(data_dict[sym], sym, config=config)
+
+    # --- Build exit rules list ---
+    exit_rules = [r for r in [config.stop_loss_rule,
+                               config.take_profit_rule] if r is not None]
+
+    # ===================================================================
+    # Main event loop
+    # ===================================================================
+    ctx = None  # HookContext, built per-bar when hooks are present
+    for idx, timestamp in enumerate(timeline):
+        active = sorted(
+            [s for s in symbols if timestamp in bar_avail[s]]
+        )
+
+        # 1. Update prices (forward-fill for inactive assets)
+        prices: Dict[str, float] = {}
+        for sym in symbols:
+            if sym in active:
+                prices[sym] = float(
+                    data_dict[sym].loc[timestamp, 'close'])
+                last_known[sym] = prices[sym]
+            else:
+                prices[sym] = last_known[sym]
+        portfolio.update_prices(prices, timestamp, record=False)
+
+        # Reset per-bar realized PnL tracker
+        if pnl_tracker is not None:
+            for sym in symbols:
+                pnl_tracker['bar_realized'][sym] = 0.0
+
+        # 2. Process pending orders (per active symbol)
+        for sym in active:
+            bar = data_dict[sym].loc[timestamp]
+            filled = brokers[sym].process_bar(bar, timestamp, sym)
+            for order in filled:
+                trade = portfolio.update_from_order(order, timestamp)
+                if trade and pnl_tracker is not None:
+                    pnl_tracker['bar_realized'][sym] = (
+                        pnl_tracker['bar_realized'].get(sym, 0.0)
+                        + trade.pnl + trade.commission
+                        + trade.slippage_cost
+                    )
+
+        # 3. Exit rules (per active symbol)
+        for sym in active:
+            bar = data_dict[sym].loc[timestamp]
+            for rule in exit_rules:
+                rule.check_event_driven(
+                    portfolio, brokers[sym], sym, bar, timestamp)
+
+        # 4. Hooks: on_pre_signal
+        pending_before_hooks: Dict[str, int] = {}
+        if config.hooks:
+            for sym in active:
+                pending_before_hooks[sym] = len(
+                    brokers[sym].get_pending_orders(sym))
+
+            if is_single:
+                sym0 = symbols[0]
+                ctx = HookContext(
+                    bar_index=idx,
+                    timestamp=timestamp,
+                    portfolio=portfolio,
+                    bar_data=data_dict[sym0].loc[timestamp],
+                    data=data_dict[sym0].loc[:timestamp],
+                    symbol=sym0,
+                    broker=brokers[sym0],
+                )
+            else:
+                ctx = HookContext(
+                    bar_index=idx,
+                    timestamp=timestamp,
+                    portfolio=portfolio,
+                    active_symbols=active,
+                    all_bar_data={s: data_dict[s].loc[timestamp]
+                                  for s in active},
+                    all_data={s: data_dict[s].loc[:timestamp]
+                              for s in symbols},
+                    all_brokers=brokers,
+                )
             for hook in config.hooks:
                 hook.on_pre_signal(ctx)
 
-        # 4b. Process immediate IOC/FOK orders submitted by hooks
-        immediate = broker.process_immediate_orders(bar, timestamp, symbol)
-        for order in immediate:
-            portfolio.update_from_order(order, timestamp)
+        # 4b. Process immediate IOC/FOK from hooks
+        for sym in active:
+            bar = data_dict[sym].loc[timestamp]
+            immediate = brokers[sym].process_immediate_orders(
+                bar, timestamp, sym)
+            for order in immediate:
+                trade = portfolio.update_from_order(order, timestamp)
+                if trade and pnl_tracker is not None:
+                    pnl_tracker['bar_realized'][sym] = (
+                        pnl_tracker['bar_realized'].get(sym, 0.0)
+                        + trade.pnl + trade.commission
+                        + trade.slippage_cost
+                    )
 
-        # 5. Process new signals
-        signal = signals.iloc[i] if i < len(signals) else 0
+        # 5. Two-phase signal processing
+        # Phase A: collect signals
+        current_signals: Dict[str, int] = {}
+        for sym in active:
+            sig = signals_as_dict[sym].get(timestamp, 0)
+            if sig != 0:
+                current_signals[sym] = sig
 
-        # Warn if hooks submitted orders AND signal is non-zero
-        if config.hooks and signal != 0:
-            pending_now = len(broker.get_pending_orders(symbol))
-            if pending_now > pending_before_hooks:
-                warnings.warn(
-                    f"Bar {i}: hook submitted orders while signal={signal}. "
-                    f"Both will execute. Set signals to 0 if hooks manage orders."
-                )
+        # Warn if hooks submitted orders AND signals are non-zero
+        if config.hooks and current_signals:
+            for sym, sig in current_signals.items():
+                if sym in pending_before_hooks:
+                    pending_now = len(
+                        brokers[sym].get_pending_orders(sym))
+                    if pending_now > pending_before_hooks.get(sym, 0):
+                        warnings.warn(
+                            f"Bar {idx}: hook submitted orders for "
+                            f"'{sym}' while signal={sig}. Both will "
+                            f"execute. Set signals to 0 if hooks "
+                            f"manage orders."
+                        )
 
-        if signal != 0:
+        # Phase B: allocate then execute
+        budgets: Dict[str, Optional[float]] = {}
+        if current_signals and config.capital_allocator is not None:
+            budgets = config.capital_allocator.allocate(
+                current_signals, prices, portfolio, config)
+
+        for sym, sig in sorted(current_signals.items()):
+            bar = data_dict[sym].loc[timestamp]
             _process_signal(
-                signal, portfolio, broker, symbol, bar, timestamp,
+                sig, portfolio, brokers[sym], sym, bar, timestamp,
                 config=config,
-                bar_index=i,
-                full_data=full_data,
+                bar_index=idx,
+                full_data=data_dict[sym],
+                budget=budgets.get(sym),
             )
 
-        # 5b. Process immediate IOC/FOK orders submitted by signals
-        immediate = broker.process_immediate_orders(bar, timestamp, symbol)
-        for order in immediate:
-            portfolio.update_from_order(order, timestamp)
+        # 5b. Process immediate IOC/FOK from signals
+        for sym in active:
+            bar = data_dict[sym].loc[timestamp]
+            immediate = brokers[sym].process_immediate_orders(
+                bar, timestamp, sym)
+            for order in immediate:
+                trade = portfolio.update_from_order(order, timestamp)
+                if trade and pnl_tracker is not None:
+                    pnl_tracker['bar_realized'][sym] = (
+                        pnl_tracker['bar_realized'].get(sym, 0.0)
+                        + trade.pnl + trade.commission
+                        + trade.slippage_cost
+                    )
 
-        # 6. Call hooks: on_bar (after signal processing)
-        if config.hooks:
+        # 6. Hooks: on_bar
+        if config.hooks and ctx is not None:
             for hook in config.hooks:
                 hook.on_bar(ctx)
 
-        # 7. Record equity AFTER all position changes
+        # 7. Record equity + per-asset PnL
         portfolio._record_equity(timestamp)
+        if pnl_tracker is not None:
+            _record_per_asset_pnl(
+                timestamp, portfolio, symbols, pnl_tracker)
 
-    # Notify hooks: backtest end
+    # --- Post-loop: notify hooks ---
     for hook in config.hooks:
         hook.on_backtest_end()
 
-    # Build results
+    # --- Build results ---
     equity_curve = portfolio.get_equity_curve()
     trades = portfolio.trade_history
     positions_df = portfolio.get_positions_df()
-    orders_df = broker.get_orders_df()
 
-    # Compute daily returns
+    # Merge order DataFrames from all brokers
+    orders_dfs = [b.get_orders_df() for b in brokers.values()]
+    orders_df = (pd.concat(orders_dfs, ignore_index=True)
+                 if orders_dfs else pd.DataFrame())
+
     daily_returns = None
     if len(equity_curve) > 0:
         daily_returns = calculate_returns(equity_curve)
 
-    return {
+    result = {
         'equity_curve': equity_curve,
         'trades': trades,
         'positions_df': positions_df,
@@ -159,6 +307,52 @@ def run_event_driven(
         'final_capital': portfolio.total_equity,
     }
 
+    # Per-asset PnL (multi-asset only)
+    if pnl_tracker is not None:
+        per_asset_pnl = {}
+        for sym in symbols:
+            entries = pnl_tracker['series'][sym]
+            if entries:
+                idx_list, vals = zip(*entries)
+                per_asset_pnl[sym] = pd.Series(
+                    vals, index=pd.DatetimeIndex(idx_list), name=sym)
+            else:
+                per_asset_pnl[sym] = pd.Series(
+                    dtype=float, name=sym)
+        result['per_asset_pnl'] = per_asset_pnl
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Per-asset PnL tracking
+# ---------------------------------------------------------------------------
+
+def _record_per_asset_pnl(
+    timestamp: pd.Timestamp,
+    portfolio: Portfolio,
+    symbols: List[str],
+    tracker: dict,
+) -> None:
+    """Track per-symbol GROSS PnL contribution each bar.
+
+    Gross = before fees/slippage.  This is standard for per-asset
+    attribution in shared-capital portfolios.  The sum of all assets'
+    PnL will exceed the portfolio equity change by total fees paid.
+    """
+    for sym in symbols:
+        pos = portfolio.positions.get(sym)
+        current_unrealized = pos.unrealized_pnl if pos else 0.0
+        prev_unrealized = tracker['prev_unrealized'].get(sym, 0.0)
+        realized_this_bar = tracker['bar_realized'].get(sym, 0.0)
+        delta = (current_unrealized - prev_unrealized) + realized_this_bar
+        tracker['series'][sym].append((timestamp, delta))
+        tracker['prev_unrealized'][sym] = current_unrealized
+
+
+# ---------------------------------------------------------------------------
+# Signal processing (largely unchanged from v0.6)
+# ---------------------------------------------------------------------------
 
 def _process_signal(
     signal: int,
@@ -170,6 +364,7 @@ def _process_signal(
     config: BacktestConfig,
     bar_index: Optional[int] = None,
     full_data: Optional[pd.DataFrame] = None,
+    budget: Optional[float] = None,
 ):
     """Process a single trading signal."""
     current_pos = portfolio.get_position_size(symbol)
@@ -225,6 +420,13 @@ def _process_signal(
     # Calculate required trade
     size_change = target_pos - current_pos
 
+    # Budget cap on incremental cost (direction-agnostic)
+    price = bar['close']
+    if budget is not None and price > 0:
+        max_size = budget / price
+        if abs(size_change) > max_size:
+            size_change = max_size * (1 if size_change > 0 else -1)
+
     if abs(size_change) < 0.001:  # Ignore tiny changes
         return
 
@@ -237,6 +439,9 @@ def _process_signal(
         order = broker.create_market_order(
             symbol, "sell", abs(size_change), "signal", timestamp,
         )
+
+    # Hint for buying power check (market orders have no price)
+    order.metadata['estimated_price'] = price
 
     broker.submit_order(order, timestamp)
 

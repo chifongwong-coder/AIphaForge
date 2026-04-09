@@ -154,6 +154,11 @@ class BacktestResult:
     benchmark_equity: Optional[pd.Series] = None
     benchmark_metrics: Optional[Dict[str, float]] = None
     benchmark_name: str = "Buy & Hold"
+    # Multi-asset fields (v0.7)
+    per_asset_pnl: Optional[Dict[str, pd.Series]] = None
+    per_asset_trades: Optional[Dict[str, List['Trade']]] = None
+    per_asset_metrics: Optional[Dict[str, Dict]] = None
+    symbols: List[str] = field(default_factory=list)
 
     def __post_init__(self):
         if self.final_capital == 0.0 and len(self.equity_curve) > 0:

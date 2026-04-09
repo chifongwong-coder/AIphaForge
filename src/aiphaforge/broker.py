@@ -61,6 +61,7 @@ class Broker:
         stop_fill_pessimistic: bool = True,
         session_end_time: Optional[time] = None,
         immediate_fill_price: str = "close",
+        assigned_symbol: Optional[str] = None,
     ):
         self.fee_model = fee_model or SimpleFeeModel()
         self.fill_model = fill_model
@@ -70,6 +71,7 @@ class Broker:
         self.check_buying_power = check_buying_power
         self.stop_fill_pessimistic = stop_fill_pessimistic
         self.session_end_time = session_end_time
+        self.assigned_symbol = assigned_symbol
         if immediate_fill_price not in ("close", "open", "vwap"):
             raise ValueError(
                 f"immediate_fill_price must be 'close', 'open', or 'vwap', "
@@ -161,6 +163,14 @@ class Broker:
         if timestamp and order.created_time is None:
             order.created_time = timestamp
 
+        # Symbol guard for multi-asset mode
+        if (self.assigned_symbol is not None
+                and order.symbol != self.assigned_symbol):
+            order.reject(f"Symbol mismatch: broker assigned to "
+                         f"'{self.assigned_symbol}', got '{order.symbol}'")
+            self.rejected_orders += 1
+            return order.order_id
+
         # DAY orders must have a created_time for session expiration logic
         if order.time_in_force == "DAY" and order.created_time is None:
             raise ValueError(
@@ -170,6 +180,15 @@ class Broker:
         # Buying power check
         if self.check_buying_power and self._portfolio and order.is_buy:
             estimated_price = order.price or 0  # Market order price unknown
+            # For market orders, estimate from last known position price
+            if estimated_price <= 0:
+                pos = self._portfolio.positions.get(order.symbol)
+                if pos and pos.current_price > 0:
+                    estimated_price = pos.current_price
+            # Fallback: check order metadata (set by _process_signal)
+            if estimated_price <= 0:
+                estimated_price = order.metadata.get(
+                    'estimated_price', 0)
             if estimated_price > 0:
                 if not self._portfolio.check_buying_power(order.size, estimated_price):
                     order.reject("Insufficient buying power")
