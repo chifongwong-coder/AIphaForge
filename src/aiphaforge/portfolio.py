@@ -5,7 +5,7 @@ Tracks positions, cash, equity, and account state.
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
@@ -227,6 +227,7 @@ class Portfolio:
         allow_short: bool = True,
         margin_requirement: float = 1.0,
         fee_allocation: str = "proportional",
+        margin_config: Any = None,
     ):
         self.initial_capital = initial_capital
         self.cash = initial_capital
@@ -235,6 +236,8 @@ class Portfolio:
         self.allow_short = allow_short
         self.margin_requirement = margin_requirement
         self.fee_allocation = fee_allocation
+        # Margin config (v0.8); import lazily to avoid circular deps
+        self._margin_config = margin_config
 
         # History
         self.equity_history: List[EquityPoint] = []
@@ -274,7 +277,42 @@ class Portfolio:
 
     @property
     def buying_power(self) -> float:
+        """Max additional position value that can be opened.
+
+        With margin: equity / IMR - total_abs_positions.
+        Without margin (IMR=1.0): reduces to equity - positions = cash
+        for long-only portfolios.
+        """
+        if self._margin_config is not None:
+            imr = self._margin_config.initial_margin_ratio
+            if imr <= 0:
+                return float('inf')
+            total_pos = sum(
+                abs(p.market_value) for p in self.positions.values())
+            return max(0.0, self.total_equity / imr - total_pos)
+        # Legacy fallback (no margin config)
+        if self.margin_requirement <= 0:
+            return float('inf')
         return self.cash / self.margin_requirement
+
+    @property
+    def maintenance_requirement(self) -> float:
+        """Minimum equity to avoid margin call."""
+        if self._margin_config is None:
+            return 0.0
+        mmr = self._margin_config.maintenance_margin_ratio
+        total_pos = sum(
+            abs(p.market_value) for p in self.positions.values())
+        return total_pos * mmr
+
+    @property
+    def is_margin_call(self) -> bool:
+        """True if equity is below the maintenance requirement."""
+        return self.total_equity < self.maintenance_requirement
+
+    def deduct_cost(self, amount: float) -> None:
+        """Deduct periodic cost (borrowing, funding) from cash."""
+        self.cash -= amount
 
     @property
     def current_drawdown(self) -> float:

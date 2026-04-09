@@ -157,3 +157,39 @@ class ProRataAllocator(BaseCapitalAllocator):
             if sig <= 0:
                 budgets[s] = None
         return budgets
+
+
+class MarginAllocator(BaseCapitalAllocator):
+    """Allocate buying power among buys and short opens.
+
+    Both buys and short-to-open signals consume buying power and share
+    the same pool.  Position closes receive ``None`` (no constraint).
+    """
+
+    def allocate(
+        self,
+        signals: Dict[str, int],
+        prices: Dict[str, float],
+        portfolio: Any,
+        config: Any,
+    ) -> Dict[str, Optional[float]]:
+        buys = {s for s, sig in signals.items() if sig > 0}
+        short_opens = {
+            s for s, sig in signals.items()
+            if sig < 0 and not portfolio.has_position(s)
+        }
+        closes = {
+            s for s, sig in signals.items()
+            if sig < 0 and portfolio.has_position(s)
+        }
+
+        capital_signals = buys | short_opens
+        budgets: Dict[str, Optional[float]] = {}
+        if capital_signals:
+            bp = portfolio.buying_power
+            per_signal = bp / len(capital_signals) if bp > 0 else 0
+            for s in capital_signals:
+                budgets[s] = per_signal
+        for s in closes:
+            budgets[s] = None
+        return budgets

@@ -125,8 +125,8 @@ class TestMultiAssetEventDriven:
 
         assert isinstance(result, BacktestResult)
 
-    def test_latency_hook_rejected_in_multi_asset(self):
-        """Path: LatencyHook + multi-asset → ValueError."""
+    def test_latency_hook_works_in_multi_asset(self):
+        """Path: LatencyHook + multi-asset → runs without error (v0.8)."""
         data, _ = _make_multi_data(10, 2)
         signals = _make_multi_signals(data)
 
@@ -139,12 +139,13 @@ class TestMultiAssetEventDriven:
             mode="event_driven",
             initial_capital=200_000,
             hooks=[hook],
+            capital_allocator=EqualWeightAllocator(),
             include_benchmark=False,
         )
         engine.set_signals(signals)
-
-        with pytest.raises(ValueError, match="LatencyHook"):
-            engine.run(data)
+        result = engine.run(data)
+        assert isinstance(result, BacktestResult)
+        assert len(result.equity_curve) == 10
 
 
 # ===========================================================================

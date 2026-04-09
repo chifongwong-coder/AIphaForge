@@ -59,6 +59,7 @@ def run_event_driven(
         max_position_size=config.max_position_size,
         allow_short=config.allow_short,
         fee_allocation=config.fee_allocation,
+        margin_config=config.margin_config,
     )
 
     # --- Initialize per-symbol brokers ---
@@ -169,6 +170,12 @@ def run_event_driven(
                 rule.check_event_driven(
                     portfolio, brokers[sym], sym, bar, timestamp)
 
+        # 3b. Portfolio-level exit rules (margin call, etc.)
+        if config.portfolio_exit_rules:
+            for rule in config.portfolio_exit_rules:
+                rule.check_portfolio(
+                    portfolio, brokers, symbols, prices, timestamp)
+
         # 4. Hooks: on_pre_signal
         pending_before_hooks: Dict[str, int] = {}
         if config.hooks:
@@ -273,11 +280,31 @@ def run_event_driven(
             for hook in config.hooks:
                 hook.on_bar(ctx)
 
+        # 6.5. Periodic costs (borrowing, funding)
+        if config.periodic_cost_model is not None:
+            for sym in symbols:
+                pos = portfolio.positions.get(sym)
+                if pos and not pos.is_flat:
+                    mc = resolve_config(
+                        config.margin_config,
+                        config.asset_margin_configs, sym)
+                    if mc is not None:
+                        cost = config.periodic_cost_model.calculate_cost(
+                            pos, prices[sym], timestamp, mc)
+                        if cost > 0:
+                            portfolio.deduct_cost(cost)
+
         # 7. Record equity + per-asset PnL
         portfolio._record_equity(timestamp)
         if pnl_tracker is not None:
             _record_per_asset_pnl(
                 timestamp, portfolio, symbols, pnl_tracker)
+
+        # 7b. Negative equity termination (gap risk)
+        if (config.margin_config is not None
+                and config.margin_config.stop_on_negative_equity
+                and portfolio.total_equity < 0):
+            break
 
     # --- Post-loop: notify hooks ---
     for hook in config.hooks:

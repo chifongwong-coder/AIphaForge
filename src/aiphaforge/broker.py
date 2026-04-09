@@ -177,20 +177,44 @@ class Broker:
                 "DAY orders must have created_time set at submission"
             )
 
-        # Buying power check
-        if self.check_buying_power and self._portfolio and order.is_buy:
-            estimated_price = order.price or 0  # Market order price unknown
-            # For market orders, estimate from last known position price
+        # Buying power check: only for orders that INCREASE exposure.
+        # Closing/reducing orders (buy-to-close-short, sell-to-close-long)
+        # do not consume buying power and are always allowed.
+        needs_buying_power = False
+        if self._portfolio:
+            pos = self._portfolio.get_position(order.symbol)
+            if order.is_buy:
+                # Buy + no position or long → opens/increases → needs check
+                # Buy + short → closing short → no check
+                needs_buying_power = (pos is None or pos.is_flat
+                                      or pos.is_long)
+            else:
+                # Sell + no position or short → opens/increases → needs check
+                # Sell + long → closing long → no check
+                needs_buying_power = (pos is None or pos.is_flat
+                                      or pos.is_short)
+
+        if self.check_buying_power and self._portfolio and needs_buying_power:
+            # Block new opens during margin call
+            if self._portfolio.is_margin_call:
+                order.reject("Margin call in effect — new opens blocked")
+                self.rejected_orders += 1
+                return order.order_id
+
+            # Estimate price for market orders
+            estimated_price = order.price or 0
             if estimated_price <= 0:
                 pos = self._portfolio.positions.get(order.symbol)
                 if pos and pos.current_price > 0:
                     estimated_price = pos.current_price
-            # Fallback: check order metadata (set by _process_signal)
             if estimated_price <= 0:
                 estimated_price = order.metadata.get(
                     'estimated_price', 0)
+
+            # Check buying power
             if estimated_price > 0:
-                if not self._portfolio.check_buying_power(order.size, estimated_price):
+                estimated_cost = order.size * estimated_price
+                if estimated_cost > self._portfolio.buying_power:
                     order.reject("Insufficient buying power")
                     self.rejected_orders += 1
                     return order.order_id

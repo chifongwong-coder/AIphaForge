@@ -190,12 +190,19 @@ class LatencyHook(BacktestHook):
 
     def on_pre_signal(self, context: HookContext) -> None:
         """Intercept the inner hook's orders and manage the delay queue."""
-        # Step 1 — run the inner hook with a capturing proxy
+        if context.all_brokers is not None:
+            # Multi-asset: proxy all brokers
+            self._on_pre_signal_multi(context)
+        else:
+            # Single-asset: proxy the single broker
+            self._on_pre_signal_single(context)
+
+    def _on_pre_signal_single(self, context: HookContext) -> None:
+        """Single-asset path: proxy context.broker."""
         proxy = _CapturingBrokerProxy(context.broker)
         proxied_ctx = dataclasses.replace(context, broker=proxy)
         self.inner_hook.on_pre_signal(proxied_ctx)
 
-        # Step 2 — queue newly captured orders with computed delay
         for order, ts in proxy.captured_orders:
             self._current_order = order
             delay = self._calculate_delay(context.bar_index, context)
@@ -204,7 +211,28 @@ class LatencyHook(BacktestHook):
             decision_ts = context.timestamp
             self._queue.append((submit_at, order, decision_ts))
 
-        # Step 3 — submit any orders whose delay has elapsed
+        self._flush_ready_orders(context)
+
+    def _on_pre_signal_multi(self, context: HookContext) -> None:
+        """Multi-asset path: proxy all brokers in context.all_brokers."""
+        proxied_brokers = {}
+        for sym, broker in context.all_brokers.items():
+            proxied_brokers[sym] = _CapturingBrokerProxy(broker)
+        proxied_ctx = dataclasses.replace(
+            context, all_brokers=proxied_brokers)
+        self.inner_hook.on_pre_signal(proxied_ctx)
+
+        # Collect captured orders from all proxies
+        for sym, proxy in proxied_brokers.items():
+            for order, ts in proxy.captured_orders:
+                self._current_order = order
+                delay = self._calculate_delay(
+                    context.bar_index, context)
+                self._current_order = None
+                submit_at = context.bar_index + delay - 1
+                decision_ts = context.timestamp
+                self._queue.append((submit_at, order, decision_ts))
+
         self._flush_ready_orders(context)
 
     def on_bar(self, context: HookContext) -> None:
@@ -228,7 +256,13 @@ class LatencyHook(BacktestHook):
                 # Preserve decision-time TIF semantics
                 if order.created_time is None:
                     order.created_time = decision_ts
-                context.broker.submit_order(order, decision_ts)
+                # Route to correct broker
+                if context.all_brokers is not None:
+                    broker = context.all_brokers.get(order.symbol)
+                    if broker is not None:
+                        broker.submit_order(order, decision_ts)
+                else:
+                    context.broker.submit_order(order, decision_ts)
             else:
                 remaining.append((submit_at, order, decision_ts))
         self._queue = remaining
