@@ -113,6 +113,9 @@ class BacktestEngine:
         data_validation: str = "warn",
         session_end_time: Optional[time] = None,
         immediate_fill_price: str = "close",
+        capital_allocator=None,
+        asset_fee_models: Optional[Dict] = None,
+        asset_fill_models: Optional[Dict] = None,
     ):
         # Fee model
         if isinstance(fee_model, str):
@@ -172,6 +175,11 @@ class BacktestEngine:
         # Fill price for same-bar IOC/FOK second pass
         self.immediate_fill_price = immediate_fill_price
 
+        # Multi-asset (v0.7)
+        self.capital_allocator = capital_allocator
+        self.asset_fee_models: Dict = asset_fee_models or {}
+        self.asset_fill_models: Dict = asset_fill_models or {}
+
         # Custom benchmark config defaults
         self._config_benchmark: Optional[pd.Series] = None
         self._config_benchmark_type: str = "auto"
@@ -224,12 +232,15 @@ class BacktestEngine:
         self._signals = None
         return self
 
-    def set_signals(self, signals: pd.Series) -> 'BacktestEngine':
+    def set_signals(
+        self, signals: Union[pd.Series, Dict[str, pd.Series]],
+    ) -> 'BacktestEngine':
         """
         Set pre-computed trading signals directly.
 
         Parameters:
-            signals: Signal series (index=time, values={1, -1, 0}).
+            signals: Signal series (single-asset) or dict of signal
+                series keyed by symbol (multi-asset).
 
         Returns:
             self: For method chaining.
@@ -258,31 +269,41 @@ class BacktestEngine:
 
     def run(
         self,
-        data: pd.DataFrame,
+        data: Union[pd.DataFrame, Dict[str, pd.DataFrame]],
         start: Optional[str] = None,
         end: Optional[str] = None,
         symbol: str = "default",
         *,
         benchmark: Optional[pd.Series] = None,
         benchmark_type: Optional[str] = None,
+        weights: Optional[Dict[str, float]] = None,
     ) -> BacktestResult:
         """
         Run the backtest.
 
         Parameters:
-            data: OHLCV data with open, high, low, close, volume columns.
-            start: Start date (optional).
-            end: End date (optional).
-            symbol: Instrument symbol.
+            data: OHLCV data (single-asset ``pd.DataFrame``) or dict of
+                DataFrames keyed by symbol (multi-asset).
+            start: Start date (optional, single-asset only).
+            end: End date (optional, single-asset only).
+            symbol: Instrument symbol (single-asset only).
             benchmark: Custom benchmark series (prices or returns).
-                Overrides the value set in BacktestConfig when provided.
-            benchmark_type: Type of benchmark data — ``"prices"``,
-                ``"returns"``, or ``"auto"``.  Overrides BacktestConfig
-                when provided.
+            benchmark_type: Type of benchmark data.
+            weights: Per-symbol weights for vectorized multi-asset.
 
         Returns:
             BacktestResult: Backtest results.
         """
+        is_multi = isinstance(data, dict)
+
+        # --- Multi-asset path ---
+        if is_multi:
+            return self._run_multi(
+                data, benchmark=benchmark,
+                benchmark_type=benchmark_type, weights=weights,
+            )
+
+        # --- Single-asset path ---
         # Validate and prepare data
         data = self._prepare_data(data, start, end)
         self._data = data
@@ -297,12 +318,13 @@ class BacktestEngine:
         config = self._build_config(
             benchmark=benchmark,
             benchmark_type=benchmark_type,
+            symbols=[symbol],
         )
 
         # Guard: multiple LatencyHook instances wrapping the same inner_hook
         latency_hooks = [h for h in self.hooks if isinstance(h, LatencyHook)]
         if len(latency_hooks) > 1:
-            inner_ids: list[int] = []
+            inner_ids: List[int] = []
             for lh in latency_hooks:
                 iid = id(lh.inner_hook)
                 if iid in inner_ids:
@@ -317,12 +339,214 @@ class BacktestEngine:
         if self.mode == ExecutionMode.VECTORIZED:
             raw = run_vectorized(data, signals, config, symbol)
         else:
+            # Wrap single-asset as dict for the unified core
             raw = run_event_driven(
-                data, signals, config, symbol,
-                strategy=self._strategy, full_data=self._data,
+                data_dict={symbol: data},
+                signals_dict={symbol: signals},
+                config=config,
+                symbols=[symbol],
+                strategy=self._strategy,
             )
 
         return self._build_result(raw, data, config)
+
+    def _run_multi(
+        self,
+        data_dict: Dict[str, pd.DataFrame],
+        *,
+        benchmark: Optional[pd.Series] = None,
+        benchmark_type: Optional[str] = None,
+        weights: Optional[Dict[str, float]] = None,
+    ) -> BacktestResult:
+        """Run a multi-asset backtest."""
+        from .capital_allocator import EqualWeightAllocator
+
+        symbols = sorted(data_dict.keys())
+
+        # Validate each asset's data
+        for sym, df in data_dict.items():
+            validate_ohlcv(
+                df,
+                required=['open', 'high', 'low', 'close'],
+                validation_level=self.data_validation,
+            )
+            data_dict[sym] = ensure_datetime_index(df).sort_index().copy()
+
+        # Generate signals
+        signals_dict = self._get_signals_multi(data_dict)
+
+        # Build config
+        config = self._build_config(
+            benchmark=benchmark,
+            benchmark_type=benchmark_type,
+            symbols=symbols,
+        )
+
+        # Auto-set allocator for multi-asset if not provided
+        if config.capital_allocator is None:
+            warnings.warn(
+                "No capital_allocator set for multi-asset mode. "
+                "Using EqualWeightAllocator (equal budget per signal). "
+                "Set capital_allocator explicitly to suppress this warning."
+            )
+            config.capital_allocator = EqualWeightAllocator()
+
+        # LatencyHook guard for multi-asset
+        for hook in self.hooks:
+            if isinstance(hook, LatencyHook):
+                raise ValueError(
+                    "LatencyHook does not support multi-asset mode. "
+                    "Implement latency logic in your multi-asset hook."
+                )
+
+        # Dispatch
+        if self.mode == ExecutionMode.VECTORIZED:
+            raw = self._run_vectorized_multi(
+                data_dict, signals_dict, config, weights)
+        else:
+            raw = run_event_driven(
+                data_dict=data_dict,
+                signals_dict=signals_dict,
+                config=config,
+                symbols=symbols,
+                strategy=self._strategy,
+            )
+
+        # Build result (use first asset's data for benchmark alignment)
+        first_df = data_dict[symbols[0]]
+        result = self._build_result(raw, first_df, config)
+
+        # Attach multi-asset fields
+        if 'per_asset_pnl' in raw:
+            result.per_asset_pnl = raw['per_asset_pnl']
+        result.symbols = symbols
+
+        # Group trades by symbol
+        if result.trades:
+            per_asset_trades = {}
+            for t in result.trades:
+                per_asset_trades.setdefault(t.symbol, []).append(t)
+            result.per_asset_trades = per_asset_trades
+
+        return result
+
+    def _get_signals_multi(
+        self,
+        data_dict: Dict[str, pd.DataFrame],
+    ) -> Dict[str, pd.Series]:
+        """Get signals for multi-asset mode."""
+        if isinstance(self._signals, dict):
+            signals_dict = {}
+            for sym, df in data_dict.items():
+                if sym in self._signals:
+                    sig = self._signals[sym].reindex(df.index).fillna(0)
+                else:
+                    sig = pd.Series(0, index=df.index, dtype=float)
+                signals_dict[sym] = sig.replace(
+                    [np.inf, -np.inf], 0).fillna(0)
+            return signals_dict
+        elif self._strategy is not None:
+            result = self._strategy.generate_signals(data_dict)
+            if isinstance(result, dict):
+                return result
+            raise TypeError(
+                "Strategy.generate_signals() must return "
+                "Dict[str, pd.Series] for multi-asset mode"
+            )
+        else:
+            raise ValueError(
+                "Must set either a strategy or signals (via set_signals "
+                "or set_strategy) before running a multi-asset backtest"
+            )
+
+    def _run_vectorized_multi(
+        self,
+        data_dict: Dict[str, pd.DataFrame],
+        signals_dict: Dict[str, pd.Series],
+        config: BacktestConfig,
+        weights: Optional[Dict[str, float]] = None,
+    ) -> dict:
+        """Run vectorized multi-asset: per-asset runs + merge."""
+        import dataclasses
+
+        symbols = sorted(data_dict.keys())
+        if weights is None:
+            weights = {s: 1.0 / len(symbols) for s in symbols}
+
+        # Validate weights
+        for s, w in weights.items():
+            if w <= 0:
+                raise ValueError(
+                    f"Weight for '{s}' must be > 0, got {w}")
+        total_w = sum(weights.values())
+        if total_w > 1.0 + 1e-9:
+            raise ValueError(
+                f"Sum of weights ({total_w:.4f}) exceeds 1.0")
+        if total_w < 1.0 - 1e-9:
+            warnings.warn(
+                f"Sum of weights ({total_w:.4f}) < 1.0. "
+                f"{1 - total_w:.1%} of capital held as cash."
+            )
+
+        per_asset = {}
+        for sym in symbols:
+            w = weights.get(sym, 0)
+            asset_capital = config.initial_capital * w
+            asset_config = dataclasses.replace(
+                config, initial_capital=asset_capital)
+            per_asset[sym] = run_vectorized(
+                data_dict[sym], signals_dict[sym],
+                asset_config, sym)
+
+        return self._merge_vectorized_results(
+            per_asset, config.initial_capital)
+
+    @staticmethod
+    def _merge_vectorized_results(
+        per_asset: Dict[str, dict],
+        initial_capital: float,
+    ) -> dict:
+        """Merge per-asset vectorized results into a portfolio result."""
+        # Align and sum equity curves
+        equity_curves = {}
+        all_trades = []
+        all_orders = []
+        for sym, raw in per_asset.items():
+            eq = raw['equity_curve']
+            equity_curves[sym] = eq
+            all_trades.extend(raw.get('trades', []))
+            odf = raw.get('orders_df')
+            if odf is not None and len(odf) > 0:
+                all_orders.append(odf)
+
+        eq_df = pd.DataFrame(equity_curves)
+        # Forward-fill and sum
+        eq_df = eq_df.ffill()
+        portfolio_equity = eq_df.sum(axis=1)
+
+        orders_df = (pd.concat(all_orders, ignore_index=True)
+                     if all_orders else pd.DataFrame())
+
+        from .utils import calculate_returns
+        daily_returns = (calculate_returns(portfolio_equity)
+                         if len(portfolio_equity) > 0 else None)
+
+        # Per-asset PnL from independent equity curves
+        per_asset_pnl = {}
+        for sym, eq in equity_curves.items():
+            per_asset_pnl[sym] = eq.diff().fillna(0.0)
+            per_asset_pnl[sym].name = sym
+
+        return {
+            'equity_curve': portfolio_equity,
+            'trades': all_trades,
+            'positions_df': pd.DataFrame(),
+            'orders_df': orders_df,
+            'daily_returns': daily_returns,
+            'final_capital': (float(portfolio_equity.iloc[-1])
+                              if len(portfolio_equity) > 0 else 0.0),
+            'per_asset_pnl': per_asset_pnl,
+        }
 
     def _prepare_data(
         self,
@@ -367,6 +591,7 @@ class BacktestEngine:
         self,
         benchmark: Optional[pd.Series] = None,
         benchmark_type: Optional[str] = None,
+        symbols: Optional[List[str]] = None,
     ) -> BacktestConfig:
         """Build a BacktestConfig from the engine's attributes.
 
@@ -374,6 +599,7 @@ class BacktestEngine:
             benchmark: Run-time benchmark override (takes precedence over
                 the engine-level config).
             benchmark_type: Run-time benchmark_type override.
+            symbols: List of symbols for this run.
         """
         return BacktestConfig(
             initial_capital=self.initial_capital,
@@ -398,6 +624,10 @@ class BacktestEngine:
             benchmark=benchmark if benchmark is not None else self._config_benchmark,
             benchmark_type=benchmark_type if benchmark_type is not None else self._config_benchmark_type,
             benchmark_name=self._config_benchmark_name,
+            symbols=symbols or [],
+            capital_allocator=self.capital_allocator,
+            asset_fee_models=self.asset_fee_models,
+            asset_fill_models=self.asset_fill_models,
         )
 
     def _build_result(

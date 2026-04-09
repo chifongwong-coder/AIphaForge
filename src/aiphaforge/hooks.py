@@ -12,7 +12,7 @@ When no hooks are registered, the engine behaves identically to the original cod
 from abc import ABC
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
@@ -24,22 +24,37 @@ class HookContext:
     """
     Context data passed to hook functions.
 
+    In single-asset mode, ``bar_data``, ``data``, ``symbol``, and ``broker``
+    are populated (identical to v0.6).  In multi-asset mode, the
+    ``active_symbols``, ``all_bar_data``, ``all_data``, and ``all_brokers``
+    fields are populated instead.
+
     Attributes:
-        bar_index: Index of the current bar in the full dataset.
+        bar_index: Index of the current bar (unified timeline index in multi).
         timestamp: Timestamp of the current bar.
-        bar_data: OHLCV data for the current bar (pd.Series).
-        data: All historical data up to and including the current bar.
         portfolio: Current portfolio state.
-        symbol: Instrument symbol.
-        broker: Broker instance (typed as Any to avoid coupling).
+        bar_data: OHLCV for the current bar (single-asset only).
+        data: Historical data up to current bar (single-asset only).
+        symbol: Instrument symbol (single-asset only).
+        broker: Broker instance (single-asset only).
+        active_symbols: Symbols with a bar on this timestamp (multi-asset).
+        all_bar_data: Per-symbol bar data for active symbols (multi-asset).
+        all_data: Per-symbol historical data sliced to current timestamp (multi-asset).
+        all_brokers: Per-symbol Broker instances (multi-asset).
     """
     bar_index: int
     timestamp: datetime
-    bar_data: pd.Series
-    data: pd.DataFrame
     portfolio: Portfolio
-    symbol: str
+    # Single-asset fields (populated when single, else default):
+    bar_data: Optional[pd.Series] = None
+    data: Optional[pd.DataFrame] = None
+    symbol: str = ""
     broker: Any = None
+    # Multi-asset fields (populated when multi, else None):
+    active_symbols: Optional[List[str]] = None
+    all_bar_data: Optional[Dict[str, pd.Series]] = None
+    all_data: Optional[Dict[str, pd.DataFrame]] = None
+    all_brokers: Optional[Dict[str, Any]] = None
 
 
 class BacktestHook(ABC):

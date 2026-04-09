@@ -457,6 +457,62 @@ class PerformanceAnalyzer:
             'pnl_pct': [t.pnl_pct for t in self.trades]
         }
 
+    # ========== Multi-Asset Analysis ==========
+
+    def per_asset_analysis(self) -> Dict[str, Dict[str, Any]]:
+        """Compute per-asset performance metrics from per_asset_pnl.
+
+        The ``sharpe_ratio`` here is computed on dollar PnL deltas
+        (not percentage returns), which is standard practice for
+        shared-capital multi-asset portfolios where per-asset returns
+        have no well-defined denominator.  This is sometimes called
+        "dollar-PnL Sharpe" and is widely used in prop trading.
+
+        Returns:
+            Dict mapping symbol to a metrics dict with keys:
+            ``total_pnl``, ``sharpe_ratio`` (dollar-PnL based),
+            ``max_drawdown`` (dollar), ``volatility`` (dollar).
+        """
+        pnl_dict = self.result.per_asset_pnl
+        if pnl_dict is None:
+            return {}
+
+        results: Dict[str, Dict[str, Any]] = {}
+        for sym, pnl_series in pnl_dict.items():
+            if len(pnl_series) == 0:
+                results[sym] = {
+                    'total_pnl': 0.0, 'sharpe_ratio': 0.0,
+                    'max_drawdown': 0.0, 'volatility': 0.0,
+                }
+                continue
+            cumulative = pnl_series.cumsum()
+            total_pnl = float(cumulative.iloc[-1])
+            vol = float(pnl_series.std() * np.sqrt(TRADING_DAYS_STOCK))
+            sr = calc_sharpe(pnl_series, trading_days=TRADING_DAYS_STOCK)
+            # Drawdown from cumulative PnL curve
+            peak = cumulative.expanding().max()
+            dd = (cumulative - peak)
+            mdd = float(abs(dd.min())) if len(dd) > 0 else 0.0
+            results[sym] = {
+                'total_pnl': total_pnl,
+                'sharpe_ratio': sr,
+                'max_drawdown': mdd,
+                'volatility': vol,
+            }
+        return results
+
+    def correlation_matrix(self) -> Optional[pd.DataFrame]:
+        """Pairwise PnL-change correlation matrix across assets.
+
+        Returns:
+            pd.DataFrame correlation matrix, or None if not multi-asset.
+        """
+        pnl_dict = self.result.per_asset_pnl
+        if pnl_dict is None or len(pnl_dict) < 2:
+            return None
+        pnl_df = pd.DataFrame(pnl_dict)
+        return pnl_df.corr()
+
     def __repr__(self):
         return (f"PerformanceAnalyzer(strategy={self.result.strategy_name}, "
                 f"return={self.total_return*100:+.2f}%, "

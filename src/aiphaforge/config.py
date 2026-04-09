@@ -7,7 +7,7 @@ event-driven execution cores.
 
 from dataclasses import dataclass, field
 from datetime import time
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
@@ -51,3 +51,15 @@ class BacktestConfig:
     benchmark: Optional[pd.Series] = None
     benchmark_type: str = "auto"
     benchmark_name: str = "Buy & Hold"
+    # Multi-asset fields (v0.7)
+    asset_fee_models: Dict[str, BaseFeeModel] = field(default_factory=dict)
+    asset_fill_models: Dict[str, FillModel] = field(default_factory=dict)
+    weights: Optional[Dict[str, float]] = None
+    capital_allocator: Any = None  # BaseCapitalAllocator; typed Any to avoid cycle
+    trading_days: Optional[int] = None
+    symbols: List[str] = field(default_factory=list)
+
+
+def resolve_config(default: Any, overrides: Dict, symbol: str) -> Any:
+    """Return per-symbol override if present, else default."""
+    return overrides.get(symbol, default)

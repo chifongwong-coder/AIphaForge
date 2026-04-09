@@ -5,7 +5,7 @@ Common constants and helper functions for quantitative finance calculations.
 """
 
 import warnings
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -284,6 +284,40 @@ def annualize(
     if is_volatility:
         return float(value * np.sqrt(trading_days))
     return float(value * trading_days)
+
+
+def build_unified_timeline(
+    data_dict: Dict[str, pd.DataFrame],
+) -> Tuple[pd.DatetimeIndex, Dict[str, Set]]:
+    """Build a unified timeline from multiple per-asset DataFrames.
+
+    Returns:
+        Tuple of (timeline, bar_availability) where:
+        - timeline: pd.DatetimeIndex — sorted union of all timestamps.
+        - bar_availability: Dict[str, set] — per-symbol set of timestamps
+          for O(1) membership checks.
+    """
+    if len(data_dict) == 1:
+        sym, df = next(iter(data_dict.items()))
+        return df.index, {sym: set(df.index)}
+
+    all_indices = []
+    bar_availability: Dict[str, set] = {}
+    for sym, df in data_dict.items():
+        if len(df) == 0:
+            warnings.warn(f"Asset '{sym}' has an empty DataFrame")
+        bar_availability[sym] = set(df.index)
+        all_indices.append(df.index)
+
+    if not all_indices:
+        return pd.DatetimeIndex([]), {}
+
+    timeline = all_indices[0]
+    for idx in all_indices[1:]:
+        timeline = timeline.union(idx)
+    timeline = timeline.sort_values()
+
+    return timeline, bar_availability
 
 
 def compute_buy_and_hold(data: pd.DataFrame, initial_capital: float) -> pd.Series:

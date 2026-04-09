@@ -54,7 +54,13 @@ Performance Analysis:
 """
 
 from .broker import Broker, FillModel, SimpleBroker, SlippageModel
-from .config import BacktestConfig
+from .capital_allocator import (
+    BaseCapitalAllocator,
+    EqualWeightAllocator,
+    FixedWeightAllocator,
+    ProRataAllocator,
+)
+from .config import BacktestConfig, resolve_config
 from .costs import BaseTradeCost, DefaultTradeCost
 from .engine import BacktestEngine, ExecutionMode, PositionSizing, backtest
 from .exit_rules import BaseExitRule, PercentageStopLoss, PercentageTakeProfit
@@ -84,7 +90,7 @@ from .risk import (
     RiskSignal,
 )
 
-__version__ = '0.6.0'
+__version__ = '0.7.0'
 
 __all__ = [
     # Main engine
@@ -145,6 +151,13 @@ __all__ = [
 
     # Config
     'BacktestConfig',
+    'resolve_config',
+
+    # Capital allocation
+    'BaseCapitalAllocator',
+    'EqualWeightAllocator',
+    'FixedWeightAllocator',
+    'ProRataAllocator',
 
     # Risk management
     'BaseRiskManager',
