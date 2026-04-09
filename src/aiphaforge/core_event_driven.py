@@ -18,7 +18,6 @@ from .hooks import HookContext
 from .portfolio import Portfolio
 from .utils import build_unified_timeline, calculate_returns
 
-
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
