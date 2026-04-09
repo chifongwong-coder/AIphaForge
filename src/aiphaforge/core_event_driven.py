@@ -456,8 +456,18 @@ def _process_signal(
     # Calculate required trade
     size_change = target_pos - current_pos
 
-    # Budget cap on incremental cost (direction-agnostic)
+    # Per-asset position limit (cap total position to equity * max_pct)
     price = bar['close']
+    max_pct = resolve_config(
+        config.max_position_pct, config.asset_max_position_pcts, symbol)
+    if max_pct < 1.0 and price > 0:
+        max_pos = portfolio.total_equity * max_pct / price
+        new_pos = current_pos + size_change
+        if abs(new_pos) > max_pos:
+            capped_pos = max_pos * (1 if new_pos > 0 else -1)
+            size_change = capped_pos - current_pos
+
+    # Budget cap on incremental cost (direction-agnostic)
     if budget is not None and price > 0:
         max_size = budget / price
         if abs(size_change) > max_size:
@@ -465,9 +475,9 @@ def _process_signal(
 
     # Lot-size rounding (e.g., A-share 100-share lots)
     lot = resolve_config(config.lot_size, config.asset_lot_sizes, symbol)
-    if lot > 1:
-        direction = 1 if size_change > 0 else -1
-        size_change = (int(abs(size_change)) // lot) * lot * direction
+    if lot > 1 and size_change != 0:
+        sign = 1 if size_change > 0 else -1
+        size_change = (int(abs(size_change)) // lot) * lot * sign
 
     if abs(size_change) < 0.001:  # Ignore tiny changes
         return

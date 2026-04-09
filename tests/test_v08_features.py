@@ -352,3 +352,74 @@ class TestLotSize:
         ashare_trades = [t for t in result.trades if t.symbol == "600519.SH"]
         assert len(btc_trades) > 0, "BTC should have trades"
         assert len(ashare_trades) > 0, "A-share should have trades"
+
+
+class TestPositionLimit:
+    """Per-asset position limit as fraction of equity."""
+
+    def test_position_limit_caps_exposure(self):
+        """max_position_pct=0.5 → each asset limited to 50% of equity."""
+        data = make_ohlcv(20, start_price=100)
+        signals = pd.Series(0, index=data.index, dtype=float)
+        signals.iloc[1] = 1
+        signals.iloc[15] = -1
+
+        # Without limit: FractionSizer(0.95) uses ~95% of equity
+        engine_no_limit = BacktestEngine(
+            fee_model=ZeroFeeModel(),
+            mode="event_driven",
+            initial_capital=100_000,
+            include_benchmark=False,
+        )
+        engine_no_limit.set_signals(signals)
+        result_no_limit = engine_no_limit.run(data)
+
+        # With 50% limit
+        engine_limited = BacktestEngine(
+            fee_model=ZeroFeeModel(),
+            mode="event_driven",
+            initial_capital=100_000,
+            max_position_pct=0.5,
+            include_benchmark=False,
+        )
+        engine_limited.set_signals(signals)
+        result_limited = engine_limited.run(data)
+
+        # Limited run should have smaller trades
+        if result_no_limit.trades and result_limited.trades:
+            no_limit_size = result_no_limit.trades[0].size
+            limited_size = result_limited.trades[0].size
+            assert limited_size < no_limit_size
+
+    def test_per_asset_position_limit_isolation(self):
+        """Different limits per asset: AAPL=10%, TSLA=default(100%)."""
+        data = {
+            "AAPL": make_ohlcv(15, start_price=150),
+            "TSLA": make_ohlcv(15, start_price=200),
+        }
+        signals = {
+            "AAPL": pd.Series(0, index=data["AAPL"].index, dtype=float),
+            "TSLA": pd.Series(0, index=data["TSLA"].index, dtype=float),
+        }
+        signals["AAPL"].iloc[1] = 1
+        signals["TSLA"].iloc[1] = 1
+        signals["AAPL"].iloc[10] = -1
+        signals["TSLA"].iloc[10] = -1
+
+        engine = BacktestEngine(
+            fee_model=ZeroFeeModel(),
+            mode="event_driven",
+            initial_capital=200_000,
+            capital_allocator=EqualWeightAllocator(),
+            asset_max_position_pcts={"AAPL": 0.1},  # AAPL: 10% cap
+            include_benchmark=False,
+        )
+        engine.set_signals(signals)
+        result = engine.run(data)
+
+        assert isinstance(result, BacktestResult)
+        # AAPL should have smaller position than TSLA
+        aapl_trades = [t for t in result.trades if t.symbol == "AAPL"]
+        tsla_trades = [t for t in result.trades if t.symbol == "TSLA"]
+        if aapl_trades and tsla_trades:
+            assert aapl_trades[0].size < tsla_trades[0].size

@@ -64,6 +64,9 @@ class BacktestConfig:
     # Lot sizes (v0.8)
     lot_size: int = 1  # default 1 = fractional allowed
     asset_lot_sizes: Dict[str, int] = field(default_factory=dict)
+    # Per-asset position limits (v0.8) — fraction of equity
+    max_position_pct: float = 1.0  # 1.0 = no per-asset limit
+    asset_max_position_pcts: Dict[str, float] = field(default_factory=dict)
 
 
 def resolve_config(default: Any, overrides: Dict, symbol: str) -> Any:

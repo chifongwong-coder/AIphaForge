@@ -122,6 +122,8 @@ class BacktestEngine:
         portfolio_exit_rules: Optional[List] = None,
         lot_size: int = 1,
         asset_lot_sizes: Optional[Dict] = None,
+        max_position_pct: float = 1.0,
+        asset_max_position_pcts: Optional[Dict] = None,
     ):
         # Fee model
         if isinstance(fee_model, str):
@@ -193,14 +195,26 @@ class BacktestEngine:
         self.portfolio_exit_rules: List = portfolio_exit_rules or []
 
         # Lot sizes (v0.8)
-        if lot_size < 1:
-            raise ValueError(f"lot_size must be >= 1, got {lot_size}")
+        if not isinstance(lot_size, int) or lot_size < 1:
+            raise ValueError(f"lot_size must be an int >= 1, got {lot_size!r}")
         self.lot_size = lot_size
         self.asset_lot_sizes: Dict = asset_lot_sizes or {}
         for sym, ls in self.asset_lot_sizes.items():
-            if ls < 1:
+            if not isinstance(ls, int) or ls < 1:
                 raise ValueError(
-                    f"lot_size for '{sym}' must be >= 1, got {ls}")
+                    f"lot_size for '{sym}' must be an int >= 1, got {ls!r}")
+
+        # Per-asset position limits (v0.8)
+        if not 0 < max_position_pct <= 1.0:
+            raise ValueError(
+                f"max_position_pct must be in (0, 1.0], got {max_position_pct}")
+        self.max_position_pct = max_position_pct
+        self.asset_max_position_pcts: Dict = asset_max_position_pcts or {}
+        for sym, pct in self.asset_max_position_pcts.items():
+            if not 0 < pct <= 1.0:
+                raise ValueError(
+                    f"max_position_pct for '{sym}' must be in (0, 1.0], "
+                    f"got {pct}")
 
         # Custom benchmark config defaults
         self._config_benchmark: Optional[pd.Series] = None
@@ -657,6 +671,8 @@ class BacktestEngine:
             portfolio_exit_rules=self.portfolio_exit_rules,
             lot_size=self.lot_size,
             asset_lot_sizes=self.asset_lot_sizes,
+            max_position_pct=self.max_position_pct,
+            asset_max_position_pcts=self.asset_max_position_pcts,
         )
 
     def _build_result(
