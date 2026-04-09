@@ -5,6 +5,7 @@ same-bar IOC/FOK processing, SymbolRoutingLatencyHook.
 Each test covers one distinct user path through the engine.
 """
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -70,7 +71,7 @@ class EquityRecordingHook(BacktestHook):
 
 
 def _run_event_driven(data, hooks, **kwargs) -> BacktestResult:
-    signals = pd.Series(0, index=data.index, dtype=float)
+    signals = pd.Series(np.nan, index=data.index, dtype=float)
     engine = BacktestEngine(
         fee_model=ZeroFeeModel(), mode="event_driven",
         initial_capital=kwargs.pop("initial_capital", 100_000),

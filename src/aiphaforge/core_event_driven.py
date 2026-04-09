@@ -116,16 +116,6 @@ def run_event_driven(
             'bar_realized': {sym: 0.0 for sym in symbols},
         }
 
-    # --- Validate periodic cost config ---
-    if (config.periodic_cost_model is not None
-            and config.margin_config is None
-            and not config.asset_margin_configs):
-        warnings.warn(
-            "periodic_cost_model is set but margin_config is None. "
-            "Periodic costs require margin_config to calculate borrowing. "
-            "Costs will be zero for all symbols."
-        )
-
     # --- Notify hooks: backtest start (per symbol) ---
     for sym in sorted(symbols):
         for hook in config.hooks:
@@ -234,14 +224,18 @@ def run_event_driven(
                     )
 
         # 5. Two-phase signal processing
-        # Phase A: collect signals
-        current_signals: Dict[str, int] = {}
+        # Phase A: collect signals (NaN = hold → skip; 0 = flat → include)
+        current_signals: Dict[str, float] = {}
         for sym in active:
-            sig = signals_as_dict[sym].get(timestamp, 0)
-            if sig != 0:
-                current_signals[sym] = sig
+            raw_sig = signals_as_dict[sym].get(timestamp, float('nan'))
+            if pd.isna(raw_sig):
+                continue
+            # Apply signal transform if configured
+            if config.signal_transform is not None:
+                raw_sig = config.signal_transform(raw_sig)
+            current_signals[sym] = raw_sig
 
-        # Warn if hooks submitted orders AND signals are non-zero
+        # Warn if hooks submitted orders AND signals are active
         if config.hooks and current_signals:
             for sym, sig in current_signals.items():
                 if sym in pending_before_hooks:
@@ -251,7 +245,7 @@ def run_event_driven(
                         warnings.warn(
                             f"Bar {idx}: hook submitted orders for "
                             f"'{sym}' while signal={sig}. Both will "
-                            f"execute. Set signals to 0 if hooks "
+                            f"execute. Set signals to NaN if hooks "
                             f"manage orders."
                         )
 
@@ -298,11 +292,10 @@ def run_event_driven(
                     mc = resolve_config(
                         config.margin_config,
                         config.asset_margin_configs, sym)
-                    if mc is not None:
-                        cost = config.periodic_cost_model.calculate_cost(
-                            pos, prices[sym], timestamp, mc)
-                        if cost > 0:
-                            portfolio.deduct_cost(cost)
+                    cost = config.periodic_cost_model.calculate_cost(
+                        pos, prices[sym], timestamp, mc)
+                    if cost > 0:
+                        portfolio.deduct_cost(cost)
 
         # 7. Record equity + per-asset PnL
         portfolio._record_equity(timestamp)
@@ -391,7 +384,7 @@ def _record_per_asset_pnl(
 # ---------------------------------------------------------------------------
 
 def _process_signal(
-    signal: int,
+    signal: float,
     portfolio: Portfolio,
     broker: Broker,
     symbol: str,
@@ -402,8 +395,43 @@ def _process_signal(
     full_data: Optional[pd.DataFrame] = None,
     budget: Optional[float] = None,
 ):
-    """Process a single trading signal."""
+    """Process a single trading signal.
+
+    Signal semantics (v0.9):
+    - NaN: hold (filtered before reaching here)
+    - 0: go flat (close position)
+    - positive: go long (value = exposure fraction of max target)
+    - negative: go short (value = exposure fraction of max target)
+    """
+    if pd.isna(signal):
+        return  # NaN = hold
+
+    price = bar['close']
     current_pos = portfolio.get_position_size(symbol)
+
+    # --- signal=0: go flat (close position) ---
+    if abs(signal) < 1e-8:
+        # Skip if margin call in progress (liquidation already pending)
+        if portfolio.is_margin_call:
+            return
+        if abs(current_pos) < 0.001:
+            return  # already flat
+        side = "sell" if current_pos > 0 else "buy"
+        order = broker.create_market_order(
+            symbol, side, abs(current_pos), "signal_flat", timestamp)
+        order.metadata['estimated_price'] = price
+        broker.submit_order(order, timestamp)
+        return
+
+    # --- Directional signal ---
+    direction = 1 if signal > 0 else -1
+    fraction = abs(signal)
+
+    # allow_short guard
+    if direction == -1 and not config.allow_short:
+        warnings.warn(
+            f"Short signal for '{symbol}' ignored (allow_short=False)")
+        return
 
     # Build sliced market data visible up to the current bar
     if bar_index is not None and full_data is not None:
@@ -415,49 +443,36 @@ def _process_signal(
             {symbol: full_data} if full_data is not None else {}
         )
 
-    # Risk manager check (if available)
+    # Risk manager check (preserved from v0.8)
     if config.risk_manager:
         try:
             config.risk_manager.sync_from_portfolio(portfolio)
-
             risk_signals = config.risk_manager.check_and_apply_risk_rules(
-                portfolio, market_data_dict,
-            )
-
+                portfolio, market_data_dict)
             for risk_signal in risk_signals:
                 if (
                     risk_signal.severity == 'critical'
                     and risk_signal.action in ['reject_new', 'close_all']
                 ):
                     warnings.warn(
-                        f"Risk limit triggered: {risk_signal.message}"
-                    )
+                        f"Risk limit triggered: {risk_signal.message}")
                     return
         except Exception as e:
             warnings.warn(f"Risk check failed: {e}")
 
-    # Calculate target position
-    if signal == 1:  # Buy signal
-        target_pos = _calculate_target_position(
-            portfolio, bar['close'], 1, symbol, config,
-            market_data=sliced_data,
-        )
-    elif signal == -1:  # Sell signal
-        if config.allow_short:
-            target_pos = _calculate_target_position(
-                portfolio, bar['close'], -1, symbol, config,
-                market_data=sliced_data,
-            )
-        else:
-            target_pos = 0
-    else:
-        return
+    # Calculate max target position for this direction
+    max_target = _calculate_target_position(
+        portfolio, price, direction, symbol, config,
+        market_data=sliced_data,
+    )
+
+    # Scale by signal fraction (continuous signal support)
+    target_pos = max_target * fraction
 
     # Calculate required trade
     size_change = target_pos - current_pos
 
     # Per-asset position limit (cap total position to equity * max_pct)
-    price = bar['close']
     max_pct = resolve_config(
         config.max_position_pct, config.asset_max_position_pcts, symbol)
     if max_pct < 1.0 and price > 0:
@@ -485,16 +500,12 @@ def _process_signal(
     # Create order
     if size_change > 0:
         order = broker.create_market_order(
-            symbol, "buy", size_change, "signal", timestamp,
-        )
+            symbol, "buy", size_change, "signal", timestamp)
     else:
         order = broker.create_market_order(
-            symbol, "sell", abs(size_change), "signal", timestamp,
-        )
+            symbol, "sell", abs(size_change), "signal", timestamp)
 
-    # Hint for buying power check (market orders have no price)
     order.metadata['estimated_price'] = price
-
     broker.submit_order(order, timestamp)
 
 

@@ -37,7 +37,7 @@ class TestLeveragedRoundTrip:
         """Buy at 2x leverage, hold with daily borrowing cost, sell.
         Verify equity curve, compare with cash-only run."""
         data = make_ohlcv(30, start_price=100)
-        signals = pd.Series(0, index=data.index, dtype=float)
+        signals = pd.Series(np.nan, index=data.index, dtype=float)
         signals.iloc[1] = 1   # buy
         signals.iloc[25] = -1  # sell
 
@@ -99,8 +99,8 @@ class TestMultiAssetMargin:
             "TSLA": make_ohlcv(20, start_price=200),
         }
         signals = {
-            "AAPL": pd.Series(0, index=data["AAPL"].index, dtype=float),
-            "TSLA": pd.Series(0, index=data["TSLA"].index, dtype=float),
+            "AAPL": pd.Series(np.nan, index=data["AAPL"].index, dtype=float),
+            "TSLA": pd.Series(np.nan, index=data["TSLA"].index, dtype=float),
         }
         signals["AAPL"].iloc[1] = 1
         signals["TSLA"].iloc[1] = 1
@@ -260,7 +260,7 @@ class TestCryptoFunding:
     def test_funding_rate_applied_per_bar(self):
         """FundingRateModel charges per-bar on notional value."""
         data = make_ohlcv(10, start_price=50000)
-        signals = pd.Series(0, index=data.index, dtype=float)
+        signals = pd.Series(np.nan, index=data.index, dtype=float)
         signals.iloc[1] = 1
 
         engine = BacktestEngine(
@@ -295,7 +295,7 @@ class TestLotSize:
     def test_lot_size_rounds_down(self):
         """A-share 100-lot: position sizer wants 950 shares → rounds to 900."""
         data = make_ohlcv(10, start_price=100)
-        signals = pd.Series(0, index=data.index, dtype=float)
+        signals = pd.Series(np.nan, index=data.index, dtype=float)
         signals.iloc[1] = 1
 
         # With lot_size=100, buy signal at ~$100 with $100k capital
@@ -321,8 +321,8 @@ class TestLotSize:
             "BTC": make_ohlcv(10, start_price=50000),
         }
         signals = {
-            "600519.SH": pd.Series(0, index=data["600519.SH"].index, dtype=float),
-            "BTC": pd.Series(0, index=data["BTC"].index, dtype=float),
+            "600519.SH": pd.Series(np.nan, index=data["600519.SH"].index, dtype=float),
+            "BTC": pd.Series(np.nan, index=data["BTC"].index, dtype=float),
         }
         signals["600519.SH"].iloc[1] = 1
         signals["BTC"].iloc[1] = 1
@@ -360,7 +360,7 @@ class TestPositionLimit:
     def test_position_limit_caps_exposure(self):
         """max_position_pct=0.5 → each asset limited to 50% of equity."""
         data = make_ohlcv(20, start_price=100)
-        signals = pd.Series(0, index=data.index, dtype=float)
+        signals = pd.Series(np.nan, index=data.index, dtype=float)
         signals.iloc[1] = 1
         signals.iloc[15] = -1
 
@@ -398,8 +398,8 @@ class TestPositionLimit:
             "TSLA": make_ohlcv(15, start_price=200),
         }
         signals = {
-            "AAPL": pd.Series(0, index=data["AAPL"].index, dtype=float),
-            "TSLA": pd.Series(0, index=data["TSLA"].index, dtype=float),
+            "AAPL": pd.Series(np.nan, index=data["AAPL"].index, dtype=float),
+            "TSLA": pd.Series(np.nan, index=data["TSLA"].index, dtype=float),
         }
         signals["AAPL"].iloc[1] = 1
         signals["TSLA"].iloc[1] = 1

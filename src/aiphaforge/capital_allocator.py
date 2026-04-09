@@ -27,7 +27,7 @@ class BaseCapitalAllocator:
 
     def allocate(
         self,
-        signals: Dict[str, int],
+        signals: Dict[str, float],
         prices: Dict[str, float],
         portfolio: Any,
         config: Any,
@@ -56,7 +56,7 @@ class EqualWeightAllocator(BaseCapitalAllocator):
 
     def allocate(
         self,
-        signals: Dict[str, int],
+        signals: Dict[str, float],
         prices: Dict[str, float],
         portfolio: Any,
         config: Any,
@@ -97,7 +97,7 @@ class FixedWeightAllocator(BaseCapitalAllocator):
 
     def allocate(
         self,
-        signals: Dict[str, int],
+        signals: Dict[str, float],
         prices: Dict[str, float],
         portfolio: Any,
         config: Any,
@@ -136,7 +136,7 @@ class ProRataAllocator(BaseCapitalAllocator):
 
     def allocate(
         self,
-        signals: Dict[str, int],
+        signals: Dict[str, float],
         prices: Dict[str, float],
         portfolio: Any,
         config: Any,
@@ -168,7 +168,7 @@ class MarginAllocator(BaseCapitalAllocator):
 
     def allocate(
         self,
-        signals: Dict[str, int],
+        signals: Dict[str, float],
         prices: Dict[str, float],
         portfolio: Any,
         config: Any,

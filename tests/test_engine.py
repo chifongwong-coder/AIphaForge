@@ -24,7 +24,7 @@ def _rising_data(n: int = 50) -> pd.DataFrame:
 
 def _all_long_signals(data: pd.DataFrame) -> pd.Series:
     """Return a signal series that goes long on bar 1 and flat at end."""
-    signals = pd.Series(0, index=data.index, dtype=float)
+    signals = pd.Series(np.nan, index=data.index, dtype=float)
     signals.iloc[1] = 1    # buy
     signals.iloc[-2] = -1  # sell near end
     return signals
@@ -77,7 +77,7 @@ class TestCrossModeConsistency:
     def test_cross_mode_direction_agreement(self):
         """Both modes should agree on the sign of total return for identical signals."""
         data = _rising_data(80)
-        signals = pd.Series(0, index=data.index, dtype=float)
+        signals = pd.Series(np.nan, index=data.index, dtype=float)
         signals.iloc[5] = 1
         signals.iloc[40] = -1
 
@@ -114,7 +114,7 @@ class TestStopLossTakeProfit:
         falling data.
         """
         data = make_ohlcv(30, start_price=100, trend=-0.02, volatility=0.001)
-        signals = pd.Series(0, index=data.index, dtype=float)
+        signals = pd.Series(np.nan, index=data.index, dtype=float)
         signals.iloc[1] = 1  # buy into a falling market
 
         # Run WITH stop-loss
@@ -148,7 +148,7 @@ class TestStopLossTakeProfit:
         should be closed early, producing a completed trade.
         """
         data = make_ohlcv(30, start_price=100, trend=0.02, volatility=0.001)
-        signals = pd.Series(0, index=data.index, dtype=float)
+        signals = pd.Series(np.nan, index=data.index, dtype=float)
         signals.iloc[1] = 1  # buy into a rising market
 
         engine = BacktestEngine(
@@ -175,7 +175,7 @@ class TestAllowShort:
     def test_allow_short_false_blocks_short(self):
         """When allow_short=False, sell signals should not open short positions."""
         data = _rising_data(40)
-        signals = pd.Series(0, index=data.index, dtype=float)
+        signals = pd.Series(np.nan, index=data.index, dtype=float)
         signals.iloc[5] = -1  # attempt short
 
         engine = BacktestEngine(
@@ -213,7 +213,7 @@ class TestConstructorAndValidation:
     def test_empty_data_after_filter_raises(self):
         """Filtering to an empty range should raise ValueError."""
         data = _rising_data(10)
-        signals = pd.Series(0, index=data.index, dtype=float)
+        signals = pd.Series(np.nan, index=data.index, dtype=float)
         engine = BacktestEngine(include_benchmark=False)
         engine.set_signals(signals)
 
@@ -284,7 +284,7 @@ class TestHookIntegration:
                 context.broker.submit_order(order, context.timestamp)
 
         data = _rising_data(20)
-        signals = pd.Series(0, index=data.index, dtype=float)
+        signals = pd.Series(np.nan, index=data.index, dtype=float)
         signals.iloc[5] = 1  # non-zero signal on same bar the hook acts
 
         engine = BacktestEngine(

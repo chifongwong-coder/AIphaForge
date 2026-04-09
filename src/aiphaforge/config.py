@@ -67,6 +67,10 @@ class BacktestConfig:
     # Per-asset position limits (v0.8) — fraction of equity
     max_position_pct: float = 1.0  # 1.0 = no per-asset limit
     asset_max_position_pcts: Dict[str, float] = field(default_factory=dict)
+    # Signal (v0.9)
+    signal_transform: Optional[Any] = None  # Callable[[float], float]
+    is_weight_mode: bool = False
+    turnover_config: Any = None  # TurnoverConfig
 
 
 def resolve_config(default: Any, overrides: Dict, symbol: str) -> Any:

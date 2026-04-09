@@ -181,7 +181,7 @@ class LatencyHook(BacktestHook):
             warnings.warn(
                 "LatencyHook detected while a strategy/signals are also "
                 "configured. Both the hook and signals will generate orders. "
-                "Set signals to 0 if the hook manages all orders.",
+                "Set signals to NaN if the hook manages all orders.",
                 stacklevel=2,
             )
             self._warned_signal_conflict = True

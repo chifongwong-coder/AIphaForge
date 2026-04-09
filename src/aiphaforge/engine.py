@@ -476,11 +476,11 @@ class BacktestEngine:
             signals_dict = {}
             for sym, df in data_dict.items():
                 if sym in self._signals:
-                    sig = self._signals[sym].reindex(df.index).fillna(0)
+                    sig = self._signals[sym].reindex(df.index)
                 else:
-                    sig = pd.Series(0, index=df.index, dtype=float)
+                    sig = pd.Series(np.nan, index=df.index, dtype=float)
                 signals_dict[sym] = sig.replace(
-                    [np.inf, -np.inf], 0).fillna(0)
+                    [np.inf, -np.inf], np.nan)
             return signals_dict
         elif self._strategy is not None:
             result = self._strategy.generate_signals(data_dict)
@@ -611,15 +611,16 @@ class BacktestEngine:
         return data.copy()
 
     def _get_signals(self, data: pd.DataFrame) -> pd.Series:
-        """Get trading signals."""
+        """Get trading signals. NaN = hold, 0 = flat, nonzero = trade."""
         if self._signals is not None:
-            signals = self._signals.reindex(data.index).fillna(0)
+            signals = self._signals.reindex(data.index)
+            # NaN from reindex means "no signal" = hold (preserve NaN)
         elif self._strategy is not None:
             signals = self._strategy.generate_signals(data)
         else:
             raise ValueError("Must set either a strategy or signals")
 
-        signals = signals.replace([np.inf, -np.inf], 0).fillna(0)
+        signals = signals.replace([np.inf, -np.inf], np.nan)
         return signals
 
     # ========== Config and Result Building ==========

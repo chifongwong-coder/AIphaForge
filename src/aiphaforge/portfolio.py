@@ -308,6 +308,17 @@ class Portfolio:
         """Deduct periodic cost (borrowing, funding) from cash."""
         self.cash -= amount
 
+    def get_weights(self) -> Dict[str, float]:
+        """Current portfolio weight per asset (notional value / equity)."""
+        equity = self.total_equity
+        if equity <= 0:
+            return {}
+        return {
+            sym: pos.notional_value / equity
+            for sym, pos in self.positions.items()
+            if not pos.is_flat
+        }
+
     @property
     def current_drawdown(self) -> float:
         if self._peak_equity == 0:
