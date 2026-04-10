@@ -67,6 +67,15 @@ def optimize(
     # Identify which params are engine-level vs strategy-level
     engine_param_names = set(inspect.signature(BacktestEngine.__init__).parameters)
 
+    # Warn if strategy params in grid but no factory to consume them
+    non_engine = [k for k in param_grid if k not in engine_param_names]
+    if non_engine and strategy_factory is None:
+        import warnings
+        warnings.warn(
+            f"param_grid contains non-engine params {non_engine} but "
+            f"strategy_factory is not set. These params will be ignored. "
+            f"Use strategy_factory to sweep strategy-level parameters.")
+
     param_names = list(param_grid.keys())
     param_values = list(param_grid.values())
     combos = list(itertools.product(*param_values))
