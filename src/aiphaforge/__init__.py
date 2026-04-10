@@ -62,6 +62,7 @@ from .capital_allocator import (
     ProRataAllocator,
 )
 from .config import BacktestConfig, resolve_config
+from .corporate_actions import CorporateActionHook
 from .costs import BaseTradeCost, DefaultTradeCost
 from .engine import BacktestEngine, ExecutionMode, PositionSizing, backtest
 from .exit_rules import BaseExitRule, PercentageStopLoss, PercentageTakeProfit
@@ -99,7 +100,7 @@ from .risk import (
     RiskSignal,
 )
 
-__version__ = '0.8.0'
+__version__ = '0.9.0'
 
 __all__ = [
     # Main engine
@@ -176,6 +177,7 @@ __all__ = [
     'PeriodicCostModel',
     'BorrowingCostModel',
     'FundingRateModel',
+    'CorporateActionHook',
 
     # Risk management
     'BaseRiskManager',

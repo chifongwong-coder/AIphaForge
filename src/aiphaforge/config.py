@@ -70,7 +70,6 @@ class BacktestConfig:
     # Signal (v0.9)
     signal_transform: Optional[Any] = None  # Callable[[float], float]
     is_weight_mode: bool = False
-    turnover_config: Any = None  # TurnoverConfig
 
 
 def resolve_config(default: Any, overrides: Dict, symbol: str) -> Any:

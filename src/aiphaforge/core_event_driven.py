@@ -233,6 +233,8 @@ def run_event_driven(
             # Apply signal transform if configured
             if config.signal_transform is not None:
                 raw_sig = config.signal_transform(raw_sig)
+                if pd.isna(raw_sig):
+                    continue  # transform mapped to NaN = hold
             current_signals[sym] = raw_sig
 
         # Warn if hooks submitted orders AND signals are active
@@ -250,20 +252,29 @@ def run_event_driven(
                         )
 
         # Phase B: allocate then execute
-        budgets: Dict[str, Optional[float]] = {}
-        if current_signals and config.capital_allocator is not None:
-            budgets = config.capital_allocator.allocate(
-                current_signals, prices, portfolio, config)
+        if config.is_weight_mode:
+            for sym, weight in sorted(current_signals.items()):
+                if pd.isna(weight):
+                    continue
+                bar = data_dict[sym].loc[timestamp]
+                _process_weight_rebalance(
+                    sym, weight, portfolio, brokers[sym],
+                    bar['close'], timestamp, config)
+        else:
+            budgets: Dict[str, Optional[float]] = {}
+            if current_signals and config.capital_allocator is not None:
+                budgets = config.capital_allocator.allocate(
+                    current_signals, prices, portfolio, config)
 
-        for sym, sig in sorted(current_signals.items()):
-            bar = data_dict[sym].loc[timestamp]
-            _process_signal(
-                sig, portfolio, brokers[sym], sym, bar, timestamp,
-                config=config,
-                bar_index=idx,
-                full_data=data_dict[sym],
-                budget=budgets.get(sym),
-            )
+            for sym, sig in sorted(current_signals.items()):
+                bar = data_dict[sym].loc[timestamp]
+                _process_signal(
+                    sig, portfolio, brokers[sym], sym, bar, timestamp,
+                    config=config,
+                    bar_index=idx,
+                    full_data=data_dict[sym],
+                    budget=budgets.get(sym),
+                )
 
         # 5b. Process immediate IOC/FOK from signals
         for sym in active:
@@ -547,3 +558,77 @@ def _calculate_target_position(
     return config.position_sizer.calculate(
         equity, price, direction, config.max_position_size,
     )
+
+
+# ---------------------------------------------------------------------------
+# Target-weight rebalance (v0.9)
+# ---------------------------------------------------------------------------
+
+def _process_weight_rebalance(
+    symbol: str,
+    weight: float,
+    portfolio: Portfolio,
+    broker: Broker,
+    price: float,
+    timestamp: pd.Timestamp,
+    config: BacktestConfig,
+) -> None:
+    """Compute target position from weight and submit delta order.
+
+    Bypasses position sizer and allocator — weights directly define
+    the target as a fraction of equity.
+    """
+    if pd.isna(weight):
+        return
+
+    # weight=0 means go flat
+    current_pos = portfolio.get_position_size(symbol)
+    if abs(weight) < 1e-8:
+        if portfolio.is_margin_call:
+            return
+        if abs(current_pos) < 0.001:
+            return
+        side = "sell" if current_pos > 0 else "buy"
+        order = broker.create_market_order(
+            symbol, side, abs(current_pos), "rebalance_flat", timestamp)
+        order.metadata['estimated_price'] = price
+        broker.submit_order(order, timestamp)
+        return
+
+    # Negative weight = short
+    if weight < 0 and not config.allow_short:
+        warnings.warn(
+            f"Short weight for '{symbol}' ignored (allow_short=False)")
+        return
+
+    # Target shares from weight
+    if price <= 0:
+        return
+    target_shares = portfolio.total_equity * weight / price
+
+    size_change = target_shares - current_pos
+
+    # Position limit still applies
+    max_pct = resolve_config(
+        config.max_position_pct, config.asset_max_position_pcts, symbol)
+    if max_pct < 1.0 and price > 0:
+        max_pos = portfolio.total_equity * max_pct / price
+        new_pos = current_pos + size_change
+        if abs(new_pos) > max_pos:
+            capped_pos = max_pos * (1 if new_pos > 0 else -1)
+            size_change = capped_pos - current_pos
+
+    # Lot-size rounding still applies
+    lot = resolve_config(config.lot_size, config.asset_lot_sizes, symbol)
+    if lot > 1 and size_change != 0:
+        sign = 1 if size_change > 0 else -1
+        size_change = (int(abs(size_change)) // lot) * lot * sign
+
+    if abs(size_change) < 0.001:
+        return
+
+    side = "buy" if size_change > 0 else "sell"
+    order = broker.create_market_order(
+        symbol, side, abs(size_change), "rebalance", timestamp)
+    order.metadata['estimated_price'] = price
+    broker.submit_order(order, timestamp)

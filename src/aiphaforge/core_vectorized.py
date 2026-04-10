@@ -29,6 +29,11 @@ def run_vectorized(
         Dictionary with keys: equity_curve, trades, positions_df,
         net_returns.
     """
+    # Apply signal transform if configured
+    if config.signal_transform is not None:
+        signals = signals.apply(
+            lambda s: config.signal_transform(s) if not pd.isna(s) else s)
+
     # Compute positions: NaN = hold (forward-fill), 0 = flat
     positions = signals.ffill().fillna(0)
 
