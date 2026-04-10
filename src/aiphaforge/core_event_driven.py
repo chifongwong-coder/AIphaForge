@@ -179,7 +179,9 @@ def run_event_driven(
                         suppress_new_orders = True
                     elif sig.action == 'close_all':
                         # Close all positions via existing broker infrastructure.
-                        # Dedup with margin call: skip if already active.
+                        # Orders are GTC — fill at next bar's open (same as
+                        # margin call behavior). Dedup: skip if margin call
+                        # already active.
                         if not portfolio.is_margin_call:
                             for sym, pos in portfolio.positions.items():
                                 if pos.is_flat or sym not in brokers:

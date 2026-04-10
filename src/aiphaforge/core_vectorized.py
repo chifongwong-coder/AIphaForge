@@ -68,6 +68,12 @@ def run_vectorized(
             strategy_returns, positions, data, config.fee_model,
             config.initial_capital,
         )
+        # Re-apply stop-loss on recomputed returns (risk rules may have
+        # modified positions, changing which stop-loss triggers fire)
+        if config.stop_loss_rule is not None:
+            net_returns = config.stop_loss_rule.apply_vectorized(
+                net_returns, positions, data,
+            )
 
     # Fill NaN values (first row from pct_change and shift)
     net_returns = net_returns.fillna(0)
