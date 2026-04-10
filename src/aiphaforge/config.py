@@ -72,6 +72,8 @@ class BacktestConfig:
     is_weight_mode: bool = False
     # Turnover (v0.9.1)
     turnover_config: Any = None  # TurnoverConfig
+    # Risk rules (v1.1)
+    risk_rules: Any = None  # CompositeRiskManager
 
 
 @dataclass

@@ -58,6 +58,17 @@ def run_vectorized(
             net_returns, positions, data,
         )
 
+    # Apply risk rules (v1.1)
+    if config.risk_rules:
+        temp_equity = config.initial_capital * (1 + net_returns.fillna(0)).cumprod()
+        positions = config.risk_rules.apply_vectorized_all(
+            temp_equity, positions, data)
+        strategy_returns = positions.shift(1) * returns
+        net_returns = config.trade_cost.apply_vectorized(
+            strategy_returns, positions, data, config.fee_model,
+            config.initial_capital,
+        )
+
     # Fill NaN values (first row from pct_change and shift)
     net_returns = net_returns.fillna(0)
 

@@ -126,6 +126,7 @@ class BacktestEngine:
         asset_max_position_pcts: Optional[Dict] = None,
         signal_transform=None,
         turnover_config=None,
+        risk_rules=None,
     ):
         # Fee model
         if isinstance(fee_model, str):
@@ -202,6 +203,7 @@ class BacktestEngine:
         self.lot_size = lot_size
         self.signal_transform = signal_transform
         self.turnover_config = turnover_config
+        self.risk_rules = risk_rules
         self.asset_lot_sizes: Dict = asset_lot_sizes or {}
         for sym, ls in self.asset_lot_sizes.items():
             if not isinstance(ls, int) or ls < 1:
@@ -740,6 +742,7 @@ class BacktestEngine:
             asset_max_position_pcts=self.asset_max_position_pcts,
             signal_transform=self.signal_transform,
             turnover_config=self.turnover_config,
+            risk_rules=self.risk_rules,
         )
 
     def _build_result(
