@@ -90,6 +90,7 @@ from .margin import (
     MarginConfig,
     PeriodicCostModel,
 )
+from .optimizer import optimize, walk_forward
 from .orders import Order, OrderManager, OrderSide, OrderStatus, OrderType
 from .performance import PerformanceAnalyzer, analyze, compare_strategies
 from .portfolio import Portfolio, Position
@@ -100,7 +101,7 @@ from .risk import (
     RiskSignal,
 )
 
-__version__ = '0.9.1'
+__version__ = '0.9.2'
 
 __all__ = [
     # Main engine
@@ -179,6 +180,8 @@ __all__ = [
     'FundingRateModel',
     'CorporateActionHook',
     'TurnoverConfig',
+    'optimize',
+    'walk_forward',
 
     # Risk management
     'BaseRiskManager',
