@@ -89,10 +89,8 @@ class TestPlotting:
 
     def test_plot_result_returns_figure(self):
         """plot_result returns a matplotlib Figure."""
-        try:
-            from aiphaforge.plotting import plot_result
-        except ImportError:
-            pytest.skip("matplotlib not installed")
+        pytest.importorskip("matplotlib")
+        from aiphaforge.plotting import plot_result
 
         data = make_ohlcv(30)
         signals = pd.Series(np.nan, index=data.index, dtype=float)
@@ -114,10 +112,8 @@ class TestPlotting:
 
     def test_plot_comparison_returns_figure(self):
         """plot_comparison returns a matplotlib Figure."""
-        try:
-            from aiphaforge.plotting import plot_comparison
-        except ImportError:
-            pytest.skip("matplotlib not installed")
+        pytest.importorskip("matplotlib")
+        from aiphaforge.plotting import plot_comparison
 
         data = make_ohlcv(30)
         sig1 = pd.Series(np.nan, index=data.index, dtype=float)
