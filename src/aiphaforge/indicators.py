@@ -67,8 +67,10 @@ def RSI(series: pd.Series, window: int = 14) -> pd.Series:
     avg_gain = gain.ewm(alpha=1 / window, min_periods=window, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1 / window, min_periods=window, adjust=False).mean()
 
-    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rs = avg_gain / avg_loss
     rsi = 100 - (100 / (1 + rs))
+    # When avg_loss=0 (all gains): RS=inf, RSI should be 100
+    rsi = rsi.fillna(100.0)
     return rsi
 
 
@@ -124,14 +126,14 @@ def ATR(
     close: pd.Series,
     window: int = 14,
 ) -> pd.Series:
-    """Average True Range."""
+    """Average True Range (Wilder's EMA smoothing)."""
     prev_close = close.shift(1)
     tr = pd.concat([
         high - low,
         (high - prev_close).abs(),
         (low - prev_close).abs(),
     ], axis=1).max(axis=1)
-    return tr.rolling(window=window, min_periods=window).mean()
+    return tr.ewm(alpha=1 / window, min_periods=window, adjust=False).mean()
 
 
 # ---------------------------------------------------------------------------
@@ -144,7 +146,13 @@ def VWAP(
     close: pd.Series,
     volume: pd.Series,
 ) -> pd.Series:
-    """Volume Weighted Average Price (cumulative intraday)."""
+    """Volume Weighted Average Price (running cumulative).
+
+    Note: this is a running cumulative VWAP with no daily reset.
+    Correct for daily bars or single-session intraday. For multi-day
+    intraday data, VWAP should reset each day — group by date and
+    apply this function per group.
+    """
     typical_price = (high + low + close) / 3
     cum_tp_vol = (typical_price * volume).cumsum()
     cum_vol = volume.cumsum()
