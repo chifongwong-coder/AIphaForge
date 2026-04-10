@@ -125,6 +125,7 @@ class BacktestEngine:
         max_position_pct: float = 1.0,
         asset_max_position_pcts: Optional[Dict] = None,
         signal_transform=None,
+        turnover_config=None,
     ):
         # Fee model
         if isinstance(fee_model, str):
@@ -200,6 +201,7 @@ class BacktestEngine:
             raise ValueError(f"lot_size must be an int >= 1, got {lot_size!r}")
         self.lot_size = lot_size
         self.signal_transform = signal_transform
+        self.turnover_config = turnover_config
         self.asset_lot_sizes: Dict = asset_lot_sizes or {}
         for sym, ls in self.asset_lot_sizes.items():
             if not isinstance(ls, int) or ls < 1:
@@ -737,6 +739,7 @@ class BacktestEngine:
             max_position_pct=self.max_position_pct,
             asset_max_position_pcts=self.asset_max_position_pcts,
             signal_transform=self.signal_transform,
+            turnover_config=self.turnover_config,
         )
 
     def _build_result(
@@ -804,7 +807,13 @@ class BacktestEngine:
         if final_capital is not None:
             result_kwargs['final_capital'] = final_capital
 
-        return BacktestResult(**result_kwargs)
+        result = BacktestResult(**result_kwargs)
+
+        # Attach turnover history if present
+        if 'turnover_history' in raw:
+            result.turnover_history = raw['turnover_history']
+
+        return result
 
     # ========== Performance Calculation ==========
 

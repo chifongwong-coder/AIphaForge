@@ -109,6 +109,7 @@ def run_event_driven(
     # contribution.  sum(per_asset_pnl) will exceed portfolio equity
     # change by the total fees paid.  Portfolio equity curve is net.
     pnl_tracker: Optional[dict] = None
+    turnover_history: List[float] = []
     if not is_single:
         pnl_tracker = {
             'series': {sym: [] for sym in symbols},
@@ -209,11 +210,14 @@ def run_event_driven(
             for hook in config.hooks:
                 hook.on_pre_signal(ctx)
 
-        # 4b. Process immediate IOC/FOK from hooks
+        # 4b. Process immediate IOC/FOK from hooks (track for turnover)
+        step_4b_fills: Dict[str, list] = {}
         for sym in active:
             bar = data_dict[sym].loc[timestamp]
             immediate = brokers[sym].process_immediate_orders(
                 bar, timestamp, sym)
+            if immediate:
+                step_4b_fills[sym] = list(immediate)
             for order in immediate:
                 trade = portfolio.update_from_order(order, timestamp)
                 if trade and pnl_tracker is not None:
@@ -223,18 +227,17 @@ def run_event_driven(
                         + trade.slippage_cost
                     )
 
-        # 5. Two-phase signal processing
-        # Phase A: collect signals (NaN = hold → skip; 0 = flat → include)
+        # 5. Four-phase signal processing (v0.9.1)
+        # Phase A: collect signals
         current_signals: Dict[str, float] = {}
         for sym in active:
             raw_sig = signals_as_dict[sym].get(timestamp, float('nan'))
             if pd.isna(raw_sig):
                 continue
-            # Apply signal transform if configured
             if config.signal_transform is not None:
                 raw_sig = config.signal_transform(raw_sig)
                 if pd.isna(raw_sig):
-                    continue  # transform mapped to NaN = hold
+                    continue
             current_signals[sym] = raw_sig
 
         # Warn if hooks submitted orders AND signals are active
@@ -251,30 +254,95 @@ def run_event_driven(
                             f"manage orders."
                         )
 
-        # Phase B: allocate then execute
-        if config.is_weight_mode:
-            for sym, weight in sorted(current_signals.items()):
-                if pd.isna(weight):
-                    continue
-                bar = data_dict[sym].loc[timestamp]
-                _process_weight_rebalance(
-                    sym, weight, portfolio, brokers[sym],
-                    bar['close'], timestamp, config)
-        else:
-            budgets: Dict[str, Optional[float]] = {}
-            if current_signals and config.capital_allocator is not None:
-                budgets = config.capital_allocator.allocate(
-                    current_signals, prices, portfolio, config)
+        equity = portfolio.total_equity
 
-            for sym, sig in sorted(current_signals.items()):
-                bar = data_dict[sym].loc[timestamp]
-                _process_signal(
-                    sig, portfolio, brokers[sym], sym, bar, timestamp,
-                    config=config,
-                    bar_index=idx,
-                    full_data=data_dict[sym],
-                    budget=budgets.get(sym),
-                )
+        # Phase 1: exempt close orders (signal=0 / weight=0)
+        # No lot rounding, no turnover cap — user intent is "be flat".
+        exempt_orders: Dict[str, tuple] = {}
+        non_zero_signals: Dict[str, float] = {}
+        for sym, sig in sorted(current_signals.items()):
+            if abs(sig) < 1e-8:
+                if config.is_weight_mode:
+                    sc = _compute_weight_change(
+                        sym, sig, portfolio, prices[sym], config)
+                else:
+                    bar = data_dict[sym].loc[timestamp]
+                    sc = _compute_size_change(
+                        sig, portfolio, sym, bar, config,
+                        bar_index=idx, full_data=data_dict[sym])
+                if abs(sc) > 0.001:
+                    exempt_orders[sym] = (sc, prices[sym])
+            else:
+                non_zero_signals[sym] = sig
+
+        for sym, (sc, price) in sorted(exempt_orders.items()):
+            _submit_order(sym, sc, price, brokers[sym], timestamp,
+                          "signal_flat")
+
+        # Phase 2: compute all non-zero size_changes (no lot rounding)
+        pending: Dict[str, tuple] = {}
+        if equity > 0:  # guard: skip if bankrupt
+            if config.is_weight_mode:
+                for sym, w in sorted(non_zero_signals.items()):
+                    sc = _compute_weight_change(
+                        sym, w, portfolio, prices[sym], config)
+                    if abs(sc) > 0.001:
+                        pending[sym] = (sc, prices[sym])
+            else:
+                budgets: Dict[str, Optional[float]] = {}
+                if (non_zero_signals
+                        and config.capital_allocator is not None):
+                    budgets = config.capital_allocator.allocate(
+                        non_zero_signals, prices, portfolio, config)
+                for sym, sig in sorted(non_zero_signals.items()):
+                    bar = data_dict[sym].loc[timestamp]
+                    sc = _compute_size_change(
+                        sig, portfolio, sym, bar, config,
+                        bar_index=idx, full_data=data_dict[sym],
+                        budget=budgets.get(sym))
+                    if abs(sc) > 0.001:
+                        pending[sym] = (sc, prices[sym])
+
+        # Phase 3: turnover enforcement
+        if config.turnover_config and pending and equity > 0:
+            max_to = config.turnover_config.max_turnover_per_bar
+
+            # Hook IOC: track for reporting, warn if > 50% cap
+            hook_to = sum(
+                abs(o.filled_size * o.filled_price)
+                for fills in step_4b_fills.values() for o in fills
+            ) / equity
+            if hook_to > max_to * 0.5:
+                warnings.warn(
+                    f"Hook IOC turnover ({hook_to:.1%}) exceeds 50% of "
+                    f"turnover cap ({max_to:.1%}).")
+
+            signal_to = sum(
+                abs(sc) * p for sc, p in pending.values()
+            ) / equity
+
+            if signal_to > max_to and signal_to > 0:
+                scale = max_to / signal_to
+                pending = {
+                    sym: (sc * scale, p)
+                    for sym, (sc, p) in pending.items()
+                }
+
+        # Phase 4: lot rounding + submit
+        bar_turnover = 0.0
+        for sym, (sc, price) in sorted(pending.items()):
+            sc = _apply_lot_rounding(sc, sym, config)
+            if abs(sc) > 0.001:
+                _submit_order(sym, sc, price, brokers[sym], timestamp)
+                bar_turnover += abs(sc) * price
+
+        # Track turnover
+        exempt_to = sum(abs(sc) * p for sc, p in exempt_orders.values())
+        if equity > 0:
+            turnover_history.append(
+                (bar_turnover + exempt_to) / equity)
+        else:
+            turnover_history.append(0.0)
 
         # 5b. Process immediate IOC/FOK from signals
         for sym in active:
@@ -345,6 +413,7 @@ def run_event_driven(
         'orders_df': orders_df,
         'daily_returns': daily_returns,
         'final_capital': portfolio.total_equity,
+        'turnover_history': turnover_history,
     }
 
     # Per-asset PnL (multi-asset only)
@@ -391,8 +460,174 @@ def _record_per_asset_pnl(
 
 
 # ---------------------------------------------------------------------------
-# Signal processing (largely unchanged from v0.6)
+# Signal processing helpers (v0.9.1: extracted for turnover two-pass)
 # ---------------------------------------------------------------------------
+
+def _compute_size_change(
+    signal: float,
+    portfolio: Portfolio,
+    symbol: str,
+    bar: pd.Series,
+    config: BacktestConfig,
+    bar_index: Optional[int] = None,
+    full_data: Optional[pd.DataFrame] = None,
+    budget: Optional[float] = None,
+) -> float:
+    """Compute desired size_change WITHOUT submitting or lot-rounding.
+
+    For signal=0 (flat): returns -current_pos (exact close), bypassing
+    risk manager / sizer / budget cap. Matches v0.9 short-circuit.
+    """
+    if pd.isna(signal):
+        return 0.0
+
+    price = bar['close']
+    current_pos = portfolio.get_position_size(symbol)
+
+    # signal=0 flat: exact close (SHORT-CIRCUIT)
+    if abs(signal) < 1e-8:
+        if portfolio.is_margin_call or abs(current_pos) < 0.001:
+            return 0.0
+        return -current_pos
+
+    direction = 1 if signal > 0 else -1
+    fraction = abs(signal)
+
+    if direction == -1 and not config.allow_short:
+        warnings.warn(
+            f"Short signal for '{symbol}' ignored (allow_short=False)")
+        return 0.0
+
+    # Build sliced market data
+    if bar_index is not None and full_data is not None:
+        sliced_data = full_data.iloc[:bar_index + 1]
+        market_data_dict: Dict[str, pd.DataFrame] = {symbol: sliced_data}
+    else:
+        sliced_data = full_data
+        market_data_dict = (
+            {symbol: full_data} if full_data is not None else {}
+        )
+
+    # Risk manager check
+    if config.risk_manager:
+        try:
+            config.risk_manager.sync_from_portfolio(portfolio)
+            risk_signals = config.risk_manager.check_and_apply_risk_rules(
+                portfolio, market_data_dict)
+            for risk_signal in risk_signals:
+                if (
+                    risk_signal.severity == 'critical'
+                    and risk_signal.action in ['reject_new', 'close_all']
+                ):
+                    warnings.warn(
+                        f"Risk limit triggered: {risk_signal.message}")
+                    return 0.0
+        except Exception as e:
+            warnings.warn(f"Risk check failed: {e}")
+
+    # Target position
+    max_target = _calculate_target_position(
+        portfolio, price, direction, symbol, config,
+        market_data=sliced_data,
+    )
+    target_pos = max_target * fraction
+    size_change = target_pos - current_pos
+
+    # Position limit cap
+    max_pct = resolve_config(
+        config.max_position_pct, config.asset_max_position_pcts, symbol)
+    if max_pct < 1.0 and price > 0:
+        max_pos = portfolio.total_equity * max_pct / price
+        new_pos = current_pos + size_change
+        if abs(new_pos) > max_pos:
+            capped_pos = max_pos * (1 if new_pos > 0 else -1)
+            size_change = capped_pos - current_pos
+
+    # Budget cap
+    if budget is not None and price > 0:
+        max_size = budget / price
+        if abs(size_change) > max_size:
+            size_change = max_size * (1 if size_change > 0 else -1)
+
+    # NO lot rounding here — applied in Phase 4 of event loop
+    return size_change
+
+
+def _compute_weight_change(
+    symbol: str,
+    weight: float,
+    portfolio: Portfolio,
+    price: float,
+    config: BacktestConfig,
+) -> float:
+    """Compute size_change for weight rebalance, without lot-rounding.
+
+    weight=0: returns -current_pos (exact close, SHORT-CIRCUIT).
+    """
+    if pd.isna(weight):
+        return 0.0
+
+    current_pos = portfolio.get_position_size(symbol)
+
+    if abs(weight) < 1e-8:
+        if portfolio.is_margin_call or abs(current_pos) < 0.001:
+            return 0.0
+        return -current_pos
+
+    if weight < 0 and not config.allow_short:
+        warnings.warn(
+            f"Short weight for '{symbol}' ignored (allow_short=False)")
+        return 0.0
+
+    if price <= 0:
+        return 0.0
+
+    target_shares = portfolio.total_equity * weight / price
+    size_change = target_shares - current_pos
+
+    # Position limit cap
+    max_pct = resolve_config(
+        config.max_position_pct, config.asset_max_position_pcts, symbol)
+    if max_pct < 1.0 and price > 0:
+        max_pos = portfolio.total_equity * max_pct / price
+        new_pos = current_pos + size_change
+        if abs(new_pos) > max_pos:
+            capped_pos = max_pos * (1 if new_pos > 0 else -1)
+            size_change = capped_pos - current_pos
+
+    return size_change
+
+
+def _apply_lot_rounding(
+    size_change: float,
+    symbol: str,
+    config: BacktestConfig,
+) -> float:
+    """Apply lot-size rounding to a size_change."""
+    lot = resolve_config(config.lot_size, config.asset_lot_sizes, symbol)
+    if lot > 1 and size_change != 0:
+        sign = 1 if size_change > 0 else -1
+        size_change = (int(abs(size_change)) // lot) * lot * sign
+    return size_change
+
+
+def _submit_order(
+    symbol: str,
+    size_change: float,
+    price: float,
+    broker: Broker,
+    timestamp: pd.Timestamp,
+    reason: str = "signal",
+) -> None:
+    """Submit an order for a pre-computed size_change."""
+    if abs(size_change) < 0.001:
+        return
+    side = "buy" if size_change > 0 else "sell"
+    order = broker.create_market_order(
+        symbol, side, abs(size_change), reason, timestamp)
+    order.metadata['estimated_price'] = price
+    broker.submit_order(order, timestamp)
+
 
 def _process_signal(
     signal: float,
@@ -406,118 +641,19 @@ def _process_signal(
     full_data: Optional[pd.DataFrame] = None,
     budget: Optional[float] = None,
 ):
-    """Process a single trading signal.
+    """Process a single trading signal (thin wrapper).
 
-    Signal semantics (v0.9):
-    - NaN: hold (filtered before reaching here)
-    - 0: go flat (close position)
-    - positive: go long (value = exposure fraction of max target)
-    - negative: go short (value = exposure fraction of max target)
+    Preserved for backward compatibility and standalone use.
+    The event loop uses the 4-phase pattern directly.
     """
-    if pd.isna(signal):
-        return  # NaN = hold
-
-    price = bar['close']
-    current_pos = portfolio.get_position_size(symbol)
-
-    # --- signal=0: go flat (close position) ---
-    if abs(signal) < 1e-8:
-        # Skip if margin call in progress (liquidation already pending)
-        if portfolio.is_margin_call:
-            return
-        if abs(current_pos) < 0.001:
-            return  # already flat
-        side = "sell" if current_pos > 0 else "buy"
-        order = broker.create_market_order(
-            symbol, side, abs(current_pos), "signal_flat", timestamp)
-        order.metadata['estimated_price'] = price
-        broker.submit_order(order, timestamp)
-        return
-
-    # --- Directional signal ---
-    direction = 1 if signal > 0 else -1
-    fraction = abs(signal)
-
-    # allow_short guard
-    if direction == -1 and not config.allow_short:
-        warnings.warn(
-            f"Short signal for '{symbol}' ignored (allow_short=False)")
-        return
-
-    # Build sliced market data visible up to the current bar
-    if bar_index is not None and full_data is not None:
-        sliced_data = full_data.iloc[:bar_index + 1]
-        market_data_dict: Dict[str, pd.DataFrame] = {symbol: sliced_data}
-    else:
-        sliced_data = full_data
-        market_data_dict = (
-            {symbol: full_data} if full_data is not None else {}
-        )
-
-    # Risk manager check (preserved from v0.8)
-    if config.risk_manager:
-        try:
-            config.risk_manager.sync_from_portfolio(portfolio)
-            risk_signals = config.risk_manager.check_and_apply_risk_rules(
-                portfolio, market_data_dict)
-            for risk_signal in risk_signals:
-                if (
-                    risk_signal.severity == 'critical'
-                    and risk_signal.action in ['reject_new', 'close_all']
-                ):
-                    warnings.warn(
-                        f"Risk limit triggered: {risk_signal.message}")
-                    return
-        except Exception as e:
-            warnings.warn(f"Risk check failed: {e}")
-
-    # Calculate max target position for this direction
-    max_target = _calculate_target_position(
-        portfolio, price, direction, symbol, config,
-        market_data=sliced_data,
-    )
-
-    # Scale by signal fraction (continuous signal support)
-    target_pos = max_target * fraction
-
-    # Calculate required trade
-    size_change = target_pos - current_pos
-
-    # Per-asset position limit (cap total position to equity * max_pct)
-    max_pct = resolve_config(
-        config.max_position_pct, config.asset_max_position_pcts, symbol)
-    if max_pct < 1.0 and price > 0:
-        max_pos = portfolio.total_equity * max_pct / price
-        new_pos = current_pos + size_change
-        if abs(new_pos) > max_pos:
-            capped_pos = max_pos * (1 if new_pos > 0 else -1)
-            size_change = capped_pos - current_pos
-
-    # Budget cap on incremental cost (direction-agnostic)
-    if budget is not None and price > 0:
-        max_size = budget / price
-        if abs(size_change) > max_size:
-            size_change = max_size * (1 if size_change > 0 else -1)
-
-    # Lot-size rounding (e.g., A-share 100-share lots)
-    lot = resolve_config(config.lot_size, config.asset_lot_sizes, symbol)
-    if lot > 1 and size_change != 0:
-        sign = 1 if size_change > 0 else -1
-        size_change = (int(abs(size_change)) // lot) * lot * sign
-
-    if abs(size_change) < 0.001:  # Ignore tiny changes
-        return
-
-    # Create order
-    if size_change > 0:
-        order = broker.create_market_order(
-            symbol, "buy", size_change, "signal", timestamp)
-    else:
-        order = broker.create_market_order(
-            symbol, "sell", abs(size_change), "signal", timestamp)
-
-    order.metadata['estimated_price'] = price
-    broker.submit_order(order, timestamp)
+    size_change = _compute_size_change(
+        signal, portfolio, symbol, bar, config,
+        bar_index=bar_index, full_data=full_data, budget=budget)
+    is_close = abs(signal) < 1e-8 if not pd.isna(signal) else False
+    if not is_close:
+        size_change = _apply_lot_rounding(size_change, symbol, config)
+    reason = "signal_flat" if is_close else "signal"
+    _submit_order(symbol, size_change, bar['close'], broker, timestamp, reason)
 
 
 def _calculate_target_position(
@@ -573,62 +709,15 @@ def _process_weight_rebalance(
     timestamp: pd.Timestamp,
     config: BacktestConfig,
 ) -> None:
-    """Compute target position from weight and submit delta order.
+    """Process a target-weight rebalance (thin wrapper).
 
-    Bypasses position sizer and allocator — weights directly define
-    the target as a fraction of equity.
+    Preserved for backward compatibility. The event loop uses the
+    4-phase pattern with _compute_weight_change directly.
     """
-    if pd.isna(weight):
-        return
-
-    # weight=0 means go flat
-    current_pos = portfolio.get_position_size(symbol)
-    if abs(weight) < 1e-8:
-        if portfolio.is_margin_call:
-            return
-        if abs(current_pos) < 0.001:
-            return
-        side = "sell" if current_pos > 0 else "buy"
-        order = broker.create_market_order(
-            symbol, side, abs(current_pos), "rebalance_flat", timestamp)
-        order.metadata['estimated_price'] = price
-        broker.submit_order(order, timestamp)
-        return
-
-    # Negative weight = short
-    if weight < 0 and not config.allow_short:
-        warnings.warn(
-            f"Short weight for '{symbol}' ignored (allow_short=False)")
-        return
-
-    # Target shares from weight
-    if price <= 0:
-        return
-    target_shares = portfolio.total_equity * weight / price
-
-    size_change = target_shares - current_pos
-
-    # Position limit still applies
-    max_pct = resolve_config(
-        config.max_position_pct, config.asset_max_position_pcts, symbol)
-    if max_pct < 1.0 and price > 0:
-        max_pos = portfolio.total_equity * max_pct / price
-        new_pos = current_pos + size_change
-        if abs(new_pos) > max_pos:
-            capped_pos = max_pos * (1 if new_pos > 0 else -1)
-            size_change = capped_pos - current_pos
-
-    # Lot-size rounding still applies
-    lot = resolve_config(config.lot_size, config.asset_lot_sizes, symbol)
-    if lot > 1 and size_change != 0:
-        sign = 1 if size_change > 0 else -1
-        size_change = (int(abs(size_change)) // lot) * lot * sign
-
-    if abs(size_change) < 0.001:
-        return
-
-    side = "buy" if size_change > 0 else "sell"
-    order = broker.create_market_order(
-        symbol, side, abs(size_change), "rebalance", timestamp)
-    order.metadata['estimated_price'] = price
-    broker.submit_order(order, timestamp)
+    size_change = _compute_weight_change(
+        symbol, weight, portfolio, price, config)
+    is_close = abs(weight) < 1e-8 if not pd.isna(weight) else False
+    if not is_close:
+        size_change = _apply_lot_rounding(size_change, symbol, config)
+    reason = "rebalance_flat" if is_close else "rebalance"
+    _submit_order(symbol, size_change, price, broker, timestamp, reason)

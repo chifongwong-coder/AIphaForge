@@ -159,6 +159,7 @@ class BacktestResult:
     per_asset_trades: Optional[Dict[str, List['Trade']]] = None
     per_asset_metrics: Optional[Dict[str, Dict]] = None
     symbols: List[str] = field(default_factory=list)
+    turnover_history: Optional[List[float]] = None
 
     def __post_init__(self):
         if self.final_capital == 0.0 and len(self.equity_curve) > 0:
