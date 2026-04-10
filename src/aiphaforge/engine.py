@@ -122,6 +122,9 @@ class BacktestEngine:
         portfolio_exit_rules: Optional[List] = None,
         lot_size: int = 1,
         asset_lot_sizes: Optional[Dict] = None,
+        max_position_pct: float = 1.0,
+        asset_max_position_pcts: Optional[Dict] = None,
+        signal_transform=None,
     ):
         # Fee model
         if isinstance(fee_model, str):
@@ -193,14 +196,27 @@ class BacktestEngine:
         self.portfolio_exit_rules: List = portfolio_exit_rules or []
 
         # Lot sizes (v0.8)
-        if lot_size < 1:
-            raise ValueError(f"lot_size must be >= 1, got {lot_size}")
+        if not isinstance(lot_size, int) or lot_size < 1:
+            raise ValueError(f"lot_size must be an int >= 1, got {lot_size!r}")
         self.lot_size = lot_size
+        self.signal_transform = signal_transform
         self.asset_lot_sizes: Dict = asset_lot_sizes or {}
         for sym, ls in self.asset_lot_sizes.items():
-            if ls < 1:
+            if not isinstance(ls, int) or ls < 1:
                 raise ValueError(
-                    f"lot_size for '{sym}' must be >= 1, got {ls}")
+                    f"lot_size for '{sym}' must be an int >= 1, got {ls!r}")
+
+        # Per-asset position limits (v0.8)
+        if not 0 < max_position_pct <= 1.0:
+            raise ValueError(
+                f"max_position_pct must be in (0, 1.0], got {max_position_pct}")
+        self.max_position_pct = max_position_pct
+        self.asset_max_position_pcts: Dict = asset_max_position_pcts or {}
+        for sym, pct in self.asset_max_position_pcts.items():
+            if not 0 < pct <= 1.0:
+                raise ValueError(
+                    f"max_position_pct for '{sym}' must be in (0, 1.0], "
+                    f"got {pct}")
 
         # Custom benchmark config defaults
         self._config_benchmark: Optional[pd.Series] = None
@@ -221,6 +237,7 @@ class BacktestEngine:
         self._strategy = None
         self._signals = None
         self._data = None
+        self._target_weights = None
 
     def _create_position_sizer(self):
         """Create the appropriate position sizer based on config."""
@@ -252,6 +269,7 @@ class BacktestEngine:
         """
         self._strategy = strategy
         self._signals = None
+        self._target_weights = None
         return self
 
     def set_signals(
@@ -268,6 +286,33 @@ class BacktestEngine:
             self: For method chaining.
         """
         self._signals = signals
+        self._strategy = None
+        self._target_weights = None
+        return self
+
+    def set_target_weights(
+        self,
+        weights_schedule: Dict[str, Dict[str, float]],
+    ) -> 'BacktestEngine':
+        """Set target portfolio weights for rebalancing.
+
+        Parameters:
+            weights_schedule: Mapping of date string to per-symbol
+                weight dict.  Example::
+
+                    {
+                        "2024-01-01": {"AAPL": 0.3, "TSLA": 0.7},
+                        "2024-02-01": {"AAPL": 0.5, "TSLA": 0.5},
+                    }
+
+                Between rebalance dates, positions are held (NaN signal).
+                Weight=0 on a rebalance date closes the position.
+
+        Returns:
+            self: For method chaining.
+        """
+        self._target_weights = weights_schedule
+        self._signals = None
         self._strategy = None
         return self
 
@@ -403,6 +448,8 @@ class BacktestEngine:
             benchmark_type=benchmark_type,
             symbols=symbols,
         )
+        if self._target_weights is not None:
+            config.is_weight_mode = True
 
         # Auto-set allocator for multi-asset if not provided
         if config.capital_allocator is None:
@@ -458,15 +505,20 @@ class BacktestEngine:
         data_dict: Dict[str, pd.DataFrame],
     ) -> Dict[str, pd.Series]:
         """Get signals for multi-asset mode."""
+        # Target weights mode: convert schedule to signal series
+        if self._target_weights is not None:
+            return self._weights_to_signals(
+                self._target_weights, data_dict)
+
         if isinstance(self._signals, dict):
             signals_dict = {}
             for sym, df in data_dict.items():
                 if sym in self._signals:
-                    sig = self._signals[sym].reindex(df.index).fillna(0)
+                    sig = self._signals[sym].reindex(df.index)
                 else:
-                    sig = pd.Series(0, index=df.index, dtype=float)
+                    sig = pd.Series(np.nan, index=df.index, dtype=float)
                 signals_dict[sym] = sig.replace(
-                    [np.inf, -np.inf], 0).fillna(0)
+                    [np.inf, -np.inf], np.nan)
             return signals_dict
         elif self._strategy is not None:
             result = self._strategy.generate_signals(data_dict)
@@ -481,6 +533,30 @@ class BacktestEngine:
                 "Must set either a strategy or signals (via set_signals "
                 "or set_strategy) before running a multi-asset backtest"
             )
+
+    @staticmethod
+    def _weights_to_signals(
+        weights_schedule: Dict[str, Dict[str, float]],
+        data_dict: Dict[str, pd.DataFrame],
+    ) -> Dict[str, pd.Series]:
+        """Convert target weight schedule to per-symbol signal Series.
+
+        Between rebalance dates: NaN (hold). On rebalance dates: weight value.
+        """
+        all_syms = set()
+        for w_dict in weights_schedule.values():
+            all_syms.update(w_dict.keys())
+        all_syms.update(data_dict.keys())
+
+        signals = {}
+        for sym in data_dict:
+            sig = pd.Series(np.nan, index=data_dict[sym].index, dtype=float)
+            for date_str, w_dict in weights_schedule.items():
+                ts = pd.Timestamp(date_str)
+                if ts in sig.index:
+                    sig.loc[ts] = w_dict.get(sym, 0.0)
+            signals[sym] = sig
+        return signals
 
     def _run_vectorized_multi(
         self,
@@ -597,15 +673,16 @@ class BacktestEngine:
         return data.copy()
 
     def _get_signals(self, data: pd.DataFrame) -> pd.Series:
-        """Get trading signals."""
+        """Get trading signals. NaN = hold, 0 = flat, nonzero = trade."""
         if self._signals is not None:
-            signals = self._signals.reindex(data.index).fillna(0)
+            signals = self._signals.reindex(data.index)
+            # NaN from reindex means "no signal" = hold (preserve NaN)
         elif self._strategy is not None:
             signals = self._strategy.generate_signals(data)
         else:
             raise ValueError("Must set either a strategy or signals")
 
-        signals = signals.replace([np.inf, -np.inf], 0).fillna(0)
+        signals = signals.replace([np.inf, -np.inf], np.nan)
         return signals
 
     # ========== Config and Result Building ==========
@@ -657,6 +734,9 @@ class BacktestEngine:
             portfolio_exit_rules=self.portfolio_exit_rules,
             lot_size=self.lot_size,
             asset_lot_sizes=self.asset_lot_sizes,
+            max_position_pct=self.max_position_pct,
+            asset_max_position_pcts=self.asset_max_position_pcts,
+            signal_transform=self.signal_transform,
         )
 
     def _build_result(

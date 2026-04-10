@@ -146,6 +146,8 @@ class BorrowingCostModel(PeriodicCostModel):
     """
 
     def calculate_cost(self, position, price, timestamp, margin_config):
+        if margin_config is None:
+            return 0.0  # no margin = no borrowing
         annual_rate = margin_config.borrowing_rate
         if annual_rate <= 0:
             return 0.0

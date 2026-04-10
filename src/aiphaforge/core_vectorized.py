@@ -5,7 +5,6 @@ Standalone function that runs a vectorized (array-based) backtest.
 Extracted from BacktestEngine._run_vectorized to keep engine.py thin.
 """
 
-import numpy as np
 import pandas as pd
 
 from .config import BacktestConfig
@@ -30,8 +29,13 @@ def run_vectorized(
         Dictionary with keys: equity_curve, trades, positions_df,
         net_returns.
     """
-    # Compute positions (forward-fill signals)
-    positions = signals.replace(0, np.nan).ffill().fillna(0)
+    # Apply signal transform if configured
+    if config.signal_transform is not None:
+        signals = signals.apply(
+            lambda s: config.signal_transform(s) if not pd.isna(s) else s)
+
+    # Compute positions: NaN = hold (forward-fill), 0 = flat
+    positions = signals.ffill().fillna(0)
 
     # Clip short positions if not allowed
     if not config.allow_short:

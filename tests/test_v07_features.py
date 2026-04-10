@@ -46,7 +46,7 @@ def _make_multi_signals(data_dict, buy_bars=None, sell_bars=None):
     sell_bars = sell_bars or {sym: [20] for sym in data_dict}
     signals = {}
     for sym, df in data_dict.items():
-        sig = pd.Series(0, index=df.index, dtype=float)
+        sig = pd.Series(np.nan, index=df.index, dtype=float)
         for b in buy_bars.get(sym, []):
             if b < len(sig):
                 sig.iloc[b] = 1
@@ -86,7 +86,7 @@ class TestMultiAssetEventDriven:
     def test_single_asset_backward_compat(self):
         """Path: single DataFrame + single Series → same behavior as v0.6."""
         data = make_ohlcv(30)
-        signals = pd.Series(0, index=data.index, dtype=float)
+        signals = pd.Series(np.nan, index=data.index, dtype=float)
         signals.iloc[1] = 1
         signals.iloc[20] = -1
 
@@ -290,7 +290,7 @@ class TestMultiAssetHookContext:
     def test_single_asset_hook_unchanged(self):
         """Path: single-asset hook gets bar_data, broker, symbol as before."""
         data = make_ohlcv(10)
-        signals = pd.Series(0, index=data.index, dtype=float)
+        signals = pd.Series(np.nan, index=data.index, dtype=float)
 
         class InspectorHook(BacktestHook):
             def __init__(self):
@@ -467,7 +467,7 @@ class TestPerAssetPnL:
     def test_single_asset_no_per_asset_fields(self):
         """Path: single-asset → per_asset_pnl is None."""
         data = make_ohlcv(20)
-        signals = pd.Series(0, index=data.index, dtype=float)
+        signals = pd.Series(np.nan, index=data.index, dtype=float)
         signals.iloc[1] = 1
         signals.iloc[15] = -1
 

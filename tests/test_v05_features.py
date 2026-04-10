@@ -81,7 +81,7 @@ class OrderCollectorHook(BacktestHook):
 
 def _run_event_driven(data, hooks, **kwargs) -> BacktestResult:
     """Run an event-driven backtest with zero signals and given hooks."""
-    signals = pd.Series(0, index=data.index, dtype=float)
+    signals = pd.Series(np.nan, index=data.index, dtype=float)
     engine = BacktestEngine(
         fee_model=ZeroFeeModel(), mode="event_driven",
         initial_capital=100_000, hooks=hooks,
@@ -206,7 +206,7 @@ class TestBenchmarkEndToEnd:
     def test_default_buy_and_hold(self):
         """Path: no custom benchmark → Buy & Hold name, equity present."""
         data = make_ohlcv(30)
-        signals = pd.Series(0, index=data.index, dtype=float)
+        signals = pd.Series(np.nan, index=data.index, dtype=float)
         signals.iloc[1] = 1
         signals.iloc[20] = -1
         engine = BacktestEngine(fee_model=ZeroFeeModel(), mode="vectorized",
@@ -220,7 +220,7 @@ class TestBenchmarkEndToEnd:
     def test_custom_benchmark_via_backtest(self):
         """Path: custom price benchmark via backtest() → normalized equity, custom name."""
         data = make_ohlcv(30)
-        signals = pd.Series(0, index=data.index, dtype=float)
+        signals = pd.Series(np.nan, index=data.index, dtype=float)
         signals.iloc[1] = 1
         signals.iloc[20] = -1
         benchmark = pd.Series(np.linspace(200, 300, len(data)), index=data.index)

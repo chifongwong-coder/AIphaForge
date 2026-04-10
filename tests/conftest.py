@@ -71,7 +71,7 @@ def sample_signals(sample_data: pd.DataFrame) -> pd.Series:
 
     Pattern: buy at bar 10, hold through bar 70, sell at bar 70, flat until end.
     """
-    signals = pd.Series(0, index=sample_data.index, dtype=float)
+    signals = pd.Series(np.nan, index=sample_data.index, dtype=float)
     signals.iloc[10] = 1   # buy
     signals.iloc[70] = -1  # sell
     return signals
