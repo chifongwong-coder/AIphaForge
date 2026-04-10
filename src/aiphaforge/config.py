@@ -70,6 +70,19 @@ class BacktestConfig:
     # Signal (v0.9)
     signal_transform: Optional[Any] = None  # Callable[[float], float]
     is_weight_mode: bool = False
+    # Turnover (v0.9.1)
+    turnover_config: Any = None  # TurnoverConfig
+
+
+@dataclass
+class TurnoverConfig:
+    """Turnover constraint configuration.
+
+    Turnover is TWO-SIDED: buys + sells both counted.
+    A round-trip = 2x one-sided turnover. More conservative than
+    industry-standard one-sided reporting.
+    """
+    max_turnover_per_bar: float = 0.2  # fraction of equity
 
 
 def resolve_config(default: Any, overrides: Dict, symbol: str) -> Any:
