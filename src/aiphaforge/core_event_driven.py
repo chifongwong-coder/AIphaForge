@@ -126,6 +126,10 @@ def run_event_driven(
     exit_rules = [r for r in [config.stop_loss_rule,
                                config.take_profit_rule] if r is not None]
 
+    # --- Reset risk rules for this run ---
+    if config.risk_rules:
+        config.risk_rules.reset()
+
     # ===================================================================
     # Main event loop
     # ===================================================================
@@ -163,6 +167,31 @@ def run_event_driven(
                         + trade.pnl + trade.commission
                         + trade.slippage_cost
                     )
+
+        # 2.5. Risk rules check (portfolio-level)
+        suppress_new_orders = False
+        if config.risk_rules:
+            risk_signals = config.risk_rules.check_all(
+                portfolio, prices, timestamp)
+            for sig in risk_signals:
+                if sig.severity == 'critical':
+                    if sig.action == 'reject_new':
+                        suppress_new_orders = True
+                    elif sig.action == 'close_all':
+                        # Close all positions via existing broker infrastructure.
+                        # Orders are GTC — fill at next bar's open (same as
+                        # margin call behavior). Dedup: skip if margin call
+                        # already active.
+                        if not portfolio.is_margin_call:
+                            for sym, pos in portfolio.positions.items():
+                                if pos.is_flat or sym not in brokers:
+                                    continue
+                                side = "sell" if pos.is_long else "buy"
+                                order = brokers[sym].create_market_order(
+                                    sym, side, abs(pos.size),
+                                    "risk_close", timestamp)
+                                brokers[sym].submit_order(order, timestamp)
+                        suppress_new_orders = True
 
         # 3. Exit rules (per active symbol)
         for sym in active:
@@ -279,62 +308,64 @@ def run_event_driven(
             _submit_order(sym, sc, price, brokers[sym], timestamp,
                           "signal_flat")
 
-        # Phase 2: compute all non-zero size_changes (no lot rounding)
+        # Phase 2-4: skip new/adjust orders when risk rules suppress
         pending: Dict[str, tuple] = {}
-        if equity > 0:  # guard: skip if bankrupt
-            if config.is_weight_mode:
-                for sym, w in sorted(non_zero_signals.items()):
-                    sc = _compute_weight_change(
-                        sym, w, portfolio, prices[sym], config)
-                    if abs(sc) > 0.001:
-                        pending[sym] = (sc, prices[sym])
-            else:
-                budgets: Dict[str, Optional[float]] = {}
-                if (non_zero_signals
-                        and config.capital_allocator is not None):
-                    budgets = config.capital_allocator.allocate(
-                        non_zero_signals, prices, portfolio, config)
-                for sym, sig in sorted(non_zero_signals.items()):
-                    bar = data_dict[sym].loc[timestamp]
-                    sc = _compute_size_change(
-                        sig, portfolio, sym, bar, config,
-                        bar_index=idx, full_data=data_dict[sym],
-                        budget=budgets.get(sym))
-                    if abs(sc) > 0.001:
-                        pending[sym] = (sc, prices[sym])
-
-        # Phase 3: turnover enforcement
-        if config.turnover_config and pending and equity > 0:
-            max_to = config.turnover_config.max_turnover_per_bar
-
-            # Hook IOC: track for reporting, warn if > 50% cap
-            hook_to = sum(
-                abs(o.filled_size * o.filled_price)
-                for fills in step_4b_fills.values() for o in fills
-            ) / equity
-            if hook_to > max_to * 0.5:
-                warnings.warn(
-                    f"Hook IOC turnover ({hook_to:.1%}) exceeds 50% of "
-                    f"turnover cap ({max_to:.1%}).")
-
-            signal_to = sum(
-                abs(sc) * p for sc, p in pending.values()
-            ) / equity
-
-            if signal_to > max_to and signal_to > 0:
-                scale = max_to / signal_to
-                pending = {
-                    sym: (sc * scale, p)
-                    for sym, (sc, p) in pending.items()
-                }
-
-        # Phase 4: lot rounding + submit
         bar_turnover = 0.0
-        for sym, (sc, price) in sorted(pending.items()):
-            sc = _apply_lot_rounding(sc, sym, config)
-            if abs(sc) > 0.001:
-                _submit_order(sym, sc, price, brokers[sym], timestamp)
-                bar_turnover += abs(sc) * price
+        if not suppress_new_orders:
+            # Phase 2: compute all non-zero size_changes (no lot rounding)
+            if equity > 0:  # guard: skip if bankrupt
+                if config.is_weight_mode:
+                    for sym, w in sorted(non_zero_signals.items()):
+                        sc = _compute_weight_change(
+                            sym, w, portfolio, prices[sym], config)
+                        if abs(sc) > 0.001:
+                            pending[sym] = (sc, prices[sym])
+                else:
+                    budgets: Dict[str, Optional[float]] = {}
+                    if (non_zero_signals
+                            and config.capital_allocator is not None):
+                        budgets = config.capital_allocator.allocate(
+                            non_zero_signals, prices, portfolio, config)
+                    for sym, sig in sorted(non_zero_signals.items()):
+                        bar = data_dict[sym].loc[timestamp]
+                        sc = _compute_size_change(
+                            sig, portfolio, sym, bar, config,
+                            bar_index=idx, full_data=data_dict[sym],
+                            budget=budgets.get(sym))
+                        if abs(sc) > 0.001:
+                            pending[sym] = (sc, prices[sym])
+
+            # Phase 3: turnover enforcement
+            if config.turnover_config and pending and equity > 0:
+                max_to = config.turnover_config.max_turnover_per_bar
+
+                # Hook IOC: track for reporting, warn if > 50% cap
+                hook_to = sum(
+                    abs(o.filled_size * o.filled_price)
+                    for fills in step_4b_fills.values() for o in fills
+                ) / equity
+                if hook_to > max_to * 0.5:
+                    warnings.warn(
+                        f"Hook IOC turnover ({hook_to:.1%}) exceeds 50% of "
+                        f"turnover cap ({max_to:.1%}).")
+
+                signal_to = sum(
+                    abs(sc) * p for sc, p in pending.values()
+                ) / equity
+
+                if signal_to > max_to and signal_to > 0:
+                    scale = max_to / signal_to
+                    pending = {
+                        sym: (sc * scale, p)
+                        for sym, (sc, p) in pending.items()
+                    }
+
+            # Phase 4: lot rounding + submit
+            for sym, (sc, price) in sorted(pending.items()):
+                sc = _apply_lot_rounding(sc, sym, config)
+                if abs(sc) > 0.001:
+                    _submit_order(sym, sc, price, brokers[sym], timestamp)
+                    bar_turnover += abs(sc) * price
 
         # Track turnover
         exempt_to = sum(abs(sc) * p for sc, p in exempt_orders.values())

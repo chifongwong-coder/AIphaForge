@@ -98,10 +98,16 @@ from .position_sizing import AllInSizer, BasePositionSizer, FixedSizer, Fraction
 from .results import BacktestResult, EquityPoint, PositionSnapshot, Trade, trades_to_dataframe
 from .risk import (
     BaseRiskManager,
+    BaseRiskRule,
+    CompositeRiskManager,
+    ConcentrationLimit,
+    DailyLossLimit,
+    ExposureLimit,
+    MaxDrawdownHalt,
     RiskSignal,
 )
 
-__version__ = '1.0.3'
+__version__ = '1.1.0'
 
 __all__ = [
     # Main engine
@@ -185,6 +191,12 @@ __all__ = [
 
     # Risk management
     'BaseRiskManager',
+    'BaseRiskRule',
+    'CompositeRiskManager',
+    'MaxDrawdownHalt',
+    'ExposureLimit',
+    'DailyLossLimit',
+    'ConcentrationLimit',
     'RiskSignal',
 
     # Results
