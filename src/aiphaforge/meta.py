@@ -111,6 +111,53 @@ class MetaContext:
         """Copy of the full audit trail."""
         return list(self._audit)
 
+    # --- Strategy tree control (v1.4) ---
+
+    def _is_composite(self) -> bool:
+        """Check if the current strategy is a composite (StrategyNode)."""
+        from .strategies import StrategyNode
+        return isinstance(self._strategy, StrategyNode)
+
+    def set_weights(self, weights: list) -> None:
+        """Adjust composite strategy weights. Auto-regenerates.
+
+        Warns and no-ops if current strategy is not a weighted composite.
+        """
+        if not self._is_composite() or not hasattr(self._strategy, 'weights'):
+            import warnings
+            warnings.warn("set_weights: current strategy is not a weighted composite")
+            return
+        if len(weights) != len(self._strategy.children):
+            raise ValueError(
+                f"len(weights)={len(weights)} != "
+                f"len(children)={len(self._strategy.children)}")
+        self._strategy.weights = list(weights)
+        self._needs_regeneration = True
+        self._log('set_weights', weights)
+
+    def swap_child(self, index: int, new_child: Any) -> None:
+        """Replace a child strategy in the tree. Auto-regenerates.
+
+        Warns and no-ops if current strategy is not a composite.
+        """
+        if not self._is_composite():
+            import warnings
+            warnings.warn("swap_child: current strategy is not a composite")
+            return
+        if not 0 <= index < len(self._strategy.children):
+            raise IndexError(
+                f"child index {index} out of range "
+                f"[0, {len(self._strategy.children)})")
+        self._strategy.children[index] = new_child
+        self._needs_regeneration = True
+        self._log('swap_child', {'index': index, 'child': new_child.name})
+
+    def get_children(self) -> list:
+        """List child strategies (empty list for leaf strategies)."""
+        if self._is_composite():
+            return list(self._strategy.children)
+        return []
+
     # --- Internal: apply overrides to config ---
 
     def _apply_overrides(self, config: Any) -> Any:
