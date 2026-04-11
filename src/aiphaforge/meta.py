@@ -127,6 +127,10 @@ class MetaContext:
             import warnings
             warnings.warn("set_weights: current strategy is not a weighted composite")
             return
+        if len(weights) != len(self._strategy.children):
+            raise ValueError(
+                f"len(weights)={len(weights)} != "
+                f"len(children)={len(self._strategy.children)}")
         self._strategy.weights = list(weights)
         self._needs_regeneration = True
         self._log('set_weights', weights)
@@ -140,6 +144,10 @@ class MetaContext:
             import warnings
             warnings.warn("swap_child: current strategy is not a composite")
             return
+        if not 0 <= index < len(self._strategy.children):
+            raise IndexError(
+                f"child index {index} out of range "
+                f"[0, {len(self._strategy.children)})")
         self._strategy.children[index] = new_child
         self._needs_regeneration = True
         self._log('swap_child', {'index': index, 'child': new_child.name})

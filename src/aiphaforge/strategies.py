@@ -726,7 +726,8 @@ class StrategyNode(BaseStrategy):
         return {
             'children': [c.name for c in self.children],
             **{k: v for k, v in self.__dict__.items()
-               if k not in ('children',) and not k.startswith('_')},
+               if k not in ('children',) and not k.startswith('_')
+               and not callable(v)},
         }
 
     def update_params(self, **kwargs) -> None:
@@ -762,6 +763,9 @@ class WeightedBlend(StrategyNode):
                  weights: Optional[List[float]] = None,
                  signal_precision: int = 2):
         super().__init__(children)
+        if weights is not None and len(weights) != len(children):
+            raise ValueError(
+                f"len(weights)={len(weights)} != len(children)={len(children)}")
         self.weights = weights or [1.0 / len(children)] * len(children)
         self.signal_precision = signal_precision
 
