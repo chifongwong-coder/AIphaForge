@@ -32,6 +32,7 @@ class MetaContext:
         self._overrides: Dict[str, Any] = {}
         self._suppress: bool = False
         self._target_weights: Optional[Dict[str, float]] = None
+        self._needs_regeneration: bool = False
         self._audit: List[Dict[str, Any]] = []
         self._audit_cursor: int = 0
 
@@ -46,12 +47,17 @@ class MetaContext:
     def set_strategy(self, strategy: Any) -> None:
         """Swap the active strategy. Takes effect this bar."""
         self._strategy = strategy
+        self._needs_regeneration = True
         self._log('set_strategy', strategy.name)
 
     def adjust_strategy_params(self, **kwargs: Any) -> None:
-        """Adjust current strategy parameters via update_params()."""
+        """Adjust current strategy parameters via update_params().
+
+        Triggers signal regeneration so new params take effect.
+        """
         if self._strategy is not None:
             self._strategy.update_params(**kwargs)
+            self._needs_regeneration = True
             self._log('adjust_strategy_params', kwargs)
 
     # --- Position sizing ---

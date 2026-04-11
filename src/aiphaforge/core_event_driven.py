@@ -278,27 +278,33 @@ def run_event_driven(
             # Apply config overrides (sizing, stop-loss, etc.)
             effective_config = meta._apply_overrides(config)
 
-            # Strategy swap: regenerate signals if agent swapped strategy
-            if meta._strategy is not current_strategy:
+            # Strategy swap or param change: regenerate signals
+            if meta._needs_regeneration:
                 current_strategy = meta._strategy
                 if is_single:
                     raw = current_strategy.generate_signals(
                         data_dict[symbols[0]])
                     signals_as_dict = {symbols[0]: raw.to_dict()}
                 else:
-                    new_sigs = current_strategy.generate_signals(data_dict)
+                    new_sigs = current_strategy.generate_signals(
+                        data_dict)
                     signals_as_dict = {
                         sym: s.to_dict()
                         for sym, s in new_sigs.items()
                     }
+                meta._needs_regeneration = False
 
             # Signal suppression (OR with risk rules -- risk always wins)
             if meta._suppress:
                 suppress_new_orders = True
 
-            # Target weights override (set flag for step 5)
+            # Target weights override (only if not suppressed)
             if meta._target_weights is not None:
-                meta_weight_override = True
+                if not suppress_new_orders:
+                    meta_weight_override = True
+                else:
+                    # Suppressed: discard one-shot weights (don't defer)
+                    meta._target_weights = None
 
         # 4b. Process immediate IOC/FOK from hooks (track for turnover)
         step_4b_fills: Dict[str, list] = {}
@@ -324,6 +330,22 @@ def run_event_driven(
 
         if meta_weight_override:
             # Weight override replaces normal signal processing.
+            # First: process any signal=0 closes from current signals
+            # (Phase 1 exempt — closes should always execute)
+            for sym in active:
+                raw_sig = signals_as_dict[sym].get(
+                    timestamp, float('nan'))
+                if not pd.isna(raw_sig) and abs(raw_sig) < 1e-8:
+                    sc = _compute_size_change(
+                        raw_sig, portfolio, sym,
+                        data_dict[sym].loc[timestamp],
+                        effective_config, bar_index=idx,
+                        full_data=data_dict[sym])
+                    if abs(sc) > 0.001:
+                        _submit_order(sym, sc, prices[sym],
+                                      brokers[sym], timestamp,
+                                      "signal_flat")
+            # Then: apply target weights
             for sym, weight in meta._target_weights.items():
                 if sym in brokers:
                     _process_weight_rebalance(
