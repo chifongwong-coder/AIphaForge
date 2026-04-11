@@ -554,6 +554,8 @@ class TestBaseRiskRule:
 
 class TestVersion:
 
-    def test_version_is_110(self):
+    def test_version_is_at_least_110(self):
         import aiphaforge
-        assert aiphaforge.__version__ == '1.1.0'
+        major, minor, patch = (
+            int(x) for x in aiphaforge.__version__.split('.'))
+        assert (major, minor) >= (1, 1)

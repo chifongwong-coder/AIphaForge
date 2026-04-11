@@ -90,6 +90,7 @@ from .margin import (
     MarginConfig,
     PeriodicCostModel,
 )
+from .meta import MetaContext
 from .optimizer import optimize, walk_forward
 from .orders import Order, OrderManager, OrderSide, OrderStatus, OrderType
 from .performance import PerformanceAnalyzer, analyze, compare_strategies
@@ -107,7 +108,7 @@ from .risk import (
     RiskSignal,
 )
 
-__version__ = '1.1.0'
+__version__ = '1.2.0'
 
 __all__ = [
     # Main engine
@@ -165,6 +166,9 @@ __all__ = [
     'LatencyHook',
     'SimpleLatencyHook',
     'SymbolRoutingLatencyHook',
+
+    # MetaController (v1.2)
+    'MetaContext',
 
     # Config
     'BacktestConfig',

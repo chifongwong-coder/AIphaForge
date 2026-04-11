@@ -55,6 +55,8 @@ class HookContext:
     all_bar_data: Optional[Dict[str, pd.Series]] = None
     all_data: Optional[Dict[str, pd.DataFrame]] = None
     all_brokers: Optional[Dict[str, Any]] = None
+    # MetaContext for agent control (v1.2, event-driven only)
+    meta: Optional[Any] = None
 
 
 class BacktestHook(ABC):

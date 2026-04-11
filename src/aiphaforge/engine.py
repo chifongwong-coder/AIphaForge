@@ -816,6 +816,10 @@ class BacktestEngine:
         if 'turnover_history' in raw:
             result.turnover_history = raw['turnover_history']
 
+        # Attach MetaContext audit trail (v1.2)
+        if 'meta_audit' in raw and raw['meta_audit']:
+            result.metadata['meta_audit'] = raw['meta_audit']
+
         return result
 
     # ========== Performance Calculation ==========

@@ -15,6 +15,7 @@ import pandas as pd
 from .broker import Broker
 from .config import BacktestConfig, resolve_config
 from .hooks import HookContext
+from .meta import MetaContext
 from .portfolio import Portfolio
 from .utils import build_unified_timeline, calculate_returns
 
@@ -130,6 +131,13 @@ def run_event_driven(
     if config.risk_rules:
         config.risk_rules.reset()
 
+    # --- MetaContext lifecycle (v1.2) ---
+    current_strategy = strategy
+    meta: Optional[MetaContext] = (
+        MetaContext(config, strategy=current_strategy)
+        if config.hooks else None
+    )
+
     # ===================================================================
     # Main event loop
     # ===================================================================
@@ -194,9 +202,20 @@ def run_event_driven(
                         suppress_new_orders = True
 
         # 3. Exit rules (per active symbol)
+        # Use meta-overridden rules if available (persists across bars)
+        active_exit_rules = exit_rules
+        if meta is not None and (
+            'stop_loss_rule' in meta._overrides
+            or 'take_profit_rule' in meta._overrides
+        ):
+            sl = meta._overrides.get(
+                'stop_loss_rule', config.stop_loss_rule)
+            tp = meta._overrides.get(
+                'take_profit_rule', config.take_profit_rule)
+            active_exit_rules = [r for r in [sl, tp] if r is not None]
         for sym in active:
             bar = data_dict[sym].loc[timestamp]
-            for rule in exit_rules:
+            for rule in active_exit_rules:
                 rule.check_event_driven(
                     portfolio, brokers[sym], sym, bar, timestamp)
 
@@ -209,6 +228,9 @@ def run_event_driven(
         # 4. Hooks: on_pre_signal
         pending_before_hooks: Dict[str, int] = {}
         if config.hooks:
+            if meta is not None:
+                meta._strategy = current_strategy
+
             for sym in active:
                 pending_before_hooks[sym] = len(
                     brokers[sym].get_pending_orders(sym))
@@ -223,6 +245,7 @@ def run_event_driven(
                     data=data_dict[sym0].loc[:timestamp],
                     symbol=sym0,
                     broker=brokers[sym0],
+                    meta=meta,
                 )
             else:
                 ctx = HookContext(
@@ -235,9 +258,47 @@ def run_event_driven(
                     all_data={s: data_dict[s].loc[:timestamp]
                               for s in symbols},
                     all_brokers=brokers,
+                    meta=meta,
                 )
             for hook in config.hooks:
                 hook.on_pre_signal(ctx)
+
+        # 4.1 Apply MetaContext overrides (v1.2)
+        effective_config = config
+        meta_weight_override = False
+        if meta is not None:
+            # Audit enrichment: annotate new entries with bar context
+            if len(meta._audit) > meta._audit_cursor:
+                for entry in meta._audit[meta._audit_cursor:]:
+                    entry['timestamp'] = timestamp
+                    entry['equity'] = portfolio.total_equity
+                    entry['drawdown'] = portfolio.current_drawdown
+                meta._audit_cursor = len(meta._audit)
+
+            # Apply config overrides (sizing, stop-loss, etc.)
+            effective_config = meta._apply_overrides(config)
+
+            # Strategy swap: regenerate signals if agent swapped strategy
+            if meta._strategy is not current_strategy:
+                current_strategy = meta._strategy
+                if is_single:
+                    raw = current_strategy.generate_signals(
+                        data_dict[symbols[0]])
+                    signals_as_dict = {symbols[0]: raw.to_dict()}
+                else:
+                    new_sigs = current_strategy.generate_signals(data_dict)
+                    signals_as_dict = {
+                        sym: s.to_dict()
+                        for sym, s in new_sigs.items()
+                    }
+
+            # Signal suppression (OR with risk rules -- risk always wins)
+            if meta._suppress:
+                suppress_new_orders = True
+
+            # Target weights override (set flag for step 5)
+            if meta._target_weights is not None:
+                meta_weight_override = True
 
         # 4b. Process immediate IOC/FOK from hooks (track for turnover)
         step_4b_fills: Dict[str, list] = {}
@@ -256,116 +317,139 @@ def run_event_driven(
                         + trade.slippage_cost
                     )
 
-        # 5. Four-phase signal processing (v0.9.1)
-        # Phase A: collect signals
-        current_signals: Dict[str, float] = {}
-        for sym in active:
-            raw_sig = signals_as_dict[sym].get(timestamp, float('nan'))
-            if pd.isna(raw_sig):
-                continue
-            if config.signal_transform is not None:
-                raw_sig = config.signal_transform(raw_sig)
+        # 5. Signal processing
+        equity = portfolio.total_equity
+        bar_turnover = 0.0
+        exempt_orders: Dict[str, tuple] = {}
+
+        if meta_weight_override:
+            # Weight override replaces normal signal processing.
+            for sym, weight in meta._target_weights.items():
+                if sym in brokers:
+                    _process_weight_rebalance(
+                        sym, weight, portfolio, brokers[sym],
+                        prices.get(sym, 0), timestamp, effective_config)
+            meta._target_weights = None  # one-shot
+        else:
+            # Normal four-phase signal processing (v0.9.1)
+            # Phase A: collect signals
+            current_signals: Dict[str, float] = {}
+            for sym in active:
+                raw_sig = signals_as_dict[sym].get(
+                    timestamp, float('nan'))
                 if pd.isna(raw_sig):
                     continue
-            current_signals[sym] = raw_sig
+                if config.signal_transform is not None:
+                    raw_sig = config.signal_transform(raw_sig)
+                    if pd.isna(raw_sig):
+                        continue
+                current_signals[sym] = raw_sig
 
-        # Warn if hooks submitted orders AND signals are active
-        if config.hooks and current_signals:
-            for sym, sig in current_signals.items():
-                if sym in pending_before_hooks:
-                    pending_now = len(
-                        brokers[sym].get_pending_orders(sym))
-                    if pending_now > pending_before_hooks.get(sym, 0):
-                        warnings.warn(
-                            f"Bar {idx}: hook submitted orders for "
-                            f"'{sym}' while signal={sig}. Both will "
-                            f"execute. Set signals to NaN if hooks "
-                            f"manage orders."
-                        )
+            # Warn if hooks submitted orders AND signals are active
+            if config.hooks and current_signals:
+                for sym, sig in current_signals.items():
+                    if sym in pending_before_hooks:
+                        pending_now = len(
+                            brokers[sym].get_pending_orders(sym))
+                        if pending_now > pending_before_hooks.get(sym, 0):
+                            warnings.warn(
+                                f"Bar {idx}: hook submitted orders for "
+                                f"'{sym}' while signal={sig}. Both will "
+                                f"execute. Set signals to NaN if hooks "
+                                f"manage orders."
+                            )
 
-        equity = portfolio.total_equity
-
-        # Phase 1: exempt close orders (signal=0 / weight=0)
-        # No lot rounding, no turnover cap — user intent is "be flat".
-        exempt_orders: Dict[str, tuple] = {}
-        non_zero_signals: Dict[str, float] = {}
-        for sym, sig in sorted(current_signals.items()):
-            if abs(sig) < 1e-8:
-                if config.is_weight_mode:
-                    sc = _compute_weight_change(
-                        sym, sig, portfolio, prices[sym], config)
-                else:
-                    bar = data_dict[sym].loc[timestamp]
-                    sc = _compute_size_change(
-                        sig, portfolio, sym, bar, config,
-                        bar_index=idx, full_data=data_dict[sym])
-                if abs(sc) > 0.001:
-                    exempt_orders[sym] = (sc, prices[sym])
-            else:
-                non_zero_signals[sym] = sig
-
-        for sym, (sc, price) in sorted(exempt_orders.items()):
-            _submit_order(sym, sc, price, brokers[sym], timestamp,
-                          "signal_flat")
-
-        # Phase 2-4: skip new/adjust orders when risk rules suppress
-        pending: Dict[str, tuple] = {}
-        bar_turnover = 0.0
-        if not suppress_new_orders:
-            # Phase 2: compute all non-zero size_changes (no lot rounding)
-            if equity > 0:  # guard: skip if bankrupt
-                if config.is_weight_mode:
-                    for sym, w in sorted(non_zero_signals.items()):
+            # Phase 1: exempt close orders (signal=0 / weight=0)
+            # No lot rounding, no turnover cap -- user intent is "be flat".
+            non_zero_signals: Dict[str, float] = {}
+            for sym, sig in sorted(current_signals.items()):
+                if abs(sig) < 1e-8:
+                    if effective_config.is_weight_mode:
                         sc = _compute_weight_change(
-                            sym, w, portfolio, prices[sym], config)
-                        if abs(sc) > 0.001:
-                            pending[sym] = (sc, prices[sym])
-                else:
-                    budgets: Dict[str, Optional[float]] = {}
-                    if (non_zero_signals
-                            and config.capital_allocator is not None):
-                        budgets = config.capital_allocator.allocate(
-                            non_zero_signals, prices, portfolio, config)
-                    for sym, sig in sorted(non_zero_signals.items()):
+                            sym, sig, portfolio, prices[sym],
+                            effective_config)
+                    else:
                         bar = data_dict[sym].loc[timestamp]
                         sc = _compute_size_change(
-                            sig, portfolio, sym, bar, config,
-                            bar_index=idx, full_data=data_dict[sym],
-                            budget=budgets.get(sym))
-                        if abs(sc) > 0.001:
-                            pending[sym] = (sc, prices[sym])
+                            sig, portfolio, sym, bar, effective_config,
+                            bar_index=idx, full_data=data_dict[sym])
+                    if abs(sc) > 0.001:
+                        exempt_orders[sym] = (sc, prices[sym])
+                else:
+                    non_zero_signals[sym] = sig
 
-            # Phase 3: turnover enforcement
-            if config.turnover_config and pending and equity > 0:
-                max_to = config.turnover_config.max_turnover_per_bar
+            for sym, (sc, price) in sorted(exempt_orders.items()):
+                _submit_order(sym, sc, price, brokers[sym], timestamp,
+                              "signal_flat")
 
-                # Hook IOC: track for reporting, warn if > 50% cap
-                hook_to = sum(
-                    abs(o.filled_size * o.filled_price)
-                    for fills in step_4b_fills.values() for o in fills
-                ) / equity
-                if hook_to > max_to * 0.5:
-                    warnings.warn(
-                        f"Hook IOC turnover ({hook_to:.1%}) exceeds 50% of "
-                        f"turnover cap ({max_to:.1%}).")
+            # Phase 2-4: skip new/adjust orders when risk rules suppress
+            pending: Dict[str, tuple] = {}
+            if not suppress_new_orders:
+                # Phase 2: compute all non-zero size_changes
+                if equity > 0:  # guard: skip if bankrupt
+                    if effective_config.is_weight_mode:
+                        for sym, w in sorted(non_zero_signals.items()):
+                            sc = _compute_weight_change(
+                                sym, w, portfolio, prices[sym],
+                                effective_config)
+                            if abs(sc) > 0.001:
+                                pending[sym] = (sc, prices[sym])
+                    else:
+                        budgets: Dict[str, Optional[float]] = {}
+                        if (non_zero_signals
+                                and effective_config.capital_allocator
+                                is not None):
+                            budgets = (
+                                effective_config.capital_allocator.allocate(
+                                    non_zero_signals, prices, portfolio,
+                                    effective_config))
+                        for sym, sig in sorted(non_zero_signals.items()):
+                            bar = data_dict[sym].loc[timestamp]
+                            sc = _compute_size_change(
+                                sig, portfolio, sym, bar,
+                                effective_config,
+                                bar_index=idx,
+                                full_data=data_dict[sym],
+                                budget=budgets.get(sym))
+                            if abs(sc) > 0.001:
+                                pending[sym] = (sc, prices[sym])
 
-                signal_to = sum(
-                    abs(sc) * p for sc, p in pending.values()
-                ) / equity
+                # Phase 3: turnover enforcement
+                if (effective_config.turnover_config and pending
+                        and equity > 0):
+                    max_to = (
+                        effective_config.turnover_config
+                        .max_turnover_per_bar)
 
-                if signal_to > max_to and signal_to > 0:
-                    scale = max_to / signal_to
-                    pending = {
-                        sym: (sc * scale, p)
-                        for sym, (sc, p) in pending.items()
-                    }
+                    # Hook IOC: track for reporting, warn if > 50% cap
+                    hook_to = sum(
+                        abs(o.filled_size * o.filled_price)
+                        for fills in step_4b_fills.values()
+                        for o in fills
+                    ) / equity
+                    if hook_to > max_to * 0.5:
+                        warnings.warn(
+                            f"Hook IOC turnover ({hook_to:.1%}) exceeds "
+                            f"50% of turnover cap ({max_to:.1%}).")
 
-            # Phase 4: lot rounding + submit
-            for sym, (sc, price) in sorted(pending.items()):
-                sc = _apply_lot_rounding(sc, sym, config)
-                if abs(sc) > 0.001:
-                    _submit_order(sym, sc, price, brokers[sym], timestamp)
-                    bar_turnover += abs(sc) * price
+                    signal_to = sum(
+                        abs(sc) * p for sc, p in pending.values()
+                    ) / equity
+
+                    if signal_to > max_to and signal_to > 0:
+                        scale = max_to / signal_to
+                        pending = {
+                            sym: (sc * scale, p)
+                            for sym, (sc, p) in pending.items()
+                        }
+
+                # Phase 4: lot rounding + submit
+                for sym, (sc, price) in sorted(pending.items()):
+                    sc = _apply_lot_rounding(sc, sym, effective_config)
+                    if abs(sc) > 0.001:
+                        _submit_order(
+                            sym, sc, price, brokers[sym], timestamp)
+                        bar_turnover += abs(sc) * price
 
         # Track turnover
         exempt_to = sum(abs(sc) * p for sc, p in exempt_orders.values())
@@ -445,6 +529,7 @@ def run_event_driven(
         'daily_returns': daily_returns,
         'final_capital': portfolio.total_equity,
         'turnover_history': turnover_history,
+        'meta_audit': meta.audit_log if meta else [],
     }
 
     # Per-asset PnL (multi-asset only)
