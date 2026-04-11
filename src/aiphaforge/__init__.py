@@ -80,6 +80,7 @@ from .fees import (
 from .hooks import (
     BacktestHook,
     HookContext,
+    SecondaryTimeframe,
 )
 from .latency import LatencyHook, SimpleLatencyHook, SymbolRoutingLatencyHook
 from .margin import (
@@ -108,7 +109,7 @@ from .risk import (
     RiskSignal,
 )
 
-__version__ = '1.2.0'
+__version__ = '1.3.0'
 
 __all__ = [
     # Main engine
@@ -163,6 +164,7 @@ __all__ = [
     # Hooks
     'HookContext',
     'BacktestHook',
+    'SecondaryTimeframe',
     'LatencyHook',
     'SimpleLatencyHook',
     'SymbolRoutingLatencyHook',
