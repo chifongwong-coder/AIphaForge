@@ -320,6 +320,36 @@ def build_unified_timeline(
     return timeline, bar_availability
 
 
+def build_secondary_lookup(
+    primary_timeline: pd.DatetimeIndex,
+    secondary_df: pd.DataFrame,
+    align: str = "close",
+) -> pd.Series:
+    """For each primary timestamp, find the last completed secondary bar.
+
+    Parameters:
+        primary_timeline: Timestamps from the primary (highest frequency) data.
+        secondary_df: OHLCV DataFrame for a single secondary timeframe/asset.
+        align: Alignment mode.
+            ``"close"``: secondary timestamps are bar CLOSE times.  Bar is
+            complete AT this timestamp.  ``searchsorted(side='right') - 1``.
+            ``"open"``: secondary timestamps are bar OPEN times.  Bar
+            completes at the NEXT bar's open.  ``searchsorted(side='left') - 1``.
+
+    Returns:
+        pd.Series indexed by *primary_timeline* whose values are secondary
+        timestamps (or ``NaT`` when no completed bar exists yet).
+    """
+    sec_idx = secondary_df.index
+    side = 'right' if align == 'close' else 'left'
+    positions = sec_idx.searchsorted(primary_timeline, side=side) - 1
+
+    result = pd.Series(pd.NaT, index=primary_timeline)
+    valid = positions >= 0
+    result[valid] = sec_idx[positions[valid]]
+    return result
+
+
 def compute_buy_and_hold(data: pd.DataFrame, initial_capital: float) -> pd.Series:
     """Compute the buy-and-hold equity curve from OHLCV data.
 

@@ -348,6 +348,8 @@ class BacktestEngine:
         benchmark: Optional[pd.Series] = None,
         benchmark_type: Optional[str] = None,
         weights: Optional[Dict[str, float]] = None,
+        secondary_data: Optional[Dict[str, Union[pd.DataFrame, Dict[str, pd.DataFrame]]]] = None,
+        secondary_bar_align: str = "close",
     ) -> BacktestResult:
         """
         Run the backtest.
@@ -361,6 +363,11 @@ class BacktestEngine:
             benchmark: Custom benchmark series (prices or returns).
             benchmark_type: Type of benchmark data.
             weights: Per-symbol weights for vectorized multi-asset.
+            secondary_data: Secondary timeframe data (event-driven only).
+                Mapping of timeframe name to DataFrame (global) or dict
+                of per-symbol DataFrames.
+            secondary_bar_align: Alignment mode for secondary bars.
+                ``"close"`` (default) or ``"open"``.
 
         Returns:
             BacktestResult: Backtest results.
@@ -372,6 +379,8 @@ class BacktestEngine:
             return self._run_multi(
                 data, benchmark=benchmark,
                 benchmark_type=benchmark_type, weights=weights,
+                secondary_data=secondary_data,
+                secondary_bar_align=secondary_bar_align,
             )
 
         # --- Single-asset path ---
@@ -406,6 +415,23 @@ class BacktestEngine:
                     )
                 inner_ids.append(iid)
 
+        # Validate secondary data
+        if secondary_data is not None:
+            for tf_name, tf_data in secondary_data.items():
+                if isinstance(tf_data, pd.DataFrame):
+                    validate_ohlcv(
+                        tf_data,
+                        required=['open', 'high', 'low', 'close'],
+                        validation_level=self.data_validation,
+                    )
+                else:
+                    for sym_name, sdf in tf_data.items():
+                        validate_ohlcv(
+                            sdf,
+                            required=['open', 'high', 'low', 'close'],
+                            validation_level=self.data_validation,
+                        )
+
         # Dispatch to execution core
         if self.mode == ExecutionMode.VECTORIZED:
             raw = run_vectorized(data, signals, config, symbol)
@@ -417,6 +443,8 @@ class BacktestEngine:
                 config=config,
                 symbols=[symbol],
                 strategy=self._strategy,
+                secondary_data=secondary_data,
+                secondary_bar_align=secondary_bar_align,
             )
 
         return self._build_result(raw, data, config)
@@ -428,6 +456,8 @@ class BacktestEngine:
         benchmark: Optional[pd.Series] = None,
         benchmark_type: Optional[str] = None,
         weights: Optional[Dict[str, float]] = None,
+        secondary_data: Optional[Dict[str, Union[pd.DataFrame, Dict[str, pd.DataFrame]]]] = None,
+        secondary_bar_align: str = "close",
     ) -> BacktestResult:
         """Run a multi-asset backtest."""
         from .capital_allocator import EqualWeightAllocator
@@ -442,6 +472,23 @@ class BacktestEngine:
                 validation_level=self.data_validation,
             )
             data_dict[sym] = ensure_datetime_index(df).sort_index().copy()
+
+        # Validate secondary data
+        if secondary_data is not None:
+            for tf_name, tf_data in secondary_data.items():
+                if isinstance(tf_data, pd.DataFrame):
+                    validate_ohlcv(
+                        tf_data,
+                        required=['open', 'high', 'low', 'close'],
+                        validation_level=self.data_validation,
+                    )
+                else:
+                    for sym_name, sdf in tf_data.items():
+                        validate_ohlcv(
+                            sdf,
+                            required=['open', 'high', 'low', 'close'],
+                            validation_level=self.data_validation,
+                        )
 
         # Generate signals
         signals_dict = self._get_signals_multi(data_dict)
@@ -484,6 +531,8 @@ class BacktestEngine:
                 config=config,
                 symbols=symbols,
                 strategy=self._strategy,
+                secondary_data=secondary_data,
+                secondary_bar_align=secondary_bar_align,
             )
 
         # Build result (use first asset's data for benchmark alignment)

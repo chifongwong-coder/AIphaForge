@@ -8,16 +8,16 @@ dict-based data; single-asset input is wrapped before calling.
 """
 
 import warnings
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
 from .broker import Broker
 from .config import BacktestConfig, resolve_config
-from .hooks import HookContext
+from .hooks import HookContext, SecondaryTimeframe
 from .meta import MetaContext
 from .portfolio import Portfolio
-from .utils import build_unified_timeline, calculate_returns
+from .utils import build_secondary_lookup, build_unified_timeline, calculate_returns
 
 # ---------------------------------------------------------------------------
 # Public entry point
@@ -29,6 +29,8 @@ def run_event_driven(
     config: BacktestConfig,
     symbols: List[str],
     strategy=None,
+    secondary_data=None,
+    secondary_bar_align: str = "close",
 ) -> dict:
     """Run an event-driven backtest and return raw results.
 
@@ -38,6 +40,9 @@ def run_event_driven(
         config: Backtest configuration bundle.
         symbols: Ordered list of symbol names.
         strategy: Strategy object (for risk_manager attributes).
+        secondary_data: Secondary timeframe data. Mapping of timeframe
+            name to DataFrame (global) or dict of per-symbol DataFrames.
+        secondary_bar_align: Alignment mode (``"close"`` or ``"open"``).
 
     Returns:
         Dictionary with keys: equity_curve, trades, positions_df,
@@ -79,6 +84,19 @@ def run_event_driven(
 
     # --- Build unified timeline ---
     timeline, bar_avail = build_unified_timeline(data_dict)
+
+    # --- Build secondary lookups (v1.3: multi-timeframe) ---
+    sec_lookups: Dict[str, Dict[str, pd.Series]] = {}
+    sec_data: Dict[str, Dict[str, pd.DataFrame]] = {}
+    if secondary_data:
+        for tf_name, tf_data in secondary_data.items():
+            if isinstance(tf_data, pd.DataFrame):
+                tf_data = {"_global": tf_data}
+            sec_data[tf_name] = tf_data
+            sec_lookups[tf_name] = {}
+            for sym, df in tf_data.items():
+                sec_lookups[tf_name][sym] = build_secondary_lookup(
+                    timeline, df, align=secondary_bar_align)
 
     # --- Convert signal Series to dicts for O(1) lookup ---
     signals_as_dict: Dict[str, dict] = {
@@ -235,6 +253,24 @@ def run_event_driven(
                 pending_before_hooks[sym] = len(
                     brokers[sym].get_pending_orders(sym))
 
+            # Build secondary context for this bar (v1.3)
+            secondary_ctx = None
+            if sec_data:
+                secondary_ctx = {}
+                for tf_name, tf_assets in sec_data.items():
+                    bar_dict: Dict[str, Any] = {}
+                    data_dict_tf: Dict[str, Any] = {}
+                    for sym, df in tf_assets.items():
+                        sec_ts = sec_lookups[tf_name][sym].loc[timestamp]
+                        if pd.isna(sec_ts):
+                            bar_dict[sym] = None
+                            data_dict_tf[sym] = df.iloc[:0]
+                        else:
+                            bar_dict[sym] = df.loc[sec_ts]
+                            data_dict_tf[sym] = df.loc[:sec_ts]
+                    secondary_ctx[tf_name] = SecondaryTimeframe(
+                        bar_data=bar_dict, data=data_dict_tf)
+
             if is_single:
                 sym0 = symbols[0]
                 ctx = HookContext(
@@ -246,6 +282,7 @@ def run_event_driven(
                     symbol=sym0,
                     broker=brokers[sym0],
                     meta=meta,
+                    secondary=secondary_ctx,
                 )
             else:
                 ctx = HookContext(
@@ -259,6 +296,7 @@ def run_event_driven(
                               for s in symbols},
                     all_brokers=brokers,
                     meta=meta,
+                    secondary=secondary_ctx,
                 )
             for hook in config.hooks:
                 hook.on_pre_signal(ctx)

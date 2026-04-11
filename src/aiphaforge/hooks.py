@@ -20,6 +20,20 @@ from .portfolio import Portfolio
 
 
 @dataclass
+class SecondaryTimeframe:
+    """Data for one secondary timeframe, per-asset.
+
+    Attributes:
+        bar_data: Per-symbol current bar (``pd.Series`` or ``None`` if no
+            completed bar exists yet).
+        data: Per-symbol historical data up to the current secondary bar
+            (empty ``pd.DataFrame`` when no completed bar exists).
+    """
+    bar_data: Dict[str, Any]
+    data: Dict[str, Any]
+
+
+@dataclass
 class HookContext:
     """
     Context data passed to hook functions.
@@ -57,6 +71,8 @@ class HookContext:
     all_brokers: Optional[Dict[str, Any]] = None
     # MetaContext for agent control (v1.2, event-driven only)
     meta: Optional[Any] = None
+    # Secondary timeframe data (v1.3, event-driven only)
+    secondary: Optional[Dict[str, SecondaryTimeframe]] = None
 
 
 class BacktestHook(ABC):

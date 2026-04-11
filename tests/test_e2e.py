@@ -758,3 +758,224 @@ class TestEdgeCases:
         order = broker.create_market_order("TSLA", "buy", 100)
         broker.submit_order(order)
         assert order.status == OrderStatus.REJECTED
+
+
+# ===================================================================
+# Multi-Timeframe (v1.3)
+# ===================================================================
+
+
+class TestMultiTimeframe:
+
+    def test_single_asset_daily_reference(self):
+        """Minute-level primary with daily secondary: hook reads ctx.secondary."""
+        from aiphaforge import SecondaryTimeframe
+
+        # Primary: 20 "minute" bars (business-day index for simplicity)
+        primary = make_ohlcv(20, start_price=100)
+
+        # Secondary: 4 "daily" bars aligned to every 5th primary bar
+        daily_idx = primary.index[::5]  # bars 0, 5, 10, 15
+        rng = np.random.default_rng(99)
+        daily = pd.DataFrame({
+            "open": 100 + rng.standard_normal(len(daily_idx)),
+            "high": 105 + rng.standard_normal(len(daily_idx)),
+            "low": 95 + rng.standard_normal(len(daily_idx)),
+            "close": 102 + rng.standard_normal(len(daily_idx)),
+            "volume": rng.integers(1000, 5000, size=len(daily_idx)).astype(float),
+        }, index=daily_idx)
+        # Clamp open into [low, high]
+        daily["open"] = daily["open"].clip(lower=daily["low"], upper=daily["high"])
+
+        signals = pd.Series(np.nan, index=primary.index, dtype=float)
+        signals.iloc[1] = 1
+        signals.iloc[18] = 0
+
+        class SecondaryReader(BacktestHook):
+            def __init__(self):
+                self.collected = []
+
+            def on_pre_signal(self, ctx):
+                if ctx.secondary is not None and "1D" in ctx.secondary:
+                    tf = ctx.secondary["1D"]
+                    assert isinstance(tf, SecondaryTimeframe)
+                    bar = tf.bar_data.get("_global")
+                    hist = tf.data.get("_global")
+                    self.collected.append({
+                        "ts": ctx.timestamp,
+                        "bar_is_none": bar is None,
+                        "hist_len": len(hist),
+                    })
+
+        hook = SecondaryReader()
+        engine = BacktestEngine(
+            mode='event_driven', fee_model=ZeroFeeModel(),
+            initial_capital=100_000, hooks=[hook],
+            include_benchmark=False,
+        )
+        engine.set_signals(signals)
+        result = engine.run(
+            primary,
+            secondary_data={"1D": daily},
+            secondary_bar_align="close",
+        )
+
+        assert isinstance(result, BacktestResult)
+        assert len(hook.collected) == 20
+
+        # Bar 0 has a daily bar (index 0 is in daily)
+        entry_0 = hook.collected[0]
+        assert not entry_0["bar_is_none"]
+        assert entry_0["hist_len"] >= 1
+
+        # Bar 3 should still see the bar from index 0 (forward-fill)
+        entry_3 = hook.collected[3]
+        assert not entry_3["bar_is_none"]
+        assert entry_3["hist_len"] == 1
+
+        # Bar 6 should see 2 daily bars (index 0 and 5)
+        entry_6 = hook.collected[6]
+        assert not entry_6["bar_is_none"]
+        assert entry_6["hist_len"] == 2
+
+    def test_multi_asset_multi_timeframe(self):
+        """2 assets x 2 timeframes: correct per-asset per-tf lookup."""
+        from aiphaforge import SecondaryTimeframe
+
+        data_a = make_ohlcv(20, start_price=100)
+        data_b = make_ohlcv(20, start_price=200)
+        data = {"A": data_a, "B": data_b}
+
+        # Build daily secondary per asset (every 5 bars)
+        daily_idx = data_a.index[::5]
+        rng = np.random.default_rng(77)
+
+        def _make_secondary(idx, base):
+            n = len(idx)
+            low = base - 5 + rng.standard_normal(n)
+            high = base + 5 + rng.standard_normal(n)
+            # Ensure high >= low
+            low, high = np.minimum(low, high), np.maximum(low, high)
+            opn = np.clip(base + rng.standard_normal(n), low, high)
+            close = np.clip(base + rng.standard_normal(n), low, high)
+            return pd.DataFrame({
+                "open": opn, "high": high, "low": low,
+                "close": close,
+                "volume": rng.integers(1000, 5000, size=n).astype(float),
+            }, index=idx)
+
+        daily_a = _make_secondary(daily_idx, 100)
+        daily_b = _make_secondary(daily_idx, 200)
+
+        # Weekly secondary: global (single DataFrame, every 10 bars)
+        weekly_idx = data_a.index[::10]
+        weekly_global = _make_secondary(weekly_idx, 150)
+
+        secondary_data = {
+            "1D": {"A": daily_a, "B": daily_b},
+            "1W": weekly_global,  # global, auto-wrapped as _global
+        }
+
+        signals = {
+            sym: pd.Series(np.nan, index=df.index, dtype=float)
+            for sym, df in data.items()
+        }
+
+        class MultiInspector(BacktestHook):
+            def __init__(self):
+                self.records = []
+
+            def on_pre_signal(self, ctx):
+                if ctx.secondary is None:
+                    return
+                rec = {"ts": ctx.timestamp}
+                # Daily per-asset
+                if "1D" in ctx.secondary:
+                    tf = ctx.secondary["1D"]
+                    rec["daily_A"] = tf.bar_data.get("A") is not None
+                    rec["daily_B"] = tf.bar_data.get("B") is not None
+                # Weekly global
+                if "1W" in ctx.secondary:
+                    tf = ctx.secondary["1W"]
+                    rec["weekly_global"] = tf.bar_data.get("_global") is not None
+                self.records.append(rec)
+
+        hook = MultiInspector()
+        engine = BacktestEngine(
+            mode='event_driven', fee_model=ZeroFeeModel(),
+            initial_capital=200_000, hooks=[hook],
+            capital_allocator=EqualWeightAllocator(),
+            include_benchmark=False,
+        )
+        engine.set_signals(signals)
+        result = engine.run(
+            data,
+            secondary_data=secondary_data,
+        )
+
+        assert isinstance(result, BacktestResult)
+        assert len(hook.records) == 20
+
+        # At bar 0 daily should be available (close alignment)
+        assert hook.records[0]["daily_A"] is True
+        assert hook.records[0]["daily_B"] is True
+        assert hook.records[0]["weekly_global"] is True
+
+    def test_early_bars_before_secondary(self):
+        """Primary starts before secondary: bar_data is None for early bars."""
+        from aiphaforge import SecondaryTimeframe
+
+        primary = make_ohlcv(20, start_price=100)
+
+        # Secondary starts at bar 10 (primary bars 0-9 have no secondary)
+        sec_idx = primary.index[10:]
+        rng = np.random.default_rng(55)
+        n = len(sec_idx)
+        low = 95 + rng.standard_normal(n)
+        high = 105 + rng.standard_normal(n)
+        low, high = np.minimum(low, high), np.maximum(low, high)
+        opn = np.clip(100 + rng.standard_normal(n), low, high)
+        close = np.clip(100 + rng.standard_normal(n), low, high)
+        secondary_df = pd.DataFrame({
+            "open": opn, "high": high, "low": low,
+            "close": close,
+            "volume": rng.integers(1000, 5000, size=n).astype(float),
+        }, index=sec_idx)
+
+        signals = pd.Series(np.nan, index=primary.index, dtype=float)
+
+        class EarlyChecker(BacktestHook):
+            def __init__(self):
+                self.early_none = []
+                self.late_present = []
+
+            def on_pre_signal(self, ctx):
+                if ctx.secondary is None:
+                    return
+                tf = ctx.secondary["1D"]
+                bar = tf.bar_data.get("_global")
+                hist = tf.data.get("_global")
+                if ctx.bar_index < 10:
+                    self.early_none.append(bar is None)
+                else:
+                    self.late_present.append(bar is not None)
+
+        hook = EarlyChecker()
+        engine = BacktestEngine(
+            mode='event_driven', fee_model=ZeroFeeModel(),
+            initial_capital=100_000, hooks=[hook],
+            include_benchmark=False,
+        )
+        engine.set_signals(signals)
+        result = engine.run(
+            primary,
+            secondary_data={"1D": secondary_df},
+        )
+
+        assert isinstance(result, BacktestResult)
+        # First 10 bars should all have None bar_data
+        assert len(hook.early_none) == 10
+        assert all(hook.early_none)
+        # Bars 10+ should all have data
+        assert len(hook.late_present) == 10
+        assert all(hook.late_present)
