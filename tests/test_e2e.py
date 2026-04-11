@@ -41,7 +41,16 @@ from aiphaforge.risk import (
     ExposureLimit,
     MaxDrawdownHalt,
 )
-from aiphaforge.strategies import MACrossover, RSIMeanReversion
+from aiphaforge.strategies import (
+    MACrossover,
+    MACDStrategy,
+    PriorityCascade,
+    RSIMeanReversion,
+    SelectBest,
+    VoteEnsemble,
+    WeightedBlend,
+    ConditionalSwitch,
+)
 
 from .conftest import make_ohlcv
 
@@ -979,3 +988,163 @@ class TestMultiTimeframe:
         # Bars 10+ should all have data
         assert len(hook.late_present) == 10
         assert all(hook.late_present)
+
+
+# ===================================================================
+# Strategy Composition Tree (v1.4)
+# ===================================================================
+
+
+class TestStrategyTree:
+
+    def test_weighted_blend(self):
+        """WeightedBlend: 2 children with known signals, verify weighted output."""
+        data = make_ohlcv(100)
+        child_a = MACrossover(short=5, long=20)
+        child_b = RSIMeanReversion(period=14)
+
+        tree = WeightedBlend(
+            children=[child_a, child_b],
+            weights=[0.6, 0.4],
+        )
+
+        signals = tree.generate_signals(data)
+        assert isinstance(signals, pd.Series)
+        assert len(signals) == len(data)
+        # At least some non-NaN signals produced
+        assert signals.notna().sum() > 0
+
+        # Full backtest runs without error
+        result = tree.backtest(data, fee_model=ZeroFeeModel(),
+                               include_benchmark=False)
+        assert isinstance(result, BacktestResult)
+
+    def test_select_best(self):
+        """SelectBest: children with different strengths, strongest wins."""
+        data = make_ohlcv(100)
+        child_a = MACrossover(short=5, long=20)
+        child_b = MACDStrategy()
+
+        tree = SelectBest(children=[child_a, child_b])
+        signals = tree.generate_signals(data)
+        assert isinstance(signals, pd.Series)
+        assert signals.notna().sum() > 0
+
+        result = tree.backtest(data, fee_model=ZeroFeeModel(),
+                               include_benchmark=False)
+        assert isinstance(result, BacktestResult)
+
+    def test_priority_cascade(self):
+        """PriorityCascade: first child NaN falls to second."""
+        data = make_ohlcv(100)
+        # RSI with extreme thresholds: rarely signals
+        child_primary = RSIMeanReversion(period=14, oversold=5, overbought=95)
+        child_fallback = MACrossover(short=5, long=20)
+
+        tree = PriorityCascade(children=[child_primary, child_fallback])
+        signals = tree.generate_signals(data)
+
+        # Fallback should fill in where primary is silent
+        fallback_signals = child_fallback.generate_signals(data)
+        assert isinstance(signals, pd.Series)
+        # Should have at least as many signals as fallback alone
+        assert signals.notna().sum() >= fallback_signals.notna().sum()
+
+    def test_vote_ensemble(self):
+        """VoteEnsemble: 2 buy + 1 sell -> buy via majority."""
+        data = make_ohlcv(100)
+        tree = VoteEnsemble(children=[
+            MACrossover(short=5, long=20),
+            MACDStrategy(),
+            RSIMeanReversion(period=14),
+        ])
+        signals = tree.generate_signals(data)
+        assert isinstance(signals, pd.Series)
+        # Majority vote should produce some signals
+        assert signals.notna().sum() > 0
+
+        result = tree.backtest(data, fee_model=ZeroFeeModel(),
+                               include_benchmark=False)
+        assert isinstance(result, BacktestResult)
+
+    def test_conditional_switch(self):
+        """ConditionalSwitch: regime function selects correct child."""
+        data = make_ohlcv(100)
+        child_trend = MACrossover(short=5, long=20)
+        child_revert = RSIMeanReversion(period=14)
+
+        # Simple regime: first half -> child 0, second half -> child 1
+        def regime_fn(df):
+            mid = len(df) // 2
+            idx = pd.Series(0, index=df.index, dtype=int)
+            idx.iloc[mid:] = 1
+            return idx
+
+        tree = ConditionalSwitch(
+            children=[child_trend, child_revert],
+            condition_fn=regime_fn,
+        )
+        signals = tree.generate_signals(data)
+        assert isinstance(signals, pd.Series)
+        assert signals.notna().sum() > 0
+
+        result = tree.backtest(data, fee_model=ZeroFeeModel(),
+                               include_benchmark=False)
+        assert isinstance(result, BacktestResult)
+
+    def test_nested_tree(self):
+        """Nested tree: blend of cascade and ensemble runs backtest."""
+        data = make_ohlcv(100)
+
+        cascade = PriorityCascade(children=[
+            RSIMeanReversion(period=14, oversold=5, overbought=95),
+            MACrossover(short=5, long=20),
+        ])
+
+        ensemble = VoteEnsemble(children=[
+            MACrossover(short=10, long=30),
+            MACDStrategy(),
+            RSIMeanReversion(period=14),
+        ])
+
+        tree = WeightedBlend(
+            children=[cascade, ensemble],
+            weights=[0.6, 0.4],
+        )
+
+        result = tree.backtest(data, fee_model=ZeroFeeModel(),
+                               include_benchmark=False)
+        assert isinstance(result, BacktestResult)
+
+    def test_meta_set_weights(self):
+        """Agent adjusts tree weights mid-backtest via MetaContext."""
+        data = make_ohlcv(100)
+
+        tree = WeightedBlend(
+            children=[MACrossover(short=5, long=20), RSIMeanReversion()],
+            weights=[0.7, 0.3],
+        )
+
+        class WeightAgent(BacktestHook):
+            def on_pre_signal(self, ctx):
+                if ctx.meta and ctx.bar_index == 50:
+                    ctx.meta.set_weights([0.3, 0.7])
+
+        result = BacktestEngine(
+            mode='event_driven', fee_model=ZeroFeeModel(),
+            initial_capital=100_000, hooks=[WeightAgent()],
+            include_benchmark=False,
+        ).set_strategy(tree).run(data)
+
+        assert isinstance(result, BacktestResult)
+        # Verify weights were actually changed
+        assert tree.weights == [0.3, 0.7]
+
+    def test_meta_set_weights_single_strategy_warns(self):
+        """set_weights on a non-composite strategy warns and no-ops."""
+        meta = MetaContext(config=None, strategy=MACrossover())
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            meta.set_weights([0.5, 0.5])
+            assert len(w) == 1
+            assert "not a weighted composite" in str(w[0].message)

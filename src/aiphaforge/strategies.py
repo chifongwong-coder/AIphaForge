@@ -697,3 +697,189 @@ class MultiIndicatorStrategy(BaseStrategy):
         raw[combined_buy] = 1
         raw[combined_sell] = -1
         return _transitions_only(raw)
+
+
+# ---------------------------------------------------------------------------
+# Strategy Composition Tree (v1.4)
+# ---------------------------------------------------------------------------
+
+
+class StrategyNode(BaseStrategy):
+    """Base for composite strategy nodes.
+
+    A composite node combines multiple child strategies into a single
+    signal stream. Composites are BaseStrategy subclasses, so they work
+    everywhere a strategy works: engine.set_strategy(), backtest(),
+    generate_signals(), MetaController, and optimizer.
+
+    Parameters:
+        children: List of child strategies (BaseStrategy instances).
+    """
+
+    name = "Strategy Node"
+
+    def __init__(self, children: List[BaseStrategy]):
+        self.children = children
+
+    @property
+    def params(self) -> Dict[str, Any]:
+        return {
+            'children': [c.name for c in self.children],
+            **{k: v for k, v in self.__dict__.items()
+               if k not in ('children',) and not k.startswith('_')},
+        }
+
+    def update_params(self, **kwargs) -> None:
+        for k, v in kwargs.items():
+            if hasattr(self, k) and k != 'children':
+                setattr(self, k, v)
+            else:
+                raise ValueError(f"Unknown param '{k}' for {self.name}")
+
+    def default_param_grid(self) -> Dict[str, list]:
+        return {}
+
+    def _compute(self, df: pd.DataFrame) -> pd.Series:
+        raise NotImplementedError
+
+
+class WeightedBlend(StrategyNode):
+    """Blend child signals with fixed weights.
+
+    Final signal = sum(weight_i * signal_i) with re-normalized weights
+    per bar (NaN children excluded). Continuous output discretized to
+    signal_precision decimal places, then transition-only filtered.
+
+    Parameters:
+        children: List of child strategies.
+        weights: Per-child weights (default: equal weight).
+        signal_precision: Decimal places for rounding (default 2).
+    """
+
+    name = "Weighted Blend"
+
+    def __init__(self, children: List[BaseStrategy],
+                 weights: Optional[List[float]] = None,
+                 signal_precision: int = 2):
+        super().__init__(children)
+        self.weights = weights or [1.0 / len(children)] * len(children)
+        self.signal_precision = signal_precision
+
+    def _compute(self, df: pd.DataFrame) -> pd.Series:
+        signals = pd.concat(
+            [child._compute(df) for child in self.children], axis=1)
+        signals.columns = range(len(self.children))
+        w = pd.Series(self.weights, index=signals.columns)
+
+        # Re-normalize weights per bar: exclude NaN children
+        valid = signals.notna()
+        w_valid = valid.mul(w, axis=1)
+        w_sum = w_valid.sum(axis=1).replace(0, np.nan)
+        w_norm = w_valid.div(w_sum, axis=0)
+
+        # Weighted sum with re-normalized weights
+        result = (signals.fillna(0) * w_norm.fillna(0)).sum(axis=1)
+        all_nan = valid.sum(axis=1) == 0
+        result[all_nan] = np.nan
+
+        # Discretize + transition-only to prevent micro-rebalancing
+        result = result.round(self.signal_precision)
+        return _transitions_only(result)
+
+
+class SelectBest(StrategyNode):
+    """Run all children, select the one with the strongest signal.
+
+    On each bar, the child with the largest abs(signal) wins.
+    Tie-breaking: first child in list (idxmax behavior).
+    """
+
+    name = "Select Best"
+
+    def _compute(self, df: pd.DataFrame) -> pd.Series:
+        signals = pd.concat(
+            [child._compute(df) for child in self.children], axis=1)
+        signals.columns = range(len(self.children))
+        # Vectorized: select column with max abs value per row
+        abs_signals = signals.abs()
+        # Use fillna(-1) to avoid FutureWarning on all-NaN rows;
+        # all-NaN rows get idxmax=0 but are excluded by valid check below
+        best_col = abs_signals.fillna(-1).idxmax(axis=1)
+        has_any = abs_signals.notna().any(axis=1)
+        result = pd.Series(np.nan, index=df.index, dtype=float)
+        for col in range(len(self.children)):
+            mask = (best_col == col) & has_any
+            result[mask] = signals.loc[mask, col]
+        return _transitions_only(result)
+
+
+class PriorityCascade(StrategyNode):
+    """Try children in order. First non-NaN signal wins.
+
+    Use case: primary strategy signals most bars; fallback strategy
+    covers gaps when primary is NaN (no opinion).
+    """
+
+    name = "Priority Cascade"
+
+    def _compute(self, df: pd.DataFrame) -> pd.Series:
+        result = pd.Series(np.nan, index=df.index, dtype=float)
+        for child in self.children:
+            sig = child._compute(df)
+            mask = result.isna() & sig.notna()
+            result[mask] = sig[mask]
+        return _transitions_only(result)
+
+
+class VoteEnsemble(StrategyNode):
+    """Majority vote: signal = sign(sum(sign(signals))).
+
+    3 children: 2 say buy, 1 says sell -> final = buy.
+    All NaN -> NaN. Tie -> NaN (no consensus).
+    """
+
+    name = "Vote Ensemble"
+
+    def _compute(self, df: pd.DataFrame) -> pd.Series:
+        signals = pd.concat(
+            [child._compute(df) for child in self.children], axis=1)
+        signals.columns = range(len(self.children))
+        votes = signals.apply(np.sign)
+        vote_sum = votes.sum(axis=1)
+        n_valid = votes.notna().sum(axis=1)
+
+        result = pd.Series(np.nan, index=df.index, dtype=float)
+        majority = vote_sum.abs() > n_valid / 2
+        result[majority] = np.sign(vote_sum[majority])
+        return _transitions_only(result)
+
+
+class ConditionalSwitch(StrategyNode):
+    """Regime-based strategy switching.
+
+    condition_fn receives a DataFrame and returns a pd.Series of int
+    indices (which child to use on each bar). Use for regime detection:
+    e.g., low-vol -> trend following, high-vol -> mean reversion.
+
+    Indices outside [0, len(children)) produce NaN (no signal) for
+    those bars -- treated as "no opinion" by the engine.
+
+    Parameters:
+        children: List of child strategies.
+        condition_fn: Callable(DataFrame) -> pd.Series of int indices.
+    """
+
+    name = "Conditional Switch"
+
+    def __init__(self, children: List[BaseStrategy], condition_fn):
+        super().__init__(children)
+        self.condition_fn = condition_fn
+
+    def _compute(self, df: pd.DataFrame) -> pd.Series:
+        selection = self.condition_fn(df)
+        child_signals = [c._compute(df) for c in self.children]
+        result = pd.Series(np.nan, index=df.index, dtype=float)
+        for i, sig in enumerate(child_signals):
+            mask = selection == i
+            result[mask] = sig[mask]
+        return _transitions_only(result)

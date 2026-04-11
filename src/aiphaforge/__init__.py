@@ -108,8 +108,16 @@ from .risk import (
     MaxDrawdownHalt,
     RiskSignal,
 )
+from .strategies import (
+    ConditionalSwitch,
+    PriorityCascade,
+    SelectBest,
+    StrategyNode,
+    VoteEnsemble,
+    WeightedBlend,
+)
 
-__version__ = '1.3.0'
+__version__ = '1.4.0'
 
 __all__ = [
     # Main engine
@@ -204,6 +212,14 @@ __all__ = [
     'DailyLossLimit',
     'ConcentrationLimit',
     'RiskSignal',
+
+    # Strategy composition tree (v1.4)
+    'StrategyNode',
+    'WeightedBlend',
+    'SelectBest',
+    'PriorityCascade',
+    'VoteEnsemble',
+    'ConditionalSwitch',
 
     # Results
     'Trade',
