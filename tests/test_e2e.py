@@ -182,11 +182,13 @@ class TestMultiAsset:
         }
 
     def _make_signals(self, data, buy=1, sell=20):
-        return {
-            sym: pd.Series(np.nan, index=df.index, dtype=float).pipe(
-                lambda s: s.__setitem__(buy, 1) or s.__setitem__(sell, 0) or s)
-            for sym, df in data.items()
-        }
+        signals = {}
+        for sym, df in data.items():
+            s = pd.Series(np.nan, index=df.index, dtype=float)
+            s.iloc[buy] = 1
+            s.iloc[sell] = 0
+            signals[sym] = s
+        return signals
 
     def test_multi_asset_event_driven(self):
         """Multi-asset with shared capital and per-asset PnL."""
