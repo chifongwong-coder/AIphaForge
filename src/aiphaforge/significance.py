@@ -316,8 +316,10 @@ def bootstrap_metrics(
         metric_fns[name] = _make_metric_fn(
             m, result.initial_capital, trading_days=trading_days)
 
-    # Pre-allocate reusable Series to avoid per-iteration construction
-    _reusable_series = pd.Series(np.empty(len(returns)), dtype=float)
+    # Pre-allocate numpy buffer; wrap in Series once per iteration via
+    # the buffer (avoids pd.Series construction overhead while staying
+    # compatible with pandas Copy-on-Write which makes .values read-only).
+    _buf = np.empty(len(returns), dtype=float)
 
     # Bootstrap loop: one set of samples, all metrics per sample
     rng = np.random.default_rng(random_state)
@@ -325,7 +327,8 @@ def bootstrap_metrics(
 
     for _ in range(n_bootstrap):
         boot_returns = _stationary_block_bootstrap(returns, block_size, rng)
-        _reusable_series.values[:] = boot_returns
+        _buf[:] = boot_returns
+        _reusable_series = pd.Series(_buf, copy=False)
         for name in metric_names:
             distributions[name].append(metric_fns[name](_reusable_series))
 
