@@ -476,10 +476,7 @@ def permutation_test(
     # Run actual backtest to get observed metric
     engine = BacktestEngine(**engine_kwargs)
     engine.set_signals(signals)
-    if isinstance(data, dict):
-        actual_result = engine.run(data)
-    else:
-        actual_result = engine.run(data)
+    actual_result = engine.run(data)
 
     observed_returns = utils.calculate_returns(
         actual_result.equity_curve).values
