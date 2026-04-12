@@ -73,10 +73,12 @@ class PermutationResult:
     Attributes:
         metric_name: Name of the metric tested.
         observed: Actual metric value from the real backtest.
-        p_value: Fraction of permutations matching or exceeding observed.
+        p_value: Fraction of permutations performing as well as or better
+            than observed (direction-aware).
         mean_null: Mean of the null distribution.
         std_null: Standard deviation of the null distribution.
         n_permutations: Number of permutations performed.
+        n_valid: Number of valid (non-NaN) permutations used for p-value.
         null_distribution: Full null distribution array (for plotting).
     """
     metric_name: str
@@ -85,6 +87,7 @@ class PermutationResult:
     mean_null: float
     std_null: float
     n_permutations: int
+    n_valid: int
     null_distribution: np.ndarray
 
 
@@ -140,19 +143,23 @@ def _stationary_block_bootstrap(
 def _make_metric_fn(
     metric: Union[str, Callable],
     initial_capital: float,
-) -> Callable[[np.ndarray], float]:
+    trading_days: int = 252,
+) -> Callable[[pd.Series], float]:
     """Convert a metric name or callable into a function(returns) -> float.
 
-    Built-in metrics delegate to functions in utils.py.
+    Built-in metrics delegate to functions in utils.py and accept pd.Series.
     Equity-based metrics (max_drawdown, calmar_ratio) reconstruct equity
     from bootstrapped returns: ``initial_capital * cumprod(1 + r)``.
 
+    Custom callables receive pd.Series as input.
+
     Parameters:
-        metric: Metric name string or a callable(np.ndarray) -> float.
+        metric: Metric name string or a callable(pd.Series) -> float.
         initial_capital: Initial capital for equity reconstruction.
+        trading_days: Number of trading days per year for annualization.
 
     Returns:
-        A callable that takes a numpy array of returns and returns a float.
+        A callable that takes a pd.Series of returns and returns a float.
 
     Raises:
         ValueError: If metric is an unknown string.
@@ -161,24 +168,31 @@ def _make_metric_fn(
         return metric
 
     if metric == "sharpe_ratio":
-        return lambda r: utils.sharpe_ratio(pd.Series(r))
+        return lambda r: utils.sharpe_ratio(r, trading_days=trading_days)
     if metric == "sortino_ratio":
-        return lambda r: utils.sortino_ratio(pd.Series(r))
+        return lambda r: utils.sortino_ratio(r, trading_days=trading_days)
     if metric == "max_drawdown":
         return lambda r: utils.max_drawdown(
-            pd.Series(initial_capital * np.cumprod(1 + r)))
+            pd.Series(initial_capital * np.cumprod(1 + r.values)))
     if metric == "annual_return":
-        return lambda r: float(
-            (1 + r).prod() ** (252 / max(len(r), 1)) - 1)
+        def _annual_return(r: pd.Series) -> float:
+            rv = r.values
+            return float(
+                (1 + rv).prod() ** (trading_days / max(len(rv), 1)) - 1)
+        return _annual_return
     if metric == "calmar_ratio":
-        def _calmar(r: np.ndarray) -> float:
-            ann = float((1 + r).prod() ** (252 / max(len(r), 1)) - 1)
+        def _calmar(r: pd.Series) -> float:
+            rv = r.values
+            ann = float(
+                (1 + rv).prod() ** (trading_days / max(len(rv), 1)) - 1)
             mdd = utils.max_drawdown(
-                pd.Series(initial_capital * np.cumprod(1 + r)))
-            return ann / mdd if mdd > 0 else 0.0
+                pd.Series(initial_capital * np.cumprod(1 + rv)))
+            if mdd == 0:
+                return float('inf') if ann > 0 else 0.0
+            return ann / mdd
         return _calmar
     if metric == "total_return":
-        return lambda r: float((1 + r).prod() - 1)
+        return lambda r: float((1 + r.values).prod() - 1)
 
     raise ValueError(f"Unknown metric: {metric!r}")
 
@@ -235,6 +249,7 @@ def bootstrap_metrics(
     confidence: float = 0.95,
     block_size: Optional[int] = None,
     random_state: Optional[int] = None,
+    trading_days: int = 252,
 ) -> Dict[str, BootstrapResult]:
     """Compute confidence intervals for multiple metrics via block bootstrap.
 
@@ -248,20 +263,39 @@ def bootstrap_metrics(
         metrics: List of metric names or callables. Built-in names:
             ``"sharpe_ratio"``, ``"annual_return"``, ``"max_drawdown"``,
             ``"sortino_ratio"``, ``"calmar_ratio"``, ``"total_return"``.
-            Or pass a ``callable(np.ndarray) -> float`` for custom metrics.
+            Or pass a ``callable(pd.Series) -> float`` for custom metrics.
         n_bootstrap: Number of bootstrap replications.
         confidence: Confidence level (e.g. 0.95 for 95% CI).
         block_size: Expected block length for stationary bootstrap.
             ``None`` (default) uses ``max(1, int(sqrt(N)))``.
         random_state: Seed for reproducibility.
+        trading_days: Number of trading days per year for annualization.
 
     Returns:
         Dict mapping metric name (or ``"custom_0"``, ``"custom_1"`` for
         callables) to :class:`BootstrapResult`. All results share the
         same bootstrap samples.
+
+    Raises:
+        ValueError: If n_bootstrap, confidence, or block_size are invalid,
+            or if the equity curve is too short.
     """
+    # Input validation
+    if n_bootstrap < 1:
+        raise ValueError("n_bootstrap must be >= 1")
+    if not 0 < confidence < 1:
+        raise ValueError("confidence must be between 0 and 1 (exclusive)")
+    if block_size is not None and block_size < 1:
+        raise ValueError("block_size must be >= 1")
+
     # Extract returns from equity curve
     returns = utils.calculate_returns(result.equity_curve).values
+
+    # Short equity curve check
+    if len(returns) < 2:
+        raise ValueError(
+            f"equity_curve too short ({len(result.equity_curve)} bars, "
+            f"{len(returns)} returns). Need at least 3 bars.")
 
     # Auto block_size
     if block_size is None:
@@ -279,7 +313,11 @@ def bootstrap_metrics(
         else:
             name = str(m)
         metric_names.append(name)
-        metric_fns[name] = _make_metric_fn(m, result.initial_capital)
+        metric_fns[name] = _make_metric_fn(
+            m, result.initial_capital, trading_days=trading_days)
+
+    # Pre-allocate reusable Series to avoid per-iteration construction
+    _reusable_series = pd.Series(np.empty(len(returns)), dtype=float)
 
     # Bootstrap loop: one set of samples, all metrics per sample
     rng = np.random.default_rng(random_state)
@@ -287,18 +325,21 @@ def bootstrap_metrics(
 
     for _ in range(n_bootstrap):
         boot_returns = _stationary_block_bootstrap(returns, block_size, rng)
+        _reusable_series.values[:] = boot_returns
         for name in metric_names:
-            distributions[name].append(metric_fns[name](boot_returns))
+            distributions[name].append(metric_fns[name](_reusable_series))
 
     # Build BootstrapResult per metric
     alpha = 1 - confidence
     results: Dict[str, BootstrapResult] = {}
 
+    # Compute observed metrics using pd.Series
+    observed_series = pd.Series(returns, dtype=float)
     for name in metric_names:
         dist = np.array(distributions[name])
         results[name] = BootstrapResult(
             metric_name=name,
-            observed=float(metric_fns[name](returns)),
+            observed=float(metric_fns[name](observed_series)),
             mean=float(dist.mean()),
             std=float(dist.std()),
             ci_lower=float(np.percentile(dist, 100 * alpha / 2)),
@@ -318,6 +359,7 @@ def bootstrap_ci(
     confidence: float = 0.95,
     block_size: Optional[int] = None,
     random_state: Optional[int] = None,
+    trading_days: int = 252,
 ) -> BootstrapResult:
     """Single-metric convenience wrapper around :func:`bootstrap_metrics`.
 
@@ -331,6 +373,7 @@ def bootstrap_ci(
         confidence=confidence,
         block_size=block_size,
         random_state=random_state,
+        trading_days=trading_days,
     )
     # Return the single result
     return next(iter(all_results.values()))
@@ -348,6 +391,9 @@ def permutation_test(
     metric: Union[str, Callable] = "sharpe_ratio",
     n_permutations: int = 1000,
     random_state: Optional[int] = None,
+    trading_days: int = 252,
+    higher_is_better: bool = True,
+    zero_cost: bool = False,
     **engine_kwargs,
 ) -> PermutationResult:
     """Test whether strategy alpha is statistically significant.
@@ -355,13 +401,18 @@ def permutation_test(
     Shuffles the position series (forward-filled signals) to preserve
     the permutation space, then converts back to transition-only format
     for the engine. Reports p-value = fraction of permutations that
-    match or exceed actual performance.
+    match or exceed actual performance (Phipson & Smyth +1 correction).
 
     Either ``strategy`` or ``signals`` must be provided (not both).
 
     Note: For agent strategies (hook-based, path-dependent), use Monte
     Carlo path simulation instead. Permutation test is appropriate for
     signal-based strategies only.
+
+    Note: When using non-zero transaction costs, the null distribution
+    is biased downward because random signals trade more frequently.
+    Set ``zero_cost=True`` to isolate signal timing alpha from
+    trading frequency effects.
 
     Parameters:
         data: OHLCV data (single or multi-asset dict).
@@ -370,6 +421,12 @@ def permutation_test(
         metric: Metric to compare. Same options as :func:`bootstrap_ci`.
         n_permutations: Number of random permutations.
         random_state: Seed for reproducibility.
+        trading_days: Number of trading days per year for annualization.
+        higher_is_better: Direction for custom callable metrics. If True
+            (default), higher metric values are better. Ignored for
+            built-in string metrics which have known directions.
+        zero_cost: If True, override fee_model with ZeroFeeModel to
+            eliminate transaction cost bias in the null distribution.
         **engine_kwargs: Passed to ``BacktestEngine`` constructor
             (fee_model, mode, initial_capital, etc.).
 
@@ -377,7 +434,8 @@ def permutation_test(
         :class:`PermutationResult` with p-value and null distribution.
 
     Raises:
-        ValueError: If neither or both of strategy/signals are provided.
+        ValueError: If neither or both of strategy/signals are provided,
+            or if n_permutations < 1.
     """
     from .engine import BacktestEngine
 
@@ -385,6 +443,14 @@ def permutation_test(
     if (strategy is None) == (signals is None):
         raise ValueError(
             "Exactly one of 'strategy' or 'signals' must be provided.")
+
+    if n_permutations < 1:
+        raise ValueError("n_permutations must be >= 1")
+
+    # Apply zero_cost override before creating any engines
+    if zero_cost:
+        from .fees import ZeroFeeModel
+        engine_kwargs['fee_model'] = ZeroFeeModel()
 
     # Generate signals from strategy if needed
     if strategy is not None:
@@ -404,7 +470,8 @@ def permutation_test(
     initial_capital = engine_kwargs.get("initial_capital", 100000)
 
     # Build metric function for extraction from BacktestResult
-    metric_fn = _make_metric_fn(metric, initial_capital)
+    metric_fn = _make_metric_fn(
+        metric, initial_capital, trading_days=trading_days)
 
     # Run actual backtest to get observed metric
     engine = BacktestEngine(**engine_kwargs)
@@ -413,12 +480,15 @@ def permutation_test(
         actual_result = engine.run(data)
     else:
         actual_result = engine.run(data)
-    observed = float(metric_fn(
-        utils.calculate_returns(actual_result.equity_curve).values))
+
+    observed_returns = utils.calculate_returns(
+        actual_result.equity_curve).values
+    observed = float(metric_fn(pd.Series(observed_returns, dtype=float)))
 
     # Permutation loop
     rng = np.random.default_rng(random_state)
     null_dist_values: List[float] = []
+    n_failures = 0
 
     for _ in range(n_permutations):
         # Permute signals
@@ -437,24 +507,40 @@ def permutation_test(
             perm_result = perm_engine.run(data)
             perm_returns = utils.calculate_returns(
                 perm_result.equity_curve).values
-            perm_metric = float(metric_fn(perm_returns))
+            perm_metric = float(metric_fn(
+                pd.Series(perm_returns, dtype=float)))
         except Exception:
             # If a permutation fails (e.g. degenerate signals), use NaN
             perm_metric = np.nan
+            n_failures += 1
         null_dist_values.append(perm_metric)
+
+    # Warn if any permutations failed
+    if n_failures > 0:
+        import warnings
+        fail_pct = n_failures / n_permutations * 100
+        warnings.warn(
+            f"permutation_test: {n_failures}/{n_permutations} permutations "
+            f"failed ({fail_pct:.0f}%). p-value computed from "
+            f"{n_permutations - n_failures} valid samples.")
 
     null_dist = np.array(null_dist_values)
     # Filter out NaN values for p-value computation
     valid_null = null_dist[~np.isnan(null_dist)]
 
-    # Compute p-value with correct direction
-    if len(valid_null) == 0:
-        p_value = 1.0
-    elif metric_name in _LOWER_IS_BETTER:
-        p_value = float((valid_null <= observed).sum() / len(valid_null))
+    # Determine direction for p-value computation
+    if isinstance(metric, str):
+        lower_better = metric in _LOWER_IS_BETTER
     else:
-        # Higher is better (default for custom callables too)
-        p_value = float((valid_null >= observed).sum() / len(valid_null))
+        lower_better = not higher_is_better
+
+    # Compute p-value with Phipson & Smyth (2010) +1 correction
+    if lower_better:
+        p_value = float(
+            ((valid_null <= observed).sum() + 1) / (len(valid_null) + 1))
+    else:
+        p_value = float(
+            ((valid_null >= observed).sum() + 1) / (len(valid_null) + 1))
 
     return PermutationResult(
         metric_name=metric_name,
@@ -463,5 +549,6 @@ def permutation_test(
         mean_null=float(np.nanmean(null_dist)),
         std_null=float(np.nanstd(null_dist)),
         n_permutations=n_permutations,
+        n_valid=len(valid_null),
         null_distribution=null_dist,
     )
