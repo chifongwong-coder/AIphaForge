@@ -108,6 +108,13 @@ from .risk import (
     MaxDrawdownHalt,
     RiskSignal,
 )
+from .significance import (
+    BootstrapResult,
+    PermutationResult,
+    bootstrap_ci,
+    bootstrap_metrics,
+    permutation_test,
+)
 from .strategies import (
     ConditionalSwitch,
     PriorityCascade,
@@ -117,7 +124,7 @@ from .strategies import (
     WeightedBlend,
 )
 
-__version__ = '1.4.0'
+__version__ = '1.5.0'
 
 __all__ = [
     # Main engine
@@ -220,6 +227,13 @@ __all__ = [
     'PriorityCascade',
     'VoteEnsemble',
     'ConditionalSwitch',
+
+    # Significance testing (v1.5)
+    'BootstrapResult',
+    'PermutationResult',
+    'bootstrap_ci',
+    'bootstrap_metrics',
+    'permutation_test',
 
     # Results
     'Trade',

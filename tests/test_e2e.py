@@ -1148,3 +1148,234 @@ class TestStrategyTree:
             meta.set_weights([0.5, 0.5])
             assert len(w) == 1
             assert "not a weighted composite" in str(w[0].message)
+
+
+# ===================================================================
+# Significance Testing (v1.5)
+# ===================================================================
+
+
+class TestSignificance:
+
+    def test_bootstrap_ci_tight_on_constant_returns(self):
+        """Low-volatility returns should produce a relatively narrow CI."""
+        # Build data with low-volatility positive returns
+        n = 252
+        rng_data = np.random.default_rng(12)
+        dates = pd.bdate_range("2024-01-01", periods=n, freq="B")
+        rets = 0.001 + 0.002 * rng_data.standard_normal(n)
+        close = 100.0 * np.cumprod(1 + rets)
+        close[0] = 100.0
+        data = pd.DataFrame({
+            "open": close,
+            "high": close * 1.002,
+            "low": close * 0.998,
+            "close": close,
+            "volume": np.full(n, 500000.0),
+        }, index=dates)
+
+        signals = pd.Series(np.nan, index=dates, dtype=float)
+        signals.iloc[0] = 1  # buy and hold
+
+        engine = BacktestEngine(
+            mode="vectorized", fee_model=ZeroFeeModel(),
+            include_benchmark=False)
+        engine.set_signals(signals)
+        result = engine.run(data)
+
+        from aiphaforge.significance import bootstrap_ci
+        ci = bootstrap_ci(result, metric="sharpe_ratio",
+                          n_bootstrap=500, random_state=42)
+        assert ci.observed > 0
+        assert ci.ci_upper - ci.ci_lower < 5.0
+
+    def test_bootstrap_ci_volatile_wider(self):
+        """High volatility data should produce a wider CI than low-vol."""
+        n = 252
+        dates = pd.bdate_range("2024-01-01", periods=n, freq="B")
+
+        # Low-volatility returns
+        rng_lo = np.random.default_rng(12)
+        rets_lo = 0.001 + 0.002 * rng_lo.standard_normal(n)
+        close_lo = 100.0 * np.cumprod(1 + rets_lo)
+        close_lo[0] = 100.0
+        data_lo = pd.DataFrame({
+            "open": close_lo, "high": close_lo * 1.002,
+            "low": close_lo * 0.998, "close": close_lo,
+            "volume": np.full(n, 500000.0),
+        }, index=dates)
+
+        # High-volatility returns
+        rng_hi = np.random.default_rng(99)
+        rets_hi = 0.001 + 0.05 * rng_hi.standard_normal(n)
+        close_hi = 100.0 * np.cumprod(1 + rets_hi)
+        close_hi[0] = 100.0
+        data_hi = pd.DataFrame({
+            "open": close_hi, "high": close_hi * 1.02,
+            "low": close_hi * 0.98, "close": close_hi,
+            "volume": np.full(n, 500000.0),
+        }, index=dates)
+
+        signals = pd.Series(np.nan, index=dates, dtype=float)
+        signals.iloc[0] = 1
+
+        from aiphaforge.significance import bootstrap_ci
+
+        engine_lo = BacktestEngine(mode="vectorized",
+                                   fee_model=ZeroFeeModel(),
+                                   include_benchmark=False)
+        engine_lo.set_signals(signals)
+        res_lo = engine_lo.run(data_lo)
+        ci_lo = bootstrap_ci(res_lo, n_bootstrap=500, random_state=42)
+
+        engine_hi = BacktestEngine(mode="vectorized",
+                                   fee_model=ZeroFeeModel(),
+                                   include_benchmark=False)
+        engine_hi.set_signals(signals)
+        res_hi = engine_hi.run(data_hi)
+        ci_hi = bootstrap_ci(res_hi, n_bootstrap=500, random_state=42)
+
+        width_lo = ci_lo.ci_upper - ci_lo.ci_lower
+        width_hi = ci_hi.ci_upper - ci_hi.ci_lower
+        assert width_hi > width_lo
+
+    def test_bootstrap_ci_max_drawdown_from_equity(self):
+        """Bootstrap max_drawdown should be in [0, 1]."""
+        data = make_ohlcv(200)
+        signals = pd.Series(np.nan, index=data.index, dtype=float)
+        signals.iloc[5] = 1
+        signals.iloc[150] = -1
+
+        engine = BacktestEngine(mode="vectorized",
+                                fee_model=ZeroFeeModel(),
+                                include_benchmark=False)
+        engine.set_signals(signals)
+        result = engine.run(data)
+
+        from aiphaforge.significance import bootstrap_ci
+        ci = bootstrap_ci(result, metric="max_drawdown",
+                          n_bootstrap=500, random_state=42)
+        assert ci.ci_lower >= 0
+        assert ci.ci_upper <= 1
+
+    def test_bootstrap_metrics_joint(self):
+        """Multiple metrics from one bootstrap share sample count."""
+        data = make_ohlcv(200)
+        signals = pd.Series(np.nan, index=data.index, dtype=float)
+        signals.iloc[5] = 1
+        signals.iloc[150] = -1
+
+        engine = BacktestEngine(mode="vectorized",
+                                fee_model=ZeroFeeModel(),
+                                include_benchmark=False)
+        engine.set_signals(signals)
+        result = engine.run(data)
+
+        from aiphaforge.significance import bootstrap_metrics
+        cis = bootstrap_metrics(
+            result,
+            metrics=["sharpe_ratio", "max_drawdown"],
+            n_bootstrap=500,
+            random_state=42,
+        )
+        assert "sharpe_ratio" in cis
+        assert "max_drawdown" in cis
+        assert len(cis["sharpe_ratio"].distribution) == 500
+        assert len(cis["max_drawdown"].distribution) == 500
+        assert cis["sharpe_ratio"].n_bootstrap == 500
+        assert cis["max_drawdown"].n_bootstrap == 500
+
+    def test_bootstrap_ci_custom_metric(self):
+        """Custom callable metric should work with bootstrap_ci."""
+        data = make_ohlcv(200)
+        signals = pd.Series(np.nan, index=data.index, dtype=float)
+        signals.iloc[5] = 1
+        signals.iloc[150] = -1
+
+        engine = BacktestEngine(mode="vectorized",
+                                fee_model=ZeroFeeModel(),
+                                include_benchmark=False)
+        engine.set_signals(signals)
+        result = engine.run(data)
+
+        from aiphaforge.significance import BootstrapResult, bootstrap_ci
+        mean_return = lambda r: float(np.mean(r))  # noqa: E731
+        ci = bootstrap_ci(result, metric=mean_return,
+                          n_bootstrap=500, random_state=42)
+        assert isinstance(ci, BootstrapResult)
+        assert ci.metric_name == "custom_0"
+
+    def test_bootstrap_ci_reproducible(self):
+        """Same random_state produces identical results."""
+        data = make_ohlcv(200)
+        signals = pd.Series(np.nan, index=data.index, dtype=float)
+        signals.iloc[5] = 1
+        signals.iloc[150] = -1
+
+        engine = BacktestEngine(mode="vectorized",
+                                fee_model=ZeroFeeModel(),
+                                include_benchmark=False)
+        engine.set_signals(signals)
+        result = engine.run(data)
+
+        from aiphaforge.significance import bootstrap_ci
+        ci1 = bootstrap_ci(result, n_bootstrap=500, random_state=123)
+        ci2 = bootstrap_ci(result, n_bootstrap=500, random_state=123)
+        assert ci1.observed == ci2.observed
+        assert ci1.ci_lower == ci2.ci_lower
+        assert ci1.ci_upper == ci2.ci_upper
+
+    def test_permutation_test_random_signal_not_significant(self):
+        """Random signals should yield a high p-value (no alpha)."""
+        data = make_ohlcv(200, trend=0.001, volatility=0.02)
+        rng = np.random.default_rng(77)
+        raw = rng.choice([1.0, -1.0, 0.0], size=len(data))
+        signals = pd.Series(raw, index=data.index, dtype=float)
+        # Convert to transition-only
+        changed = signals != signals.shift(1)
+        transition = pd.Series(np.nan, index=data.index, dtype=float)
+        transition[changed] = signals[changed]
+
+        from aiphaforge.significance import permutation_test
+        perm = permutation_test(
+            data, signals=transition, metric="sharpe_ratio",
+            n_permutations=100, random_state=42,
+            fee_model=ZeroFeeModel(), mode="vectorized",
+            include_benchmark=False,
+        )
+        # Random signal should not be significant
+        assert perm.p_value > 0.05
+
+    def test_permutation_test_with_strategy(self):
+        """Permutation test accepts a strategy object."""
+        data = make_ohlcv(200)
+
+        from aiphaforge.significance import PermutationResult, permutation_test
+        perm = permutation_test(
+            data, strategy=MACrossover(short=5, long=20),
+            metric="sharpe_ratio", n_permutations=50, random_state=42,
+            fee_model=ZeroFeeModel(), mode="vectorized",
+            include_benchmark=False,
+        )
+        assert isinstance(perm, PermutationResult)
+        assert 0.0 <= perm.p_value <= 1.0
+        assert isinstance(perm.null_distribution, np.ndarray)
+        assert len(perm.null_distribution) == 50
+
+    def test_permutation_test_max_drawdown_direction(self):
+        """max_drawdown uses lower_is_better p-value logic."""
+        data = make_ohlcv(200, trend=0.001)
+        signals = pd.Series(np.nan, index=data.index, dtype=float)
+        signals.iloc[5] = 1
+        signals.iloc[150] = -1
+
+        from aiphaforge.significance import permutation_test
+        perm = permutation_test(
+            data, signals=signals, metric="max_drawdown",
+            n_permutations=50, random_state=42,
+            fee_model=ZeroFeeModel(), mode="vectorized",
+            include_benchmark=False,
+        )
+        # p-value should be a valid probability
+        assert 0.0 <= perm.p_value <= 1.0
+        assert perm.metric_name == "max_drawdown"
