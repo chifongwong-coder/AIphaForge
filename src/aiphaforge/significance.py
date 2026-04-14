@@ -934,8 +934,19 @@ def _arch_mcs(
               reps=n_bootstrap, bootstrap='stationary',
               seed=random_state)
     mcs.compute()
-    # mcs.pvalues is a DataFrame indexed by column names (0, 1, 2, ...)
-    return mcs.pvalues.values.ravel(), mcs.included.index.tolist()
+    # mcs.pvalues is a DataFrame/Series indexed by model names.
+    # Re-map to positional order matching input columns to ensure
+    # correct alignment regardless of internal MCS sorting.
+    n_models = returns_matrix.shape[1]
+    p_values = np.ones(n_models)  # default p=1.0 for safety
+    for model_name, p_val in mcs.pvalues.items():
+        if isinstance(model_name, (int, np.integer)) and 0 <= model_name < n_models:
+            p_values[model_name] = float(p_val)
+    included = [
+        int(idx) for idx in mcs.included.index
+        if isinstance(idx, (int, np.integer)) and 0 <= idx < n_models
+    ]
+    return p_values, included
 
 
 def _build_returns_matrix_from_cache(
@@ -1138,13 +1149,23 @@ def monte_carlo_test(
     if "include_benchmark" not in engine_kwargs:
         engine_kwargs["include_benchmark"] = False
 
-    # 1b. Save pristine hooks BEFORE the observed run mutates state
+    # 1b. Validate at least one of strategy/signals is provided
+    if strategy is None and signals is None:
+        raise ValueError(
+            "At least one of 'strategy' or 'signals' must be provided. "
+            "Hooks alone cannot drive the backtest.")
+
+    # 1c. Save pristine copies BEFORE the observed run mutates state
     if hooks is not None:
         _pristine_hooks = copy.deepcopy(hooks)
     else:
         _pristine_hooks = None
+    if strategy is not None:
+        _pristine_strategy = copy.deepcopy(strategy)
+    else:
+        _pristine_strategy = None
 
-    # 1c. Run actual backtest on original data -> observed metric
+    # 1d. Run actual backtest on original data -> observed metric
     observed = _run_backtest_and_extract(
         data, strategy, signals, hooks, metric_fn, engine_kwargs)
 
@@ -1169,9 +1190,13 @@ def monte_carlo_test(
         else:
             path_kwargs = engine_kwargs
 
+        # Deep-copy strategy to reset any state mutated by hooks
+        path_strategy = (copy.deepcopy(_pristine_strategy)
+                         if _pristine_strategy is not None else None)
+
         try:
             val = _run_backtest_and_extract(
-                path_data, strategy, signals,
+                path_data, path_strategy, signals,
                 path_hooks if hooks is not None else None,
                 metric_fn, path_kwargs)
             metrics_list.append(val)
@@ -1356,6 +1381,11 @@ def multiple_comparison_correction(
         df['significant'] = p_vals >= alpha  # In MCS, high p = in confidence set
     else:
         # Bootstrap percentile test for p-values
+        if metric in _LOWER_IS_BETTER and benchmark == "zero":
+            warnings.warn(
+                f"metric='{metric}' with benchmark='zero' will always produce "
+                f"p=1.0 (drawdown is always >= 0). Use benchmark='buy_hold' "
+                f"to compare against buy-and-hold drawdown instead.")
         initial_capital = 100000  # default
         bm_metric = None
         if benchmark == "buy_hold":
