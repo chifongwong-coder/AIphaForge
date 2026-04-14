@@ -31,7 +31,7 @@ Example::
     from aiphaforge.significance import monte_carlo_test, generate_paths
 
     mc = monte_carlo_test(data, strategy=my_strategy, metric="sharpe_ratio")
-    print(f"MC 90% CI: [{mc.ci_lower:.2f}, {mc.ci_upper:.2f}]")
+    print(f"MC 5th/95th: [{mc.pct_5:.2f}, {mc.pct_95:.2f}]")
 """
 
 import copy
@@ -110,8 +110,8 @@ class MonteCarloResult:
         observed: Actual metric value on original data.
         mean: Mean across synthetic paths.
         std: Standard deviation across synthetic paths.
-        ci_lower: 5th percentile of the distribution.
-        ci_upper: 95th percentile of the distribution.
+        pct_5: 5th percentile of simulation distribution.
+        pct_95: 95th percentile of simulation distribution.
         median: Median across synthetic paths.
         n_paths: Total number of synthetic paths generated.
         n_valid: Number of paths that completed successfully.
@@ -123,8 +123,8 @@ class MonteCarloResult:
     observed: float
     mean: float
     std: float
-    ci_lower: float
-    ci_upper: float
+    pct_5: float
+    pct_95: float
     median: float
     n_paths: int
     n_valid: int
@@ -679,10 +679,11 @@ def _reconstruct_ohlcv(
 
     n = len(indices)
 
-    # Step 2: compute close-to-close returns from resampled sequence
-    resampled_close = orig_close[indices]
+    # Step 2: each bar's actual historical return from the original series
+    # (avoids spurious returns at block boundaries)
     returns = np.ones(n)
-    returns[1:] = resampled_close[1:] / resampled_close[:-1]
+    mask = indices > 0
+    returns[mask] = orig_close[indices[mask]] / orig_close[indices[mask] - 1]
 
     # Step 3: anchor at original first close, cumulative product
     anchor = data.iloc[0]["close"]
@@ -946,6 +947,10 @@ def _build_returns_matrix_from_cache(
     Internal helper used by both build_returns_matrix and
     multiple_comparison_correction.
     """
+    if '_combo_idx' not in optimize_results.columns:
+        raise ValueError(
+            "optimize_results must contain '_combo_idx' column. "
+            "Use the DataFrame returned by optimize().")
     columns = {}
     for _, row in optimize_results.iterrows():
         combo_idx = int(row['_combo_idx'])
@@ -1133,7 +1138,13 @@ def monte_carlo_test(
     if "include_benchmark" not in engine_kwargs:
         engine_kwargs["include_benchmark"] = False
 
-    # 1b. Run actual backtest on original data -> observed metric
+    # 1b. Save pristine hooks BEFORE the observed run mutates state
+    if hooks is not None:
+        _pristine_hooks = copy.deepcopy(hooks)
+    else:
+        _pristine_hooks = None
+
+    # 1c. Run actual backtest on original data -> observed metric
     observed = _run_backtest_and_extract(
         data, strategy, signals, hooks, metric_fn, engine_kwargs)
 
@@ -1145,10 +1156,10 @@ def monte_carlo_test(
     n_failures = 0
 
     for path_data in paths:
-        # Deep-copy hooks to reset agent state per path
-        if hooks is not None:
+        # Deep-copy hooks from pristine (pre-observed-run) state
+        if _pristine_hooks is not None:
             try:
-                path_hooks = copy.deepcopy(hooks)
+                path_hooks = copy.deepcopy(_pristine_hooks)
             except Exception as e:
                 raise TypeError(
                     f"Cannot deep-copy hooks for Monte Carlo test: {e}. "
@@ -1186,8 +1197,8 @@ def monte_carlo_test(
             observed=observed,
             mean=np.nan,
             std=np.nan,
-            ci_lower=np.nan,
-            ci_upper=np.nan,
+            pct_5=np.nan,
+            pct_95=np.nan,
             median=np.nan,
             n_paths=n_paths,
             n_valid=0,
@@ -1201,8 +1212,8 @@ def monte_carlo_test(
         observed=observed,
         mean=float(np.mean(valid_dist)),
         std=float(np.std(valid_dist)),
-        ci_lower=float(np.percentile(valid_dist, 5)),
-        ci_upper=float(np.percentile(valid_dist, 95)),
+        pct_5=float(np.percentile(valid_dist, 5)),
+        pct_95=float(np.percentile(valid_dist, 95)),
         median=float(np.median(valid_dist)),
         n_paths=n_paths,
         n_valid=n_valid,
@@ -1261,7 +1272,7 @@ def multiple_comparison_correction(
     method: str = "bh",
     alpha: float = 0.05,
     benchmark: str = "zero",
-    n_bootstrap: int = 1000,
+    n_bootstrap: int = 10000,
     block_size: Optional[int] = None,
     random_state: Optional[int] = None,
     trading_days: int = 252,
@@ -1298,12 +1309,20 @@ def multiple_comparison_correction(
             results_cache cannot be found.
     """
     # Input validation
+    if '_combo_idx' not in optimize_results.columns:
+        raise ValueError(
+            "optimize_results must contain '_combo_idx' column. "
+            "Use the DataFrame returned by optimize().")
     if method not in ("bonferroni", "bh", "mcs"):
         raise ValueError(
             f"Unknown method: {method!r}. "
             f"Must be 'bonferroni', 'bh', or 'mcs'.")
     if not 0 < alpha < 1:
         raise ValueError(f"alpha must be in (0, 1), got {alpha}")
+    if benchmark not in ("zero", "buy_hold"):
+        raise ValueError(
+            f"Unknown benchmark: {benchmark!r}. "
+            f"Must be 'zero' or 'buy_hold'.")
 
     # Get results_cache
     if results_cache is None:
@@ -1319,6 +1338,14 @@ def multiple_comparison_correction(
     n_tested = len(df)
 
     if method == "mcs":
+        # Note: MCS tests based on raw returns, not the specified metric.
+        # The 'significant' column for MCS means "in the Model Confidence Set"
+        # (statistically indistinguishable from the best model).
+        if metric not in ("sharpe_ratio", "total_return"):
+            warnings.warn(
+                f"MCS tests based on raw returns, not '{metric}'. "
+                f"The 'significant' column indicates membership in the "
+                f"Model Confidence Set (indistinguishable from the best).")
         # MCS via arch package
         returns_mat = _build_returns_matrix_from_cache(
             results_cache, df).values
@@ -1355,15 +1382,13 @@ def multiple_comparison_correction(
                     p = (ci.distribution <= 0).sum() / len(ci.distribution)
                 else:
                     p = (ci.distribution >= 0).sum() / len(ci.distribution)
-            elif benchmark == "buy_hold":
+            else:  # benchmark == "buy_hold" (validated above)
                 if metric in _HIGHER_IS_BETTER:
                     p = ((ci.distribution <= bm_metric).sum()
                          / len(ci.distribution))
                 else:
                     p = ((ci.distribution >= bm_metric).sum()
                          / len(ci.distribution))
-            else:
-                p = 1.0  # unknown benchmark, conservative
 
             p_values[i] = float(p)
 
@@ -1383,12 +1408,9 @@ def multiple_comparison_correction(
     best_significant = None
     if n_significant > 0:
         sig_rows = df[df['significant']]
-        if metric in _HIGHER_IS_BETTER:
-            best_row = sig_rows.sort_values(
-                metric, ascending=False).iloc[0]
-        else:
-            best_row = sig_rows.sort_values(
-                metric, ascending=True).iloc[0]
+        sort_col = metric if metric in sig_rows.columns else 'sharpe_ratio'
+        ascending = sort_col in _LOWER_IS_BETTER
+        best_row = sig_rows.sort_values(sort_col, ascending=ascending).iloc[0]
         # Extract params (exclude internal/metric columns)
         internal_cols = {
             '_combo_idx', 'sharpe_ratio', 'total_return',
