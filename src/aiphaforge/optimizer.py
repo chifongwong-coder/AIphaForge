@@ -2,13 +2,13 @@
 Parameter Optimizer
 ===================
 
-Grid search and walk-forward validation for strategy parameter tuning.
-Standalone module — uses only the public BacktestEngine API. Zero changes
-to the engine core.
+Grid search, walk-forward, and Bayesian optimization for strategy parameter
+tuning. Standalone module — uses only the public BacktestEngine API. Zero
+changes to the engine core.
 
 Usage::
 
-    from aiphaforge import optimize, walk_forward
+    from aiphaforge import optimize, walk_forward, optimize_bayesian
 
     results = optimize(
         data, signals=my_signals,
@@ -19,6 +19,7 @@ Usage::
 
 import inspect
 import itertools
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import pandas as pd
@@ -254,3 +255,204 @@ def walk_forward(
         'test_result': test_result,
         'train_metrics': train_df,
     }
+
+
+@dataclass
+class BayesianResult:
+    """Result of Bayesian parameter optimization.
+
+    Attributes:
+        best_params: Best parameter combination found.
+        best_value: Best metric value (in-sample).
+        in_sample_result: BacktestResult on training data with best params.
+        out_of_sample_result: BacktestResult on test data (None if
+            train_pct=1.0).
+        n_trials: Total number of trials executed.
+        n_failed: Trials that failed or violated constraints.
+        study: The Optuna Study object for advanced access.
+        results_df: All trials as a DataFrame.
+    """
+    best_params: Dict[str, Any]
+    best_value: float
+    in_sample_result: BacktestResult
+    out_of_sample_result: Optional[BacktestResult]
+    n_trials: int
+    n_failed: int
+    study: Any
+    results_df: pd.DataFrame
+
+
+def optimize_bayesian(
+    data: Union[pd.DataFrame, Dict[str, pd.DataFrame]],
+    param_ranges: Dict[str, tuple],
+    *,
+    strategy_factory: Callable[[Dict], Any],
+    metric: str = "sharpe_ratio",
+    direction: str = "maximize",
+    n_trials: int = 50,
+    train_pct: float = 0.7,
+    constraint_fn: Optional[Callable[[BacktestResult], bool]] = None,
+    mode: str = "vectorized",
+    random_state: Optional[int] = None,
+    **engine_kwargs: Any,
+) -> "BayesianResult":
+    """Bayesian parameter optimization via Optuna.
+
+    Automatically splits data into train/test sets to prevent
+    overfitting. Optimizes on train data, validates on test data.
+    Set train_pct=1.0 to disable the split (not recommended).
+
+    Parameters:
+        data: OHLCV data (single or multi-asset).
+        param_ranges: Dict of param_name to spec:
+            - (low, high): int range if both int, else float range
+            - [val1, val2, ...]: categorical choices
+        strategy_factory: Callable(dict) -> strategy object.
+        metric: Metric to optimize. Read from BacktestResult.metrics.
+        direction: "maximize" or "minimize".
+        n_trials: Number of Optuna trials. Default 50.
+        train_pct: Fraction of data for training (default 0.7).
+            Set to 1.0 to optimize on full data (no out-of-sample).
+        constraint_fn: Optional constraint. Receives BacktestResult,
+            returns True if the result satisfies constraints.
+            Trials that violate are marked as failed.
+            Example: lambda r: r.max_drawdown <= 0.15
+        mode: Execution mode for backtests.
+        random_state: Seed for Optuna sampler reproducibility.
+        **engine_kwargs: Fixed engine parameters.
+
+    Returns:
+        BayesianResult dataclass.
+
+    Raises:
+        ImportError: If optuna is not installed.
+    """
+    try:
+        import optuna
+    except ImportError:
+        raise ImportError(
+            "optimize_bayesian requires optuna. "
+            "Install with: pip install optuna")
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+    # Data split for overfitting protection
+    if isinstance(data, dict):
+        ref_index = next(iter(data.values())).index
+    else:
+        ref_index = data.index
+    split_pos = int(len(ref_index) * train_pct)
+    split_date = ref_index[split_pos] if split_pos < len(ref_index) else None
+
+    if isinstance(data, dict):
+        train_data: Any = {s: df.loc[:split_date] for s, df in data.items()}
+        test_data: Any = (
+            {s: df.loc[split_date:] for s, df in data.items()}
+            if split_date else None
+        )
+    else:
+        train_data = data.iloc[:split_pos]
+        test_data = data.iloc[split_pos:] if split_date else None
+
+    # Cache trial results
+    trial_cache: Dict[int, BacktestResult] = {}
+
+    def objective(trial: Any) -> float:
+        params: Dict[str, Any] = {}
+        for name, spec in param_ranges.items():
+            if isinstance(spec, tuple) and len(spec) == 2:
+                low, high = spec
+                if isinstance(low, int) and isinstance(high, int):
+                    params[name] = trial.suggest_int(name, low, high)
+                else:
+                    params[name] = trial.suggest_float(
+                        name, float(low), float(high))
+            elif isinstance(spec, list):
+                params[name] = trial.suggest_categorical(name, spec)
+            else:
+                raise ValueError(
+                    f"Invalid param spec for '{name}': {spec}. "
+                    f"Use (low, high) for ranges or [...] for choices.")
+
+        strategy = strategy_factory(params)
+        merged = {**engine_kwargs, 'mode': mode}
+        if 'include_benchmark' not in merged:
+            merged['include_benchmark'] = False
+        engine = BacktestEngine(**merged)
+        engine.set_strategy(strategy)
+        result = engine.run(train_data)
+
+        # Cache result for later retrieval
+        trial_cache[trial.number] = result
+
+        # Check constraint
+        if constraint_fn is not None and not constraint_fn(result):
+            raise optuna.TrialPruned("Constraint violated")
+
+        # Read metric from BacktestResult.metrics dict
+        value = result.metrics.get(metric)
+        if value is None:
+            # Fallback to property
+            value = getattr(result, metric, None)
+        if value is None:
+            raise ValueError(f"Metric '{metric}' not found in BacktestResult")
+        return float(value)
+
+    sampler = optuna.samplers.TPESampler(seed=random_state)
+    study = optuna.create_study(direction=direction, sampler=sampler)
+    study.optimize(objective, n_trials=n_trials, catch=(Exception,))
+
+    # Build results DataFrame
+    trials_data = []
+    for trial in study.trials:
+        row = dict(trial.params)
+        row['value'] = trial.value
+        row['trial_number'] = trial.number
+        row['state'] = trial.state.name
+        trials_data.append(row)
+    results_df = pd.DataFrame(trials_data)
+
+    n_failed = sum(
+        1 for t in study.trials
+        if t.state != optuna.trial.TrialState.COMPLETE
+    )
+
+    # Retrieve best result from cache (no re-run needed)
+    try:
+        best_trial = study.best_trial
+    except ValueError:
+        raise ValueError(
+            "All trials failed or were pruned. No best parameters found. "
+            "Check constraint_fn or strategy_factory for errors.")
+    in_sample_result = trial_cache.get(best_trial.number)
+    if in_sample_result is None:
+        # Fallback: re-run best params if cache miss
+        best_strategy = strategy_factory(study.best_params)
+        fallback_merged = {**engine_kwargs, 'mode': mode}
+        if 'include_benchmark' not in fallback_merged:
+            fallback_merged['include_benchmark'] = False
+        engine = BacktestEngine(**fallback_merged)
+        engine.set_strategy(best_strategy)
+        in_sample_result = engine.run(train_data)
+
+    # Out-of-sample validation
+    out_of_sample_result = None
+    if test_data is not None:
+        best_strategy = strategy_factory(study.best_params)
+        oos_merged = {**engine_kwargs, 'mode': mode}
+        if 'include_benchmark' not in oos_merged:
+            oos_merged['include_benchmark'] = False
+        engine = BacktestEngine(**oos_merged)
+        engine.set_strategy(best_strategy)
+        out_of_sample_result = engine.run(test_data)
+
+    return BayesianResult(
+        best_params=study.best_params,
+        best_value=study.best_value,
+        in_sample_result=in_sample_result,
+        out_of_sample_result=out_of_sample_result,
+        n_trials=len(study.trials),
+        n_failed=n_failed,
+        study=study,
+        results_df=results_df,
+    )

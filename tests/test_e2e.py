@@ -16,6 +16,7 @@ from aiphaforge import (
     BacktestEngine,
     BacktestHook,
     BacktestResult,
+    BayesianResult,
     EqualWeightAllocator,
     HookContext,
     LatencyHook,
@@ -23,7 +24,10 @@ from aiphaforge import (
     OrderStatus,
     PerformanceAnalyzer,
     Portfolio,
+    ScheduleHook,
     optimize,
+    optimize_bayesian,
+    schedule_rebalance,
     walk_forward,
 )
 from aiphaforge.capital_allocator import MarginAllocator
@@ -1625,3 +1629,233 @@ class TestMonteCarloAndCorrection:
 
         for p1, p2 in zip(paths1, paths2):
             pd.testing.assert_frame_equal(p1, p2)
+
+
+# ===================================================================
+# Bayesian Optimizer & Scheduling (v1.7)
+# ===================================================================
+
+
+class TestBayesianAndScheduling:
+
+    def test_schedule_hook_monthly(self):
+        """ScheduleHook monthly: triggers once per month over ~10 months."""
+        data = make_ohlcv(200, start_date="2024-01-01")
+        signals = pd.Series(np.nan, index=data.index, dtype=float)
+        signals.iloc[0] = 1
+
+        trigger_count = [0]
+
+        def count_callback(ctx):
+            trigger_count[0] += 1
+
+        hook = ScheduleHook("monthly", count_callback)
+        engine = BacktestEngine(
+            mode='event_driven', fee_model=ZeroFeeModel(),
+            initial_capital=100_000, hooks=[hook],
+            include_benchmark=False,
+        )
+        engine.set_signals(signals)
+        result = engine.run(data)
+
+        assert isinstance(result, BacktestResult)
+        # 200 business days ~ 10 months; expect roughly 10 monthly triggers
+        n_months = len({(ts.year, ts.month) for ts in data.index})
+        assert trigger_count[0] == n_months
+
+    def test_schedule_hook_every_n_bars(self):
+        """ScheduleHook with int frequency: triggers every N bars."""
+        data = make_ohlcv(100, start_date="2024-01-01")
+        signals = pd.Series(np.nan, index=data.index, dtype=float)
+
+        trigger_count = [0]
+
+        def count_callback(ctx):
+            trigger_count[0] += 1
+
+        hook = ScheduleHook(10, count_callback)
+        engine = BacktestEngine(
+            mode='event_driven', fee_model=ZeroFeeModel(),
+            initial_capital=100_000, hooks=[hook],
+            include_benchmark=False,
+        )
+        engine.set_signals(signals)
+        result = engine.run(data)
+
+        assert isinstance(result, BacktestResult)
+        assert trigger_count[0] == 10  # bars 0,10,20,...,90
+
+    def test_schedule_rebalance(self):
+        """schedule_rebalance completes backtest with target weights applied."""
+        data_a = make_ohlcv(100, start_price=100)
+        data_b = make_ohlcv(100, start_price=200)
+        data = {"A": data_a, "B": data_b}
+
+        # Provide signals for both assets
+        signals = {
+            sym: pd.Series(np.nan, index=df.index, dtype=float)
+            for sym, df in data.items()
+        }
+
+        hook = schedule_rebalance({"A": 0.5, "B": 0.5}, "monthly")
+        engine = BacktestEngine(
+            mode='event_driven', fee_model=ZeroFeeModel(),
+            initial_capital=100_000, hooks=[hook],
+            capital_allocator=EqualWeightAllocator(),
+            include_benchmark=False,
+        )
+        engine.set_signals(signals)
+        result = engine.run(data)
+
+        assert isinstance(result, BacktestResult)
+        # The engine should complete without errors; equity curve exists
+        assert len(result.equity_curve) > 0
+
+    def test_schedule_hook_resets_between_runs(self):
+        """ScheduleHook resets state between engine.run calls."""
+        data1 = make_ohlcv(50, start_date="2024-01-01")
+        data2 = make_ohlcv(50, start_date="2025-01-01")
+
+        signals1 = pd.Series(np.nan, index=data1.index, dtype=float)
+        signals2 = pd.Series(np.nan, index=data2.index, dtype=float)
+
+        trigger_count = [0]
+
+        def count_callback(ctx):
+            trigger_count[0] += 1
+
+        hook = ScheduleHook("monthly", count_callback)
+
+        engine = BacktestEngine(
+            mode='event_driven', fee_model=ZeroFeeModel(),
+            initial_capital=100_000, hooks=[hook],
+            include_benchmark=False,
+        )
+
+        # Run 1
+        engine.set_signals(signals1)
+        engine.run(data1)
+        count_after_run1 = trigger_count[0]
+        assert count_after_run1 > 0
+
+        # Run 2 — should trigger again (reset happened)
+        engine.set_signals(signals2)
+        engine.run(data2)
+        count_after_run2 = trigger_count[0]
+        assert count_after_run2 > count_after_run1
+
+        # Both runs should have similar trigger counts
+        n_months_1 = len({(ts.year, ts.month) for ts in data1.index})
+        n_months_2 = len({(ts.year, ts.month) for ts in data2.index})
+        assert count_after_run2 == n_months_1 + n_months_2
+
+    def test_optimize_bayesian_basic(self):
+        """Bayesian optimizer returns valid BayesianResult."""
+        pytest.importorskip("optuna")
+        data = make_ohlcv(200)
+
+        result = optimize_bayesian(
+            data,
+            param_ranges={'short': (5, 15), 'long': (20, 40)},
+            strategy_factory=lambda p: MACrossover(
+                short=p['short'], long=p['long']),
+            metric='sharpe_ratio',
+            n_trials=5,
+            train_pct=0.7,
+            fee_model=ZeroFeeModel(),
+        )
+
+        assert isinstance(result, BayesianResult)
+        assert 5 <= result.best_params['short'] <= 15
+        assert 20 <= result.best_params['long'] <= 40
+        assert isinstance(result.in_sample_result, BacktestResult)
+        assert result.out_of_sample_result is not None
+        assert isinstance(result.out_of_sample_result, BacktestResult)
+        assert result.n_trials == 5
+
+    def test_optimize_bayesian_train_pct_1(self):
+        """train_pct=1.0 disables out-of-sample split."""
+        pytest.importorskip("optuna")
+        data = make_ohlcv(100)
+
+        result = optimize_bayesian(
+            data,
+            param_ranges={'short': (5, 15), 'long': (20, 40)},
+            strategy_factory=lambda p: MACrossover(
+                short=p['short'], long=p['long']),
+            n_trials=3,
+            train_pct=1.0,
+            fee_model=ZeroFeeModel(),
+        )
+
+        assert isinstance(result, BayesianResult)
+        assert result.out_of_sample_result is None
+
+    def test_optimize_bayesian_constraint(self):
+        """constraint_fn filters trials that violate the constraint."""
+        pytest.importorskip("optuna")
+        data = make_ohlcv(200)
+
+        result = optimize_bayesian(
+            data,
+            param_ranges={'short': (5, 15), 'long': (20, 40)},
+            strategy_factory=lambda p: MACrossover(
+                short=p['short'], long=p['long']),
+            metric='sharpe_ratio',
+            n_trials=5,
+            train_pct=0.7,
+            constraint_fn=lambda r: r.max_drawdown <= 0.5,
+            fee_model=ZeroFeeModel(),
+        )
+
+        assert isinstance(result, BayesianResult)
+        # The best result should satisfy the constraint
+        assert result.in_sample_result.max_drawdown <= 0.5
+
+    def test_optimize_bayesian_import_error(self):
+        """Handles optuna availability gracefully."""
+        try:
+            import optuna  # noqa: F401
+        except ImportError:
+            # optuna not installed — verify ImportError
+            with pytest.raises(ImportError, match="optuna"):
+                optimize_bayesian(
+                    make_ohlcv(50),
+                    param_ranges={'short': (5, 15)},
+                    strategy_factory=lambda p: MACrossover(short=p['short']),
+                    n_trials=1,
+                    fee_model=ZeroFeeModel(),
+                )
+            return
+
+        # optuna IS installed — verify basic result
+        result = optimize_bayesian(
+            make_ohlcv(100),
+            param_ranges={'short': (5, 15), 'long': (20, 40)},
+            strategy_factory=lambda p: MACrossover(
+                short=p['short'], long=p['long']),
+            n_trials=3,
+            fee_model=ZeroFeeModel(),
+        )
+        assert isinstance(result, BayesianResult)
+
+    def test_optimize_bayesian_reproducible(self):
+        """Same random_state produces identical best_params."""
+        pytest.importorskip("optuna")
+        data = make_ohlcv(150)
+
+        kwargs = dict(
+            data=data,
+            param_ranges={'short': (5, 15), 'long': (20, 40)},
+            strategy_factory=lambda p: MACrossover(
+                short=p['short'], long=p['long']),
+            n_trials=5,
+            train_pct=0.7,
+            random_state=42,
+            fee_model=ZeroFeeModel(),
+        )
+
+        r1 = optimize_bayesian(**kwargs)
+        r2 = optimize_bayesian(**kwargs)
+
+        assert r1.best_params == r2.best_params
