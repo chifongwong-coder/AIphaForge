@@ -334,7 +334,9 @@ def optimize_bayesian(
             "optimize_bayesian requires optuna. "
             "Install with: pip install optuna")
 
-    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    # Validate train_pct
+    if not 0 < train_pct <= 1.0:
+        raise ValueError(f"train_pct must be in (0, 1], got {train_pct}")
 
     # Data split for overfitting protection
     if isinstance(data, dict):
@@ -342,65 +344,89 @@ def optimize_bayesian(
     else:
         ref_index = data.index
     split_pos = int(len(ref_index) * train_pct)
-    split_date = ref_index[split_pos] if split_pos < len(ref_index) else None
+
+    if split_pos == 0:
+        raise ValueError(
+            f"train_pct={train_pct} produces empty training set "
+            f"(data has {len(ref_index)} rows)")
 
     if isinstance(data, dict):
-        train_data: Any = {s: df.loc[:split_date] for s, df in data.items()}
+        train_data: Any = {s: df.iloc[:split_pos] for s, df in data.items()}
         test_data: Any = (
-            {s: df.loc[split_date:] for s, df in data.items()}
-            if split_date else None
+            {s: df.iloc[split_pos:] for s, df in data.items()}
+            if split_pos < len(ref_index) else None
         )
     else:
         train_data = data.iloc[:split_pos]
-        test_data = data.iloc[split_pos:] if split_date else None
+        test_data = data.iloc[split_pos:] if split_pos < len(ref_index) else None
 
     # Cache trial results
     trial_cache: Dict[int, BacktestResult] = {}
+    first_error: Optional[str] = None
 
     def objective(trial: Any) -> float:
-        params: Dict[str, Any] = {}
-        for name, spec in param_ranges.items():
-            if isinstance(spec, tuple) and len(spec) == 2:
-                low, high = spec
-                if isinstance(low, int) and isinstance(high, int):
-                    params[name] = trial.suggest_int(name, low, high)
+        nonlocal first_error
+        try:
+            params: Dict[str, Any] = {}
+            for name, spec in param_ranges.items():
+                if isinstance(spec, tuple) and len(spec) == 2:
+                    low, high = spec
+                    if isinstance(low, int) and isinstance(high, int):
+                        params[name] = trial.suggest_int(name, low, high)
+                    else:
+                        params[name] = trial.suggest_float(
+                            name, float(low), float(high))
+                elif isinstance(spec, list):
+                    params[name] = trial.suggest_categorical(name, spec)
                 else:
-                    params[name] = trial.suggest_float(
-                        name, float(low), float(high))
-            elif isinstance(spec, list):
-                params[name] = trial.suggest_categorical(name, spec)
-            else:
+                    raise ValueError(
+                        f"Invalid param spec for '{name}': {spec}. "
+                        f"Use (low, high) for ranges or [...] for choices.")
+
+            strategy = strategy_factory(params)
+            merged = {**engine_kwargs, 'mode': mode}
+            if 'include_benchmark' not in merged:
+                merged['include_benchmark'] = False
+            engine = BacktestEngine(**merged)
+            engine.set_strategy(strategy)
+            result = engine.run(train_data)
+
+            # Check constraint FIRST — return penalty instead of pruning
+            # so the surrogate model learns this region is bad
+            if constraint_fn is not None and not constraint_fn(result):
+                if direction == "maximize":
+                    return float('-inf')
+                else:
+                    return float('inf')
+
+            # Cache result only for valid trials
+            trial_cache[trial.number] = result
+
+            # Read metric from BacktestResult.metrics dict
+            value = result.metrics.get(metric)
+            if value is None:
+                # Fallback to property
+                value = getattr(result, metric, None)
+            if value is None:
                 raise ValueError(
-                    f"Invalid param spec for '{name}': {spec}. "
-                    f"Use (low, high) for ranges or [...] for choices.")
-
-        strategy = strategy_factory(params)
-        merged = {**engine_kwargs, 'mode': mode}
-        if 'include_benchmark' not in merged:
-            merged['include_benchmark'] = False
-        engine = BacktestEngine(**merged)
-        engine.set_strategy(strategy)
-        result = engine.run(train_data)
-
-        # Cache result for later retrieval
-        trial_cache[trial.number] = result
-
-        # Check constraint
-        if constraint_fn is not None and not constraint_fn(result):
-            raise optuna.TrialPruned("Constraint violated")
-
-        # Read metric from BacktestResult.metrics dict
-        value = result.metrics.get(metric)
-        if value is None:
-            # Fallback to property
-            value = getattr(result, metric, None)
-        if value is None:
-            raise ValueError(f"Metric '{metric}' not found in BacktestResult")
-        return float(value)
+                    f"Metric '{metric}' not found in BacktestResult")
+            return float(value)
+        except optuna.TrialPruned:
+            raise  # Let Optuna handle pruned trials
+        except Exception as e:
+            if first_error is None:
+                first_error = str(e)
+            raise  # Re-raise so Optuna marks it as FAIL
 
     sampler = optuna.samplers.TPESampler(seed=random_state)
     study = optuna.create_study(direction=direction, sampler=sampler)
-    study.optimize(objective, n_trials=n_trials, catch=(Exception,))
+
+    prev_verbosity = optuna.logging.get_verbosity()
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    try:
+        study.optimize(objective, n_trials=n_trials, catch=(Exception,))
+    finally:
+        optuna.logging.set_verbosity(prev_verbosity)
 
     # Build results DataFrame
     trials_data = []
@@ -418,12 +444,10 @@ def optimize_bayesian(
     )
 
     # Retrieve best result from cache (no re-run needed)
-    try:
-        best_trial = study.best_trial
-    except ValueError:
+    if all(t.state != optuna.trial.TrialState.COMPLETE for t in study.trials):
         raise ValueError(
-            "All trials failed or were pruned. No best parameters found. "
-            "Check constraint_fn or strategy_factory for errors.")
+            f"All {n_trials} trials failed. First error: {first_error}")
+    best_trial = study.best_trial
     in_sample_result = trial_cache.get(best_trial.number)
     if in_sample_result is None:
         # Fallback: re-run best params if cache miss

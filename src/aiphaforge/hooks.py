@@ -132,6 +132,9 @@ class BacktestHook(ABC):
         pass
 
 
+_VALID_FREQUENCIES = {"daily", "weekly", "monthly", "quarterly"}
+
+
 class ScheduleHook(BacktestHook):
     """Execute a callback on a periodic schedule.
 
@@ -158,6 +161,13 @@ class ScheduleHook(BacktestHook):
         callback: Callable[[HookContext], None],
         start_delay: int = 0,
     ) -> None:
+        if isinstance(frequency, str) and frequency not in _VALID_FREQUENCIES:
+            raise ValueError(
+                f"Unknown frequency: {frequency!r}. "
+                f"Must be one of {_VALID_FREQUENCIES} or an integer.")
+        if isinstance(frequency, int) and frequency < 1:
+            raise ValueError(
+                f"Integer frequency must be >= 1, got {frequency}")
         self.frequency = frequency
         self.callback = callback
         self.start_delay = start_delay
@@ -240,6 +250,8 @@ def schedule_rebalance(
     target weights. Non-trigger bars use normal strategy signals.
     Requires event-driven mode with MetaController.
     """
+    weights = dict(weights)  # defensive copy
+
     def _rebalance(ctx: HookContext) -> None:
         if ctx.meta:
             ctx.meta.set_target_weights(weights)
