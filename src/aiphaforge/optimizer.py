@@ -268,7 +268,8 @@ class BayesianResult:
         out_of_sample_result: BacktestResult on test data (None if
             train_pct=1.0).
         n_trials: Total number of trials executed.
-        n_failed: Trials that failed or violated constraints.
+        n_failed: Trials that failed (exception) or violated constraints.
+            Equal to n_trials minus the number of valid results.
         study: The Optuna Study object for advanced access.
         results_df: All trials as a DataFrame.
     """
@@ -438,31 +439,34 @@ def optimize_bayesian(
         trials_data.append(row)
     results_df = pd.DataFrame(trials_data)
 
-    n_failed = sum(
-        1 for t in study.trials
-        if t.state != optuna.trial.TrialState.COMPLETE
-    )
-
-    # Retrieve best result from cache (no re-run needed)
-    if all(t.state != optuna.trial.TrialState.COMPLETE for t in study.trials):
+    # Filter to valid trials: COMPLETE and in cache (constraint-satisfying)
+    valid_trials = [
+        t for t in study.trials
+        if t.state == optuna.trial.TrialState.COMPLETE
+        and t.number in trial_cache
+    ]
+    n_failed = len(study.trials) - len(valid_trials)
+    if not valid_trials:
         raise ValueError(
-            f"All {n_trials} trials failed. First error: {first_error}")
-    best_trial = study.best_trial
-    in_sample_result = trial_cache.get(best_trial.number)
-    if in_sample_result is None:
-        # Fallback: re-run best params if cache miss
-        best_strategy = strategy_factory(study.best_params)
-        fallback_merged = {**engine_kwargs, 'mode': mode}
-        if 'include_benchmark' not in fallback_merged:
-            fallback_merged['include_benchmark'] = False
-        engine = BacktestEngine(**fallback_merged)
-        engine.set_strategy(best_strategy)
-        in_sample_result = engine.run(train_data)
+            f"No valid trials found ({n_trials} attempted). "
+            f"All trials either failed or violated constraints. "
+            f"First error: {first_error}")
 
-    # Out-of-sample validation
+    # Find best among valid trials
+    if direction == "maximize":
+        best_trial = max(valid_trials, key=lambda t: t.value)
+    else:
+        best_trial = min(valid_trials, key=lambda t: t.value)
+
+    in_sample_result = trial_cache[best_trial.number]
+
+    # Out-of-sample validation using the valid best trial's params
+    best_params = best_trial.params
+    best_value = best_trial.value
+
     out_of_sample_result = None
     if test_data is not None:
-        best_strategy = strategy_factory(study.best_params)
+        best_strategy = strategy_factory(best_params)
         oos_merged = {**engine_kwargs, 'mode': mode}
         if 'include_benchmark' not in oos_merged:
             oos_merged['include_benchmark'] = False
@@ -471,8 +475,8 @@ def optimize_bayesian(
         out_of_sample_result = engine.run(test_data)
 
     return BayesianResult(
-        best_params=study.best_params,
-        best_value=study.best_value,
+        best_params=best_params,
+        best_value=best_value,
         in_sample_result=in_sample_result,
         out_of_sample_result=out_of_sample_result,
         n_trials=len(study.trials),
