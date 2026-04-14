@@ -25,21 +25,41 @@ AIphaForge also works perfectly well as a general-purpose backtest framework for
 ### Multi-Asset
 - **Shared capital pool** (event-driven) or **weighted split** (vectorized)
 - **Capital allocators**: EqualWeight, FixedWeight, ProRata, Margin — or build your own via `BaseCapitalAllocator`
-- **Per-asset overrides**: Fee models, fill models, margin configs, lot sizes, and position limits per symbol via `resolve_config()` pattern
+- **Per-asset overrides**: Fee models, fill models, margin configs, lot sizes, and position limits per symbol
 - **Per-asset PnL attribution**: Gross PnL time series, correlation matrix, per-asset Sharpe
 
 ### Margin & Leverage
 - **Unified margin mode**: `initial_margin_ratio=1.0` is cash-only, `0.5` is 2x leverage, `0.1` is 10x
 - **Margin calls**: Portfolio-level `MarginCallExitRule` with forced liquidation
 - **Periodic costs**: `BorrowingCostModel` (entry-based for longs, market-value for shorts), `FundingRateModel` (perpetual futures)
-- **Buying power**: Equity-based formula, distinguishes open vs close orders, blocks new opens during margin call
 
 ### AI Agent Integration
 - **Hook framework**: `on_pre_signal` / `on_bar` callbacks with full broker and portfolio access
+- **MetaController**: Agent dynamically adjusts strategy, risk, sizing, and target weights mid-backtest via `ctx.meta`
+- **Strategy composition tree**: `WeightedBlend`, `SelectBest`, `PriorityCascade`, `VoteEnsemble`, `ConditionalSwitch` — composable strategy nodes that work with MetaController
 - **Latency simulation**: `LatencyHook` models LLM inference delay (fixed, statistical, or custom distributions)
-- **Per-symbol routing**: `SymbolRoutingLatencyHook` for different latency per asset
-- **Convenience subclass**: `SimpleLatencyHook` — override `make_decision()` for quick agent prototyping
-- **Multi-asset hooks**: Single-asset and multi-asset HookContext shapes, dual-path broker proxy
+- **Multi-timeframe**: `secondary_data` for daily trend analysis while executing on minute bars
+- **Scheduled rebalancing**: `ScheduleHook` for periodic callbacks (daily/weekly/monthly/quarterly/N-bar)
+
+### Technical Indicators & Strategies
+- **25 indicators**: SMA, EMA, WMA, DEMA, TEMA, MACD, ADX, Parabolic SAR, Supertrend, Ichimoku, RSI, ROC, Stochastic, CCI, Williams %R, MFI, StochRSI, Bollinger Bands, ATR, Keltner, Donchian, VWAP, OBV, A/D Line, CMF
+- **19 strategy templates**: 13 leaf strategies (MA Crossover, MACD, RSI Mean Reversion, Bollinger, Supertrend, etc.) + 6 composite strategy nodes
+- **One-line backtest**: `MACrossover(short=10, long=30).backtest(data, fee_model='china')`
+
+### Risk Management
+- **Composable risk rules**: `CompositeRiskManager` with `MaxDrawdownHalt`, `ExposureLimit`, `DailyLossLimit`, `ConcentrationLimit`
+- **Agent-controlled risk**: MetaController adjusts stop-loss, take-profit, sizing, and signals per bar
+
+### Parameter Optimization
+- **Grid search**: `optimize()` with walk-forward validation
+- **Bayesian optimization**: `optimize_bayesian()` via Optuna with automatic train/test split, constraint support, and trial caching (optional dependency)
+
+### Statistical Significance Testing
+- **Bootstrap CI**: `bootstrap_ci()` / `bootstrap_metrics()` — stationary block bootstrap (Politis-Romano) for Sharpe, drawdown, and custom metrics
+- **Permutation test**: `permutation_test()` — shuffle signal timing to test alpha significance (Phipson-Smyth corrected p-values)
+- **Monte Carlo simulation**: `monte_carlo_test()` — generate synthetic market paths, run strategy/agent on each to test robustness
+- **Multiple comparison correction**: `multiple_comparison_correction()` — Bonferroni, Benjamini-Hochberg, or Model Confidence Set (optional `arch` dependency)
+- **Path generation**: `generate_paths()` — block bootstrap or parametric normal synthetic OHLCV data
 
 ### Costs & Fees
 - **Multi-market presets**: US stocks, China A-shares, crypto spot, crypto futures — `get_fee_model("china")`
@@ -55,118 +75,103 @@ AIphaForge also works perfectly well as a general-purpose backtest framework for
 
 ## Quick Start
 
-### Single-Asset Backtest
+### Strategy One-Line Backtest
 
 ```python
-from aiphaforge import BacktestEngine, backtest
+from aiphaforge.strategies import MACrossover
 
-result = backtest(
-    data,                          # pd.DataFrame with OHLCV columns
-    signals=my_signals,            # pd.Series: 1=buy, -1=sell, 0=flat, NaN=hold
-    fee_model='crypto',
-    initial_capital=100000,
-    stop_loss=0.05
-)
+result = MACrossover(short=10, long=30).backtest(data, fee_model='china')
 print(result.summary())
 ```
 
-### Multi-Asset Backtest
+### Signal-Based Backtest
 
 ```python
-from aiphaforge import BacktestEngine, EqualWeightAllocator
-
-data = {
-    "600519.SH": maotai_df,
-    "000858.SZ": wuliangye_df,
-    "601318.SH": pingan_df,
-}
-signals = {sym: sig_series for sym, sig_series in ...}
+from aiphaforge import BacktestEngine
 
 engine = BacktestEngine(
-    fee_model='china',
-    mode='event_driven',
-    initial_capital=1_000_000,
-    capital_allocator=EqualWeightAllocator(),
-    asset_lot_sizes={"600519.SH": 100, "000858.SZ": 100, "601318.SH": 100},
+    fee_model='crypto',
+    initial_capital=100000,
+    stop_loss=0.05,
 )
-engine.set_signals(signals)
-result = engine.run(data)
-print(result.per_asset_pnl)
-```
-
-### Target-Weight Rebalancing
-
-```python
-weights = {
-    "2024-01-01": {"AAPL": 0.3, "TSLA": 0.2, "GOOG": 0.5},
-    "2024-02-01": {"AAPL": 0.4, "TSLA": 0.1, "GOOG": 0.5},
-}
-engine = BacktestEngine(mode='event_driven', initial_capital=500_000)
-engine.set_target_weights(weights)
-result = engine.run({"AAPL": aapl_df, "TSLA": tsla_df, "GOOG": goog_df})
-```
-
-### Leveraged Trading with Margin
-
-```python
-from aiphaforge import BacktestEngine, MarginAllocator
-from aiphaforge.margin import MarginConfig, BorrowingCostModel, MarginCallExitRule
-
-engine = BacktestEngine(
-    fee_model='china',
-    mode='event_driven',
-    initial_capital=100_000,
-    margin_config=MarginConfig(
-        initial_margin_ratio=0.5,        # 2x leverage
-        maintenance_margin_ratio=0.65,   # A-share 130% maintenance line
-        borrowing_rate=0.08,
-    ),
-    capital_allocator=MarginAllocator(),
-    portfolio_exit_rules=[MarginCallExitRule("largest_first")],
-    periodic_cost_model=BorrowingCostModel(),
-)
-```
-
-### AI Agent with Latency Simulation
-
-```python
-from aiphaforge import BacktestEngine, BacktestHook, LatencyHook, HookContext
-
-class AgentHook(BacktestHook):
-    def __init__(self, agent):
-        self.agent = agent
-
-    def on_pre_signal(self, ctx: HookContext):
-        decision = self.agent.analyze(ctx.data, ctx.portfolio)
-        if decision.action == 'buy':
-            order = ctx.broker.create_market_order(
-                ctx.symbol, 'buy', decision.size, 'agent', ctx.timestamp)
-            ctx.broker.submit_order(order, ctx.timestamp)
-
-# 3-bar latency to simulate LLM inference delay
-latency_hook = LatencyHook(
-    inner_hook=AgentHook(my_agent),
-    latency_model="fixed",
-    latency_params={"bars": 3},
-)
-
-engine = BacktestEngine(mode='event_driven', hooks=[latency_hook])
-engine.set_signals(signals)
+engine.set_signals(signals)  # pd.Series: 1=buy, -1=sell, 0=flat, NaN=hold
 result = engine.run(data)
 ```
 
-### Continuous Signals with Transform
+### AI Agent with MetaController
 
 ```python
-import numpy as np
+from aiphaforge import BacktestEngine, BacktestHook
+from aiphaforge.strategies import WeightedBlend, MACrossover, RSIMeanReversion
 
-# Z-score signals clipped to [-1, 1]
+class AdaptiveAgent(BacktestHook):
+    def on_pre_signal(self, ctx):
+        if ctx.meta:
+            vol = ctx.data['close'].pct_change().std()
+            if vol > 0.03:
+                ctx.meta.set_weights([0.3, 0.7])  # favor mean reversion
+            else:
+                ctx.meta.set_weights([0.7, 0.3])  # favor trend
+
+tree = WeightedBlend(
+    children=[MACrossover(), RSIMeanReversion()],
+    weights=[0.5, 0.5],
+)
+
 engine = BacktestEngine(
     mode='event_driven',
-    signal_transform=lambda s: np.clip(s, -1, 1),
+    hooks=[AdaptiveAgent()],
 )
-engine.set_signals(zscore_signals)  # values like -2.3, 0.5, 1.8, ...
+engine.set_strategy(tree)
 result = engine.run(data)
+```
+
+### Monthly Rebalancing
+
+```python
+from aiphaforge import BacktestEngine
+from aiphaforge.hooks import schedule_rebalance
+
+engine = BacktestEngine(
+    mode='event_driven',
+    hooks=[schedule_rebalance({"AAPL": 0.5, "TSLA": 0.5}, "monthly")],
+)
+result = engine.run({"AAPL": aapl_df, "TSLA": tsla_df})
+```
+
+### Statistical Validation
+
+```python
+from aiphaforge.significance import bootstrap_ci, permutation_test, monte_carlo_test
+
+# Confidence interval on Sharpe ratio
+ci = bootstrap_ci(result, metric="sharpe_ratio", confidence=0.95)
+print(f"Sharpe: {ci.observed:.2f} [{ci.ci_lower:.2f}, {ci.ci_upper:.2f}]")
+
+# Is the strategy's alpha significant?
+perm = permutation_test(data, strategy=MACrossover(), n_permutations=1000)
+print(f"p-value: {perm.p_value:.4f}")
+
+# Monte Carlo robustness (agent re-executes on synthetic paths)
+mc = monte_carlo_test(data, strategy=tree, hooks=[AdaptiveAgent()], n_paths=500)
+print(f"MC Sharpe: {mc.mean:.2f} ± {mc.std:.2f}, worst: {mc.worst_case:.2f}")
+```
+
+### Bayesian Parameter Optimization
+
+```python
+from aiphaforge.optimizer import optimize_bayesian
+
+result = optimize_bayesian(
+    data,
+    param_ranges={'short': (5, 30), 'long': (20, 80), 'ma_type': ['sma', 'ema']},
+    strategy_factory=lambda p: MACrossover(**p),
+    n_trials=50,
+    train_pct=0.7,  # automatic overfitting protection
+)
+print(f"Best: {result.best_params}")
+print(f"In-sample Sharpe:  {result.in_sample_result.sharpe_ratio:.2f}")
+print(f"Out-of-sample:     {result.out_of_sample_result.sharpe_ratio:.2f}")
 ```
 
 ## Installation
@@ -175,37 +180,21 @@ result = engine.run(data)
 pip install aiphaforge
 ```
 
+Optional dependencies:
+
+```bash
+pip install aiphaforge[plot]          # matplotlib for visualization
+pip install aiphaforge[data]          # yfinance for data loading
+pip install aiphaforge[optimize]      # optuna for Bayesian optimization
+pip install aiphaforge[significance]  # arch for Model Confidence Set
+pip install aiphaforge[all]           # everything
+```
+
 ### Requirements
 
 - Python >= 3.10
-- pandas
-- numpy
-
-## Project Structure
-
-```
-src/aiphaforge/
-├── engine.py              # Backtest engine orchestrator
-├── config.py              # BacktestConfig dataclass
-├── core_vectorized.py     # Vectorized execution core
-├── core_event_driven.py   # Event-driven execution core (unified single/multi-asset)
-├── capital_allocator.py   # Capital allocation (EqualWeight, FixedWeight, ProRata, Margin)
-├── margin.py              # Margin/leverage (MarginConfig, MarginCall, BorrowingCost, FundingRate)
-├── corporate_actions.py   # Dividend and stock split handling
-├── exit_rules.py          # Stop-loss / take-profit modules
-├── costs.py               # Trade cost modules (vectorized mode)
-├── position_sizing.py     # Position sizing modules
-├── broker.py              # Order execution and fill simulation
-├── portfolio.py           # Position, cash, and margin tracking
-├── orders.py              # Order types and lifecycle management
-├── fees.py                # Multi-market fee models
-├── hooks.py               # Hook framework (HookContext with single/multi-asset shapes)
-├── latency.py             # Agent latency simulation (single + multi-asset)
-├── risk.py                # Risk manager ABC
-├── results.py             # Result data structures
-├── performance.py         # Performance analysis and reporting
-└── utils.py               # Common utilities and financial calculations
-```
+- pandas >= 1.5
+- numpy >= 1.23
 
 ## Fee Models
 
@@ -218,25 +207,6 @@ src/aiphaforge/
 | `SimpleFeeModel` | Generic | Flat commission rate |
 | `ZeroFeeModel` | Testing | No fees |
 
-## Performance Analysis
-
-```python
-from aiphaforge import PerformanceAnalyzer, compare_strategies
-
-analyzer = PerformanceAnalyzer(result)
-print(analyzer.summary())
-
-# Per-asset analysis (multi-asset backtests)
-per_asset = analyzer.per_asset_analysis()
-corr = analyzer.correlation_matrix()
-
-# Compare multiple strategies
-comparison = compare_strategies({
-    'Momentum': momentum_result,
-    'MeanRevert': mean_revert_result,
-})
-```
-
 ## Testing
 
 ```bash
@@ -245,8 +215,8 @@ pytest tests/ -v
 
 ## License
 
-MIT
+This project is licensed under the [GNU General Public License v3.0](LICENSE) — you are free to use, modify, and distribute this software, but any derivative work must also be distributed under the same license.
 
 ## Contributing
 
-Contributions are welcome! Please open an issue or submit a pull request.
+Contributions are welcome! Please open an issue or submit a pull request. By contributing, you agree that your contributions will be licensed under the GPL v3.
