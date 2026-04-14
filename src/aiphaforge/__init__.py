@@ -110,9 +110,15 @@ from .risk import (
 )
 from .significance import (
     BootstrapResult,
+    CorrectionResult,
+    MonteCarloResult,
     PermutationResult,
     bootstrap_ci,
     bootstrap_metrics,
+    build_returns_matrix,
+    generate_paths,
+    monte_carlo_test,
+    multiple_comparison_correction,
     permutation_test,
 )
 from .strategies import (
@@ -124,7 +130,7 @@ from .strategies import (
     WeightedBlend,
 )
 
-__version__ = '1.5.0'
+__version__ = '1.6.0'
 
 __all__ = [
     # Main engine
@@ -234,6 +240,14 @@ __all__ = [
     'bootstrap_ci',
     'bootstrap_metrics',
     'permutation_test',
+
+    # Monte Carlo & Multiple Comparison Correction (v1.6)
+    'MonteCarloResult',
+    'CorrectionResult',
+    'generate_paths',
+    'monte_carlo_test',
+    'multiple_comparison_correction',
+    'build_returns_matrix',
 
     # Results
     'Trade',
