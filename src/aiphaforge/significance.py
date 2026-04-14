@@ -934,16 +934,16 @@ def _arch_mcs(
               reps=n_bootstrap, bootstrap='stationary',
               seed=random_state)
     mcs.compute()
-    # mcs.pvalues is a DataFrame/Series indexed by model names.
-    # Re-map to positional order matching input columns to ensure
-    # correct alignment regardless of internal MCS sorting.
+    # mcs.pvalues is a DataFrame with column 'Pvalue', indexed by
+    # model names (integers 0, 1, 2, ...). Extract via the column.
     n_models = returns_matrix.shape[1]
     p_values = np.ones(n_models)  # default p=1.0 for safety
-    for model_name, p_val in mcs.pvalues.items():
+    for model_name, p_val in mcs.pvalues['Pvalue'].items():
         if isinstance(model_name, (int, np.integer)) and 0 <= model_name < n_models:
-            p_values[model_name] = float(p_val)
+            p_values[int(model_name)] = float(p_val)
+    # mcs.included is a plain list of model names (integers)
     included = [
-        int(idx) for idx in mcs.included.index
+        int(idx) for idx in mcs.included
         if isinstance(idx, (int, np.integer)) and 0 <= idx < n_models
     ]
     return p_values, included

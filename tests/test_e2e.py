@@ -1566,29 +1566,30 @@ class TestMonteCarloAndCorrection:
         assert len(corr.results) == 4
 
     def test_multiple_comparison_mcs_import_error(self):
-        """MCS raises ImportError with helpful message if arch not installed."""
+        """MCS raises ImportError if arch not installed, or runs if installed."""
         from aiphaforge.significance import multiple_comparison_correction
 
-        data = make_ohlcv(100)
-        signals = pd.Series(np.nan, index=data.index, dtype=float)
-        signals.iloc[5] = 1
-        signals.iloc[80] = -1
+        data = make_ohlcv(200)
 
+        # Use strategy_factory with diverse params for MCS to have
+        # distinguishable return streams
         results = optimize(
             data,
-            param_grid={'stop_loss': [0.03, 0.05]},
-            signals=signals,
+            param_grid={'short': [5, 10, 20], 'long': [30, 50]},
+            strategy_factory=lambda p: MACrossover(**p),
             fee_model=ZeroFeeModel(),
             include_benchmark=False,
         )
 
         try:
             corr = multiple_comparison_correction(
-                results, data, method="mcs", alpha=0.05,
+                results, data, method="mcs", alpha=0.10,
                 n_bootstrap=100, random_state=42,
             )
-            # arch IS installed — just verify it returned something
+            # arch IS installed — verify basic structure
             assert corr.method == "mcs"
+            assert 'p_value' in corr.results.columns
+            assert 'significant' in corr.results.columns
         except ImportError as e:
             assert "arch" in str(e)
             assert "pip install arch" in str(e)
