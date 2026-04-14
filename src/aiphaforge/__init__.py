@@ -80,7 +80,9 @@ from .fees import (
 from .hooks import (
     BacktestHook,
     HookContext,
+    ScheduleHook,
     SecondaryTimeframe,
+    schedule_rebalance,
 )
 from .latency import LatencyHook, SimpleLatencyHook, SymbolRoutingLatencyHook
 from .margin import (
@@ -92,7 +94,7 @@ from .margin import (
     PeriodicCostModel,
 )
 from .meta import MetaContext
-from .optimizer import optimize, walk_forward
+from .optimizer import BayesianResult, optimize, optimize_bayesian, walk_forward
 from .orders import Order, OrderManager, OrderSide, OrderStatus, OrderType
 from .performance import PerformanceAnalyzer, analyze, compare_strategies
 from .portfolio import Portfolio, Position
@@ -130,7 +132,7 @@ from .strategies import (
     WeightedBlend,
 )
 
-__version__ = '1.6.0'
+__version__ = '1.7.0'
 
 __all__ = [
     # Main engine
@@ -186,6 +188,8 @@ __all__ = [
     'HookContext',
     'BacktestHook',
     'SecondaryTimeframe',
+    'ScheduleHook',
+    'schedule_rebalance',
     'LatencyHook',
     'SimpleLatencyHook',
     'SymbolRoutingLatencyHook',
@@ -215,6 +219,8 @@ __all__ = [
     'TurnoverConfig',
     'optimize',
     'walk_forward',
+    'optimize_bayesian',
+    'BayesianResult',
 
     # Risk management
     'BaseRiskManager',
