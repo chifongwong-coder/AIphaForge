@@ -1386,7 +1386,9 @@ def multiple_comparison_correction(
                 f"metric='{metric}' with benchmark='zero' will always produce "
                 f"p=1.0 (drawdown is always >= 0). Use benchmark='buy_hold' "
                 f"to compare against buy-and-hold drawdown instead.")
-        initial_capital = 100000  # default
+        # Read initial_capital from the first cached result
+        first_idx = int(df.iloc[0]['_combo_idx'])
+        initial_capital = results_cache[first_idx].initial_capital
         bm_metric = None
         if benchmark == "buy_hold":
             bm_metric = _compute_benchmark_metric(
