@@ -194,13 +194,35 @@ class TrailingStopLoss(BaseExitRule):
 
     Parameters:
         trail_percent: Trail distance as fraction (e.g. 0.05 = 5%).
+        conservative: If True, check trigger BEFORE updating watermark
+            with current bar's high/low. This avoids the intra-bar
+            look-ahead issue where the stop ratchets using the current
+            bar's extreme then triggers on the same bar's opposite
+            extreme. Default False (standard behavior, matches most
+            backtesting frameworks).
+        fill_mode: How the close order is filled when triggered.
+            ``"next_bar"`` (default): Submit GTC market order, fills
+            at next bar's open. Consistent with PercentageStopLoss.
+            ``"immediate"``: Submit IOC market order for same-bar
+            fill via the engine's immediate fill channel.
     """
 
-    def __init__(self, trail_percent: float):
+    def __init__(
+        self,
+        trail_percent: float,
+        conservative: bool = False,
+        fill_mode: str = "next_bar",
+    ):
         if not 0 < trail_percent < 1:
             raise ValueError(
                 f"trail_percent must be in (0, 1), got {trail_percent}")
+        if fill_mode not in ("next_bar", "immediate"):
+            raise ValueError(
+                f"fill_mode must be 'next_bar' or 'immediate', "
+                f"got {fill_mode!r}")
         self.trail_percent = trail_percent
+        self.conservative = conservative
+        self.fill_mode = fill_mode
         self._watermarks: Dict[str, float] = {}
 
     def check_event_driven(
@@ -214,7 +236,6 @@ class TrailingStopLoss(BaseExitRule):
         """Check and execute trailing stop in event-driven mode."""
         position = portfolio.get_position(symbol)
         if position is None or position.size == 0:
-            # No position: clear watermark if exists
             self._watermarks.pop(symbol, None)
             return
 
@@ -222,23 +243,48 @@ class TrailingStopLoss(BaseExitRule):
         low = bar['low']
 
         if position.size > 0:  # long
-            wm = max(self._watermarks.get(symbol, high), high)
-            self._watermarks[symbol] = wm
-            stop_level = wm * (1 - self.trail_percent)
-            if low <= stop_level:
+            old_wm = self._watermarks.get(symbol, high)
+            new_wm = max(old_wm, high)
+
+            if self.conservative:
+                # Check trigger using OLD watermark (before this bar's update)
+                stop_level = old_wm * (1 - self.trail_percent)
+                triggered = low <= stop_level
+                self._watermarks[symbol] = new_wm
+            else:
+                # Standard: update first, then check (most frameworks)
+                self._watermarks[symbol] = new_wm
+                stop_level = new_wm * (1 - self.trail_percent)
+                triggered = low <= stop_level
+
+            if triggered:
+                tif = 'IOC' if self.fill_mode == 'immediate' else 'GTC'
                 order = broker.create_market_order(
                     symbol, 'sell', abs(position.size),
-                    'trailing_stop_exit', timestamp)
+                    'trailing_stop_exit', timestamp,
+                    time_in_force=tif)
                 broker.submit_order(order, timestamp)
                 self._watermarks.pop(symbol, None)
+
         else:  # short
-            wm = min(self._watermarks.get(symbol, low), low)
-            self._watermarks[symbol] = wm
-            stop_level = wm * (1 + self.trail_percent)
-            if high >= stop_level:
+            old_wm = self._watermarks.get(symbol, low)
+            new_wm = min(old_wm, low)
+
+            if self.conservative:
+                stop_level = old_wm * (1 + self.trail_percent)
+                triggered = high >= stop_level
+                self._watermarks[symbol] = new_wm
+            else:
+                self._watermarks[symbol] = new_wm
+                stop_level = new_wm * (1 + self.trail_percent)
+                triggered = high >= stop_level
+
+            if triggered:
+                tif = 'IOC' if self.fill_mode == 'immediate' else 'GTC'
                 order = broker.create_market_order(
                     symbol, 'buy', abs(position.size),
-                    'trailing_stop_exit', timestamp)
+                    'trailing_stop_exit', timestamp,
+                    time_in_force=tif)
                 broker.submit_order(order, timestamp)
                 self._watermarks.pop(symbol, None)
 

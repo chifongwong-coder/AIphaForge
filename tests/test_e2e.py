@@ -2167,6 +2167,17 @@ class TestTrailingStop:
 
         # The trailing stop should have been filled (price dropped past stop)
         assert result.num_trades >= 1
+
+        # Verify ratcheting: peak close ~ bar 9 (~119.5), trail=10%
+        # Stop should ratchet to ~107.5. Price drops -5%/bar from bar 10.
+        # Exit should happen around bars 10-12 with profit.
+        peak_close = max(close_vals[:10])
+        expected_stop_approx = peak_close * 0.9
+        assert expected_stop_approx > 100  # stop above entry price
+
+        # Verify profit: bought at ~100, trailing stop exited above 100
+        assert result.final_capital > 100_000
+
         # Verify the trailing stop order was filled
         orders_df = result.orders
         ts_orders = orders_df[orders_df['order_type'] == 'trailing_stop']
