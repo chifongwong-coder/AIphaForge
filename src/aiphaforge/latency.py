@@ -174,6 +174,14 @@ class LatencyHook(BacktestHook):
                 raise ValueError(
                     f"fixed latency requires 'bars' >= 0, got {bars!r}"
                 )
+            if bars == 0:
+                import warnings as _w
+                _w.warn(
+                    "bars=0 means zero decision latency (same as bars=1). "
+                    "In practice, agent decisions always have latency. "
+                    "Consider bars=1 or higher for realistic simulation.",
+                    stacklevel=4,
+                )
         elif model == "statistical":
             dist = params.get("distribution")
             if dist not in ("normal", "uniform"):
@@ -503,30 +511,41 @@ class SimpleLatencyHook(LatencyHook):
 # ---------------------------------------------------------------------------
 
 class SymbolRoutingLatencyHook(LatencyHook):
-    """LatencyHook subclass that routes delay calculation by symbol.
+    """LatencyHook with per-symbol execution delay on top of decision delay.
 
-    Different assets can have different latency profiles (e.g., an LLM
-    agent may take longer to analyze Chinese stocks than US stocks).
-    This hook lets you specify per-symbol overrides while sharing a
-    single inner hook instance.
+    Total delay for orders = decision delay (base) + execution delay (per-symbol).
+    Meta operations only have decision delay (no execution delay).
+
+    The base latency model (``default_latency_model``) represents the
+    agent's **decision latency** (inference time). This applies equally
+    to all orders and meta operations.
+
+    The ``symbol_overrides`` represent **execution latency** per symbol
+    (e.g., different markets have different order routing times). This
+    is **additive** on top of the decision delay and only applies to
+    orders, not meta operations.
 
     Parameters:
-        inner_hook: The hook whose orders will be delayed.
-        default_latency_model: Default latency model for unmatched symbols.
-        default_latency_params: Default latency parameters.
-        symbol_overrides: Mapping of symbol to ``(model, params)`` tuples.
+        inner_hook: The hook whose actions will be delayed.
+        default_latency_model: Decision latency model (base).
+        default_latency_params: Decision latency parameters.
+        symbol_overrides: Per-symbol execution delay. Mapping of
+            symbol to ``(model, params)`` tuples. Additive on top of
+            decision delay. Symbols not listed get 0 execution delay.
 
     Example::
 
         hook = SymbolRoutingLatencyHook(
             inner_hook=agent_hook,
             default_latency_model="fixed",
-            default_latency_params={"bars": 3},
+            default_latency_params={"bars": 3},   # decision: 3 bars
             symbol_overrides={
-                "AAPL": ("fixed", {"bars": 1}),
-                "600519.SH": ("fixed", {"bars": 5}),
+                "600519.SH": ("fixed", {"bars": 2}),  # +2 execution
             },
         )
+        # AAPL order:   3 + 0 = 3 bars total
+        # 600519 order: 3 + 2 = 5 bars total
+        # Meta ops:     3 bars (decision only)
     """
 
     def __init__(
@@ -556,26 +575,40 @@ class SymbolRoutingLatencyHook(LatencyHook):
                 ) from exc
 
     def _calculate_delay(self, bar_index: int, ctx: HookContext) -> int:
-        """Route delay calculation by the current order's symbol."""
+        """Compute total delay = decision delay + execution delay.
+
+        Decision delay comes from the base latency model (same for all
+        symbols and meta ops). Execution delay comes from per-symbol
+        overrides (additive, only applies to orders).
+
+        For meta operations (_current_order is None), only the decision
+        delay is used — meta ops have no execution delay.
+        """
+        # Base decision delay (always applies)
+        base_delay = super()._calculate_delay(bar_index, ctx)
+
+        # Add per-symbol execution delay for orders
         order = self._current_order
         if order is not None and order.symbol in self._symbol_overrides:
             model, params = self._symbol_overrides[order.symbol]
-            value = self._calculate_delay_for_model(bar_index, ctx, model, params)
-            # Apply same guard+clamp as base class for custom callables
+            exec_value = self._calculate_delay_for_model(
+                bar_index, ctx, model, params)
+            # Guard+clamp for custom callables
             if model == "custom":
-                if not isinstance(value, (int, float)) or math.isnan(value) or math.isinf(value):
+                if not isinstance(exec_value, (int, float)) or math.isnan(exec_value) or math.isinf(exec_value):
                     raise ValueError(
-                        f"Custom latency callable returned invalid value: {value}"
+                        f"Custom latency callable returned invalid value: {exec_value}"
                     )
-                clamped = max(1, int(value))
-                if clamped != int(value) and not self._warned_custom_clamp:
+                exec_value = max(0, int(exec_value))
+                if exec_value != int(exec_value) and not self._warned_custom_clamp:
                     warnings.warn(
-                        f"Custom latency callable returned {value} at bar "
-                        f"{bar_index}, clamped to {clamped} (minimum delay "
-                        f"is 1 bar). Further clamp warnings suppressed.",
+                        f"Custom latency callable returned {exec_value} at bar "
+                        f"{bar_index}, clamped to {max(0, int(exec_value))} "
+                        f"(minimum execution delay is 0). "
+                        f"Further clamp warnings suppressed.",
                         stacklevel=2,
                     )
                     self._warned_custom_clamp = True
-                return clamped
-            return value
-        return super()._calculate_delay(bar_index, ctx)
+            return base_delay + exec_value
+
+        return base_delay
