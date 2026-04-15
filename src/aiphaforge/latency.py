@@ -563,6 +563,7 @@ class SymbolRoutingLatencyHook(LatencyHook):
         self._symbol_overrides: Dict[str, Tuple[str, Dict[str, Any]]] = (
             symbol_overrides or {}
         )
+        self._warned_exec_custom_clamp = False
 
         # Validate each override's parameters eagerly
         for sym, (model, params) in self._symbol_overrides.items():
@@ -573,6 +574,17 @@ class SymbolRoutingLatencyHook(LatencyHook):
                 raise ValueError(
                     f"Invalid override for symbol {sym!r}: {exc}"
                 ) from exc
+
+    def on_backtest_start(
+        self,
+        data: Any,
+        symbol: str,
+        *,
+        config: Any = None,
+    ) -> None:
+        """Reset execution delay warning flag, then forward to base."""
+        self._warned_exec_custom_clamp = False
+        super().on_backtest_start(data, symbol, config=config)
 
     def _calculate_delay(self, bar_index: int, ctx: HookContext) -> int:
         """Compute total delay = decision delay + execution delay.
@@ -600,7 +612,7 @@ class SymbolRoutingLatencyHook(LatencyHook):
                         f"Custom latency callable returned invalid value: {exec_value}"
                     )
                 clamped = max(0, int(exec_value))
-                if clamped != int(exec_value) and not self._warned_custom_clamp:
+                if clamped != int(exec_value) and not self._warned_exec_custom_clamp:
                     warnings.warn(
                         f"Custom execution latency callable returned "
                         f"{exec_value} at bar {bar_index}, clamped to "
@@ -608,7 +620,7 @@ class SymbolRoutingLatencyHook(LatencyHook):
                         f"Further clamp warnings suppressed.",
                         stacklevel=2,
                     )
-                    self._warned_custom_clamp = True
+                    self._warned_exec_custom_clamp = True
                 exec_value = clamped
             return base_delay + exec_value
 
