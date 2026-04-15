@@ -257,3 +257,212 @@ def schedule_rebalance(
             ctx.meta.set_target_weights(weights)
 
     return ScheduleHook(frequency, _rebalance, start_delay)
+
+
+class DriftRebalanceHook(BacktestHook):
+    """Rebalance when portfolio drifts from target weights.
+
+    Checks each bar whether max(|actual_weight - target_weight|)
+    exceeds the threshold. If so, rebalances to target.
+
+    Parameters:
+        target_weights: Target allocation. Either:
+            - Dict[str, float]: static weights
+            - Callable(HookContext) -> Dict[str, float]: dynamic weights
+        threshold: Max single-asset drift before triggering (e.g., 0.05 = 5%).
+        min_interval: Minimum bars between rebalances (cooldown).
+    """
+
+    def __init__(
+        self,
+        target_weights: Union[Dict[str, float], Callable],
+        threshold: float = 0.05,
+        min_interval: int = 1,
+    ) -> None:
+        if callable(target_weights):
+            self._get_weights = target_weights
+        else:
+            weights = dict(target_weights)
+            self._get_weights = lambda ctx: weights
+        self.threshold = threshold
+        self.min_interval = min_interval
+        self._last_rebalance_bar: int = -999
+
+    def on_backtest_start(
+        self,
+        data: pd.DataFrame,
+        symbol: str,
+        *,
+        config: Any = None,
+    ) -> None:
+        self._last_rebalance_bar = -999
+        if config and hasattr(config, 'mode') and config.mode == 'vectorized':
+            import warnings
+            warnings.warn(
+                "DriftRebalanceHook has no effect in vectorized mode. "
+                "Use mode='event_driven'.")
+
+    def on_pre_signal(self, context: HookContext) -> None:
+        if context.bar_index - self._last_rebalance_bar < self.min_interval:
+            return
+        if context.meta is None:
+            return
+
+        target = self._get_weights(context)
+        current = context.portfolio.get_weights()
+
+        max_drift = 0.0
+        for sym, target_w in target.items():
+            actual_w = current.get(sym, 0.0)
+            max_drift = max(max_drift, abs(actual_w - target_w))
+
+        # Assets in portfolio but not in target should be 0
+        for sym in current:
+            if sym not in target:
+                max_drift = max(max_drift, abs(current[sym]))
+
+        if max_drift >= self.threshold:
+            context.meta.set_target_weights(target)
+            self._last_rebalance_bar = context.bar_index
+
+
+class BandRebalanceHook(BacktestHook):
+    """Rebalance only assets that drift beyond a per-asset band.
+
+    Assets within their band are not touched. Only drifted assets
+    are rebalanced to their target weight. Runs on a schedule.
+
+    Parameters:
+        target_weights: Static dict or callable(HookContext) -> dict.
+        band: Allowed drift per asset (e.g., 0.03 = +/-3%).
+        frequency: Check frequency (same as ScheduleHook).
+    """
+
+    def __init__(
+        self,
+        target_weights: Union[Dict[str, float], Callable],
+        band: float = 0.03,
+        frequency: Union[str, int] = "monthly",
+    ) -> None:
+        if callable(target_weights):
+            self._get_weights = target_weights
+        else:
+            weights = dict(target_weights)
+            self._get_weights = lambda ctx: weights
+        self.band = band
+        self._schedule = ScheduleHook(frequency, self._check_bands)
+
+    def on_backtest_start(
+        self,
+        data: pd.DataFrame,
+        symbol: str,
+        *,
+        config: Any = None,
+    ) -> None:
+        self._schedule.on_backtest_start(data, symbol, config=config)
+
+    def on_pre_signal(self, context: HookContext) -> None:
+        self._schedule.on_pre_signal(context)
+
+    def _check_bands(self, ctx: HookContext) -> None:
+        if ctx.meta is None:
+            return
+        target = self._get_weights(ctx)
+        current = ctx.portfolio.get_weights()
+
+        adjusted: Dict[str, float] = {}
+        needs_rebalance = False
+        for sym, target_w in target.items():
+            actual_w = current.get(sym, 0.0)
+            if abs(actual_w - target_w) > self.band:
+                adjusted[sym] = target_w
+                needs_rebalance = True
+            else:
+                adjusted[sym] = actual_w
+
+        if not needs_rebalance:
+            return
+
+        # No normalization — set_target_weights handles partial
+        # allocation. Weights may not sum to exactly 1.0 since
+        # in-band assets keep their current (slightly drifted) values.
+        ctx.meta.set_target_weights(adjusted)
+
+
+class CostAwareRebalanceHook(BacktestHook):
+    """Rebalance only if expected benefit exceeds transaction costs.
+
+    Compares the drift magnitude against the estimated trading cost.
+    Only triggers when the benefit of rebalancing (reducing drift)
+    outweighs the cost of trading.
+
+    Parameters:
+        target_weights: Static dict or callable(HookContext) -> dict.
+        frequency: Check frequency.
+        fee_rate: Estimated round-trip fee rate (default 0.002 = 0.2%).
+            Used to compute the cost of the weight changes.
+        min_drift: Minimum total drift (turnover) to even consider
+            rebalancing (default 0.01 = 1%). Skips cost calculation
+            if drift is negligible.
+    """
+
+    def __init__(
+        self,
+        target_weights: Union[Dict[str, float], Callable],
+        frequency: Union[str, int] = "monthly",
+        fee_rate: float = 0.002,
+        min_drift: float = 0.01,
+    ) -> None:
+        if callable(target_weights):
+            self._get_weights = target_weights
+        else:
+            weights = dict(target_weights)
+            self._get_weights = lambda ctx: weights
+        self.fee_rate = fee_rate
+        self.min_drift = min_drift
+        self._schedule = ScheduleHook(frequency, self._evaluate)
+
+    def on_backtest_start(
+        self,
+        data: pd.DataFrame,
+        symbol: str,
+        *,
+        config: Any = None,
+    ) -> None:
+        self._schedule.on_backtest_start(data, symbol, config=config)
+
+    def on_pre_signal(self, context: HookContext) -> None:
+        self._schedule.on_pre_signal(context)
+
+    def _evaluate(self, ctx: HookContext) -> None:
+        if ctx.meta is None:
+            return
+        target = self._get_weights(ctx)
+        current = ctx.portfolio.get_weights()
+
+        # Total turnover (sum of absolute weight changes)
+        turnover = sum(
+            abs(current.get(sym, 0.0) - target_w)
+            for sym, target_w in target.items()
+        )
+        for sym in current:
+            if sym not in target:
+                turnover += abs(current[sym])
+
+        if turnover < self.min_drift:
+            return  # drift too small to bother
+
+        # Benefit: reduction in tracking error variance (sum of drift^2)
+        benefit = sum(
+            (current.get(sym, 0.0) - target_w) ** 2
+            for sym, target_w in target.items()
+        )
+        for sym in current:
+            if sym not in target:
+                benefit += current[sym] ** 2
+
+        # Cost: estimated trading cost
+        cost = turnover * self.fee_rate
+
+        if benefit > cost:
+            ctx.meta.set_target_weights(target)

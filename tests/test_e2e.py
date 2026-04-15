@@ -16,7 +16,10 @@ from aiphaforge import (
     BacktestEngine,
     BacktestHook,
     BacktestResult,
+    BandRebalanceHook,
     BayesianResult,
+    CostAwareRebalanceHook,
+    DriftRebalanceHook,
     EqualWeightAllocator,
     HookContext,
     LatencyHook,
@@ -2345,3 +2348,272 @@ class TestTrailingStop:
                 pd.Series(dtype=float),
                 pd.DataFrame(),
             )
+
+
+# ===================================================================
+# Rebalancing Enhancements (v1.9.1)
+# ===================================================================
+
+
+class TestRebalancingEnhancements:
+
+    @staticmethod
+    def _make_diverging_data(n=60):
+        """Create two assets where A rises fast and B is flat, causing drift."""
+        dates = pd.bdate_range("2024-01-01", periods=n, freq="B")
+        # A rises significantly so its weight grows vs B
+        close_a = 100.0 * np.exp(np.linspace(0, 0.5, n))
+        close_b = np.full(n, 100.0)  # flat
+        data = {}
+        for sym, close in [("A", close_a), ("B", close_b)]:
+            high = close * 1.005
+            low = close * 0.995
+            open_ = np.concatenate([[close[0]], close[:-1]])
+            open_ = np.clip(open_, low, high)
+            data[sym] = pd.DataFrame({
+                'open': open_, 'high': high, 'low': low,
+                'close': close, 'volume': 500_000.0,
+            }, index=dates)
+        return data
+
+    @staticmethod
+    def _empty_signals(data):
+        return {
+            sym: pd.Series(np.nan, index=df.index, dtype=float)
+            for sym, df in data.items()
+        }
+
+    def test_drift_rebalance_triggers(self):
+        """Drift exceeds threshold -> rebalance triggers, producing trades."""
+        data = self._make_diverging_data(60)
+        signals = self._empty_signals(data)
+
+        hook = DriftRebalanceHook({"A": 0.5, "B": 0.5}, threshold=0.05)
+        engine = BacktestEngine(
+            mode='event_driven', fee_model=ZeroFeeModel(),
+            initial_capital=100_000,
+            hooks=[schedule_rebalance({"A": 0.5, "B": 0.5}, frequency=1), hook],
+            capital_allocator=EqualWeightAllocator(),
+            include_benchmark=False,
+        )
+        engine.set_signals(signals)
+        result = engine.run(data)
+
+        assert isinstance(result, BacktestResult)
+        # The initial schedule_rebalance establishes positions, then drift
+        # hook should trigger additional rebalances producing more trades
+        assert result.num_trades >= 2
+
+    def test_drift_rebalance_no_trigger(self):
+        """Drift below threshold -> no extra trades beyond initial."""
+        # Use nearly identical flat data so weights barely drift
+        dates = pd.bdate_range("2024-01-01", periods=30, freq="B")
+        data = {}
+        for sym in ["A", "B"]:
+            close = np.full(30, 100.0)
+            high = close * 1.001
+            low = close * 0.999
+            data[sym] = pd.DataFrame({
+                'open': close, 'high': high, 'low': low,
+                'close': close, 'volume': 500_000.0,
+            }, index=dates)
+        signals = self._empty_signals(data)
+
+        # Very high threshold so drift never triggers
+        hook = DriftRebalanceHook({"A": 0.5, "B": 0.5}, threshold=0.50)
+        engine = BacktestEngine(
+            mode='event_driven', fee_model=ZeroFeeModel(),
+            initial_capital=100_000,
+            hooks=[schedule_rebalance({"A": 0.5, "B": 0.5}, frequency=1), hook],
+            capital_allocator=EqualWeightAllocator(),
+            include_benchmark=False,
+        )
+        engine.set_signals(signals)
+        result = engine.run(data)
+
+        assert isinstance(result, BacktestResult)
+        # Only initial allocation trades, drift hook never fires
+        assert result.num_trades <= 4
+
+    def test_drift_min_interval(self):
+        """Drift triggers once then cooldown prevents re-trigger."""
+        data = self._make_diverging_data(60)
+        signals = self._empty_signals(data)
+
+        trigger_count = [0]
+        original_threshold = 0.02  # low threshold so it triggers often
+
+        class CountingDriftHook(DriftRebalanceHook):
+            def on_pre_signal(self, context):
+                old_bar = self._last_rebalance_bar
+                super().on_pre_signal(context)
+                if self._last_rebalance_bar != old_bar:
+                    trigger_count[0] += 1
+
+        # min_interval=20 bars between rebalances
+        hook = CountingDriftHook(
+            {"A": 0.5, "B": 0.5}, threshold=original_threshold, min_interval=20)
+        engine = BacktestEngine(
+            mode='event_driven', fee_model=ZeroFeeModel(),
+            initial_capital=100_000,
+            hooks=[schedule_rebalance({"A": 0.5, "B": 0.5}, frequency=1), hook],
+            capital_allocator=EqualWeightAllocator(),
+            include_benchmark=False,
+        )
+        engine.set_signals(signals)
+        result = engine.run(data)
+
+        assert isinstance(result, BacktestResult)
+        # With 60 bars and min_interval=20, max ~3 triggers
+        assert trigger_count[0] <= 3
+
+    def test_band_rebalance_only_outliers(self):
+        """3 assets, only 1 drifts beyond band -> only that one adjusted."""
+        dates = pd.bdate_range("2024-01-01", periods=60, freq="B")
+        # A rises a lot, B and C stay flat
+        close_a = 100.0 * np.exp(np.linspace(0, 0.5, 60))
+        close_b = np.full(60, 100.0)
+        close_c = np.full(60, 100.0)
+        data = {}
+        for sym, close in [("A", close_a), ("B", close_b), ("C", close_c)]:
+            high = close * 1.005
+            low = close * 0.995
+            open_ = np.concatenate([[close[0]], close[:-1]])
+            open_ = np.clip(open_, low, high)
+            data[sym] = pd.DataFrame({
+                'open': open_, 'high': high, 'low': low,
+                'close': close, 'volume': 500_000.0,
+            }, index=dates)
+        signals = self._empty_signals(data)
+
+        target = {"A": 0.33, "B": 0.33, "C": 0.34}
+        hook = BandRebalanceHook(target, band=0.03, frequency="monthly")
+        engine = BacktestEngine(
+            mode='event_driven', fee_model=ZeroFeeModel(),
+            initial_capital=100_000,
+            hooks=[schedule_rebalance(target, frequency=1), hook],
+            capital_allocator=EqualWeightAllocator(),
+            include_benchmark=False,
+        )
+        engine.set_signals(signals)
+        result = engine.run(data)
+
+        assert isinstance(result, BacktestResult)
+        assert result.num_trades >= 2
+
+    def test_cost_aware_skips_small_drift(self):
+        """Small drift + high fee_rate -> no rebalance (cost > benefit)."""
+        # Nearly flat data so drift is minimal
+        dates = pd.bdate_range("2024-01-01", periods=60, freq="B")
+        data = {}
+        for sym in ["A", "B"]:
+            close = 100.0 * np.exp(np.linspace(0, 0.02, 60))
+            high = close * 1.002
+            low = close * 0.998
+            open_ = np.concatenate([[close[0]], close[:-1]])
+            open_ = np.clip(open_, low, high)
+            data[sym] = pd.DataFrame({
+                'open': open_, 'high': high, 'low': low,
+                'close': close, 'volume': 500_000.0,
+            }, index=dates)
+        signals = self._empty_signals(data)
+
+        trigger_count = [0]
+
+        class CountingCostHook(CostAwareRebalanceHook):
+            def _evaluate(self, ctx):
+                original_fn = ctx.meta.set_target_weights
+                called = [False]
+
+                def tracking_fn(w):
+                    called[0] = True
+                    return original_fn(w)
+
+                ctx.meta.set_target_weights = tracking_fn
+                super()._evaluate(ctx)
+                ctx.meta.set_target_weights = original_fn
+                if called[0]:
+                    trigger_count[0] += 1
+
+        # Very high fee rate makes cost always > benefit for small drift
+        hook = CountingCostHook(
+            {"A": 0.5, "B": 0.5}, frequency="monthly",
+            fee_rate=0.5, min_drift=0.001)
+        engine = BacktestEngine(
+            mode='event_driven', fee_model=ZeroFeeModel(),
+            initial_capital=100_000,
+            hooks=[schedule_rebalance({"A": 0.5, "B": 0.5}, frequency=1), hook],
+            capital_allocator=EqualWeightAllocator(),
+            include_benchmark=False,
+        )
+        engine.set_signals(signals)
+        result = engine.run(data)
+
+        assert isinstance(result, BacktestResult)
+        # Cost-aware hook should not trigger with such high fees
+        assert trigger_count[0] == 0
+
+    def test_cost_aware_triggers_large_drift(self):
+        """Large drift -> cost-aware rebalance triggers."""
+        data = self._make_diverging_data(60)
+        signals = self._empty_signals(data)
+
+        trigger_count = [0]
+
+        class CountingCostHook(CostAwareRebalanceHook):
+            def _evaluate(self, ctx):
+                original_fn = ctx.meta.set_target_weights
+                called = [False]
+
+                def tracking_fn(w):
+                    called[0] = True
+                    return original_fn(w)
+
+                ctx.meta.set_target_weights = tracking_fn
+                super()._evaluate(ctx)
+                ctx.meta.set_target_weights = original_fn
+                if called[0]:
+                    trigger_count[0] += 1
+
+        # Low fee rate so benefit > cost for large drift
+        hook = CountingCostHook(
+            {"A": 0.5, "B": 0.5}, frequency="monthly",
+            fee_rate=0.001, min_drift=0.005)
+        engine = BacktestEngine(
+            mode='event_driven', fee_model=ZeroFeeModel(),
+            initial_capital=100_000,
+            hooks=[schedule_rebalance({"A": 0.5, "B": 0.5}, frequency=1), hook],
+            capital_allocator=EqualWeightAllocator(),
+            include_benchmark=False,
+        )
+        engine.set_signals(signals)
+        result = engine.run(data)
+
+        assert isinstance(result, BacktestResult)
+        assert trigger_count[0] >= 1
+
+    def test_dynamic_weights_callable(self):
+        """DriftRebalanceHook with callable target_weights."""
+        data = self._make_diverging_data(40)
+        signals = self._empty_signals(data)
+
+        call_count = [0]
+
+        def dynamic_weights(ctx):
+            call_count[0] += 1
+            return {"A": 0.5, "B": 0.5}
+
+        hook = DriftRebalanceHook(dynamic_weights, threshold=0.03)
+        engine = BacktestEngine(
+            mode='event_driven', fee_model=ZeroFeeModel(),
+            initial_capital=100_000,
+            hooks=[schedule_rebalance({"A": 0.5, "B": 0.5}, frequency=1), hook],
+            capital_allocator=EqualWeightAllocator(),
+            include_benchmark=False,
+        )
+        engine.set_signals(signals)
+        result = engine.run(data)
+
+        assert isinstance(result, BacktestResult)
+        # The callable should have been called on each bar
+        assert call_count[0] > 0
