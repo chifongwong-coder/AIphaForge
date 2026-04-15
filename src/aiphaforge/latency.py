@@ -50,10 +50,54 @@ class _CapturingBrokerProxy:
 
 
 # ---------------------------------------------------------------------------
+# Internal meta proxy
+# ---------------------------------------------------------------------------
+
+class _CapturingMetaProxy:
+    """Wraps a real MetaContext, capturing mutable method calls.
+
+    Non-callable attributes (bools, dicts, etc.) always pass through
+    to the real MetaContext — this is safe because reading an attribute
+    is never a mutation.
+
+    Callable attributes (methods) are captured by default, EXCEPT
+    those in ``_READ_ONLY_METHODS`` which are known query methods.
+
+    This design:
+    - Correctly handles attribute reads (e.g., ``_suppress``, ``_strategy``)
+    - Captures new mutable methods added to MetaContext in the future
+    - Forwards known read-only methods (``get_children``, ``_is_composite``)
+    """
+
+    _READ_ONLY_METHODS = {
+        'get_children', '_is_composite',
+    }
+
+    def __init__(self, real_meta: Any) -> None:
+        object.__setattr__(self, '_real_meta', real_meta)
+        object.__setattr__(self, 'captured_ops', [])
+
+    def __getattr__(self, name: str) -> Any:
+        attr = getattr(self._real_meta, name)
+        if not callable(attr):
+            # Non-callable (bool, dict, list, object, etc.): pass through.
+            # Properties like current_strategy, audit_log resolve here.
+            return attr
+        if name in self._READ_ONLY_METHODS:
+            # Known read-only method: forward directly.
+            return attr
+        # Callable and not read-only: capture for delayed replay.
+        def _capture(*args: Any, **kwargs: Any) -> None:
+            self.captured_ops.append((name, args, kwargs))
+        return _capture
+
+
+# ---------------------------------------------------------------------------
 # Queued-order record
 # ---------------------------------------------------------------------------
 
 _QueuedOrder = Tuple[int, Order, Any]  # (submit_at_bar, order, decision_timestamp)
+_MetaQueueEntry = Tuple[int, List[Tuple[str, tuple, dict]], Any]  # (submit_at_bar, meta_ops, decision_timestamp)
 
 
 # ---------------------------------------------------------------------------
@@ -97,7 +141,8 @@ class LatencyHook(BacktestHook):
         self.inner_hook = inner_hook
         self.latency_model = latency_model
         self.latency_params: Dict[str, Any] = latency_params or {}
-        self._queue: Deque[_QueuedOrder] = deque()
+        self._order_queue: Deque[_QueuedOrder] = deque()
+        self._meta_queue: Deque[_MetaQueueEntry] = deque()
         self._warned_signal_conflict = False
         self._warned_custom_clamp = False
         self._current_order: Optional[Order] = None
@@ -118,9 +163,9 @@ class LatencyHook(BacktestHook):
         """
         if model == "fixed":
             bars = params.get("bars", 1)
-            if not isinstance(bars, int) or bars < 1:
+            if not isinstance(bars, int) or bars < 0:
                 raise ValueError(
-                    f"fixed latency requires 'bars' >= 1, got {bars!r}"
+                    f"fixed latency requires 'bars' >= 0, got {bars!r}"
                 )
         elif model == "statistical":
             dist = params.get("distribution")
@@ -156,7 +201,8 @@ class LatencyHook(BacktestHook):
         config: Any = None,
     ) -> None:
         """Validate execution mode and forward to the inner hook."""
-        self._queue.clear()
+        self._order_queue.clear()
+        self._meta_queue.clear()
         self._warned_signal_conflict = False
         self._warned_custom_clamp = False
 
@@ -198,28 +244,51 @@ class LatencyHook(BacktestHook):
             self._on_pre_signal_single(context)
 
     def _on_pre_signal_single(self, context: HookContext) -> None:
-        """Single-asset path: proxy context.broker."""
+        """Single-asset path: proxy context.broker and context.meta."""
         proxy = _CapturingBrokerProxy(context.broker)
-        proxied_ctx = dataclasses.replace(context, broker=proxy)
+        meta_proxy = (
+            _CapturingMetaProxy(context.meta)
+            if context.meta is not None else None
+        )
+        proxied_ctx = dataclasses.replace(
+            context,
+            broker=proxy,
+            meta=meta_proxy if meta_proxy is not None else context.meta,
+        )
         self.inner_hook.on_pre_signal(proxied_ctx)
 
+        # Queue captured orders (per-order delay, same as before)
         for order, ts in proxy.captured_orders:
             self._current_order = order
             delay = self._calculate_delay(context.bar_index, context)
             self._current_order = None
             submit_at = context.bar_index + delay - 1
             decision_ts = context.timestamp
-            self._queue.append((submit_at, order, decision_ts))
+            self._order_queue.append((submit_at, order, decision_ts))
 
-        self._flush_ready_orders(context)
+        # Queue captured meta ops (one batch, default delay)
+        if meta_proxy is not None and meta_proxy.captured_ops:
+            delay = self._calculate_delay(context.bar_index, context)
+            submit_at = context.bar_index + delay - 1
+            self._meta_queue.append(
+                (submit_at, list(meta_proxy.captured_ops), context.timestamp))
+
+        self._flush_ready_actions(context)
 
     def _on_pre_signal_multi(self, context: HookContext) -> None:
-        """Multi-asset path: proxy all brokers in context.all_brokers."""
+        """Multi-asset path: proxy all brokers and meta."""
         proxied_brokers = {}
         for sym, broker in context.all_brokers.items():
             proxied_brokers[sym] = _CapturingBrokerProxy(broker)
+        meta_proxy = (
+            _CapturingMetaProxy(context.meta)
+            if context.meta is not None else None
+        )
         proxied_ctx = dataclasses.replace(
-            context, all_brokers=proxied_brokers)
+            context,
+            all_brokers=proxied_brokers,
+            meta=meta_proxy if meta_proxy is not None else context.meta,
+        )
         self.inner_hook.on_pre_signal(proxied_ctx)
 
         # Collect captured orders from all proxies
@@ -231,27 +300,54 @@ class LatencyHook(BacktestHook):
                 self._current_order = None
                 submit_at = context.bar_index + delay - 1
                 decision_ts = context.timestamp
-                self._queue.append((submit_at, order, decision_ts))
+                self._order_queue.append((submit_at, order, decision_ts))
 
-        self._flush_ready_orders(context)
+        # Queue captured meta ops (one batch, default delay)
+        if meta_proxy is not None and meta_proxy.captured_ops:
+            delay = self._calculate_delay(context.bar_index, context)
+            submit_at = context.bar_index + delay - 1
+            self._meta_queue.append(
+                (submit_at, list(meta_proxy.captured_ops), context.timestamp))
+
+        self._flush_ready_actions(context)
 
     def on_bar(self, context: HookContext) -> None:
         """Forward to the inner hook (no proxying needed)."""
         self.inner_hook.on_bar(context)
 
     def on_backtest_end(self) -> None:
-        """Forward to the inner hook."""
+        """Warn about pending queue items, then forward to the inner hook."""
+        n_pending = len(self._order_queue) + len(self._meta_queue)
+        if n_pending > 0:
+            warnings.warn(
+                f"LatencyHook: {n_pending} queued actions were not "
+                f"executed (backtest ended before delay elapsed).")
+        self._order_queue.clear()
+        self._meta_queue.clear()
         self.inner_hook.on_backtest_end()
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _flush_ready_orders(self, context: HookContext) -> None:
-        """Submit queued orders that are due on or before the current bar."""
-        remaining: Deque[_QueuedOrder] = deque()
-        while self._queue:
-            submit_at, order, decision_ts = self._queue.popleft()
+    def _flush_ready_actions(self, context: HookContext) -> None:
+        """Flush meta operations and orders that are due on or before the current bar."""
+        # 1. Flush meta queue first (strategy changes take effect before orders)
+        remaining_meta: Deque[_MetaQueueEntry] = deque()
+        while self._meta_queue:
+            submit_at, meta_ops, decision_ts = self._meta_queue.popleft()
+            if submit_at <= context.bar_index:
+                if context.meta is not None:
+                    for method_name, args, kwargs in meta_ops:
+                        getattr(context.meta, method_name)(*args, **kwargs)
+            else:
+                remaining_meta.append((submit_at, meta_ops, decision_ts))
+        self._meta_queue = remaining_meta
+
+        # 2. Then flush order queue (submit orders)
+        remaining_orders: Deque[_QueuedOrder] = deque()
+        while self._order_queue:
+            submit_at, order, decision_ts = self._order_queue.popleft()
             if submit_at <= context.bar_index:
                 # Preserve decision-time TIF semantics
                 if order.created_time is None:
@@ -264,8 +360,8 @@ class LatencyHook(BacktestHook):
                 else:
                     context.broker.submit_order(order, decision_ts)
             else:
-                remaining.append((submit_at, order, decision_ts))
-        self._queue = remaining
+                remaining_orders.append((submit_at, order, decision_ts))
+        self._order_queue = remaining_orders
 
     @staticmethod
     def _calculate_delay_for_model(
