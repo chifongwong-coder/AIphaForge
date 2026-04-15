@@ -239,6 +239,22 @@ class TrailingStopLoss(BaseExitRule):
             self._watermarks.pop(symbol, None)
             return
 
+        # Guard: warn and skip if a broker-level TRAILING_STOP order
+        # already exists for this symbol (avoid double close)
+        from .orders import OrderType
+        pending = broker.get_pending_orders(symbol)
+        has_broker_trailing = any(
+            o.order_type == OrderType.TRAILING_STOP for o in pending)
+        if has_broker_trailing:
+            import warnings
+            warnings.warn(
+                f"TrailingStopLoss: skipping {symbol} — a TRAILING_STOP "
+                f"broker order is already pending. Use either the exit "
+                f"rule OR broker orders, not both.",
+                stacklevel=2,
+            )
+            return
+
         high = bar['high']
         low = bar['low']
 
