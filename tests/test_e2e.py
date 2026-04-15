@@ -2535,10 +2535,11 @@ class TestRebalancingEnhancements:
                 if called[0]:
                     trigger_count[0] += 1
 
-        # Very high fee rate makes cost always > benefit for small drift
+        # Very high fee rate × high multiplier → threshold so high
+        # that small drift never exceeds it
         hook = CountingCostHook(
             {"A": 0.5, "B": 0.5}, frequency="monthly",
-            fee_rate=0.5, min_drift=0.001)
+            fee_rate=0.5, cost_multiplier=5.0)
         engine = BacktestEngine(
             mode='event_driven', fee_model=ZeroFeeModel(),
             initial_capital=100_000,
@@ -2575,10 +2576,10 @@ class TestRebalancingEnhancements:
                 if called[0]:
                     trigger_count[0] += 1
 
-        # Low fee rate so benefit > cost for large drift
+        # Low fee rate × low multiplier → small threshold, large drift exceeds it
         hook = CountingCostHook(
             {"A": 0.5, "B": 0.5}, frequency="monthly",
-            fee_rate=0.001, min_drift=0.005)
+            fee_rate=0.001, cost_multiplier=5.0)
         engine = BacktestEngine(
             mode='event_driven', fee_model=ZeroFeeModel(),
             initial_capital=100_000,

@@ -390,15 +390,16 @@ class CostAwareRebalanceHook(BacktestHook):
     Only triggers when the total turnover (sum of absolute weight
     changes) is large enough to justify the transaction costs.
 
+    The threshold is ``fee_rate × cost_multiplier``. With defaults
+    (fee_rate=0.002, cost_multiplier=5.0), turnover must exceed 1%
+    to trigger. Increase cost_multiplier to rebalance less often.
+
     Parameters:
         target_weights: Static dict or callable(HookContext) -> dict.
         frequency: Check frequency.
         fee_rate: Estimated round-trip fee rate (default 0.002 = 0.2%).
         cost_multiplier: Turnover must exceed fee_rate × cost_multiplier
-            to trigger (default 3.0). Higher = more conservative
-            (rebalance less often).
-        min_drift: Minimum total turnover to even consider rebalancing
-            (default 0.01 = 1%).
+            to trigger (default 5.0). Higher = more conservative.
     """
 
     def __init__(
@@ -406,8 +407,7 @@ class CostAwareRebalanceHook(BacktestHook):
         target_weights: Union[Dict[str, float], Callable],
         frequency: Union[str, int] = "monthly",
         fee_rate: float = 0.002,
-        cost_multiplier: float = 3.0,
-        min_drift: float = 0.01,
+        cost_multiplier: float = 5.0,
     ) -> None:
         if callable(target_weights):
             self._get_weights = target_weights
@@ -416,7 +416,6 @@ class CostAwareRebalanceHook(BacktestHook):
             self._get_weights = lambda ctx: weights
         self.fee_rate = fee_rate
         self.cost_multiplier = cost_multiplier
-        self.min_drift = min_drift
         self._schedule = ScheduleHook(frequency, self._evaluate)
 
     def on_backtest_start(
@@ -446,13 +445,10 @@ class CostAwareRebalanceHook(BacktestHook):
             if sym not in target:
                 turnover += abs(current[sym])
 
-        if turnover < self.min_drift:
-            return  # drift too small to bother
-
         # Only rebalance if turnover justifies the trading cost.
         # Threshold = fee_rate × cost_multiplier. With default
-        # fee_rate=0.002 and cost_multiplier=3.0, turnover must
-        # exceed 0.6% to trigger.
+        # fee_rate=0.002 and cost_multiplier=5.0, turnover must
+        # exceed 1.0% to trigger.
         threshold = self.fee_rate * self.cost_multiplier
         if turnover > threshold:
             ctx.meta.set_target_weights(target)
