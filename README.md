@@ -17,7 +17,7 @@ AIphaForge also works perfectly well as a general-purpose backtest framework for
 ### Core Engine
 - **Dual execution modes**: Vectorized (fast, for parameter sweeps) and Event-Driven (precise, bar-by-bar simulation)
 - **Unified multi-asset**: Single-asset and multi-asset backtests share one code path. Pass a `pd.DataFrame` or a `Dict[str, pd.DataFrame]`
-- **Realistic order simulation**: Market, limit, stop, and stop-limit orders with configurable fill and slippage models
+- **Realistic order simulation**: Market, limit, stop, stop-limit, and **trailing stop** orders with configurable fill and slippage models
 - **Time-in-force support**: GTC, IOC, FOK, and DAY order expiration with session-aware DAY semantics
 - **Continuous signals**: Fractional signals in [-1, 1] (z-scores, alpha values). `0 = flat`, `NaN = hold`, with optional `signal_transform` for custom mapping
 - **Target-weight rebalancing**: `set_target_weights()` for institutional portfolio management workflows
@@ -48,6 +48,7 @@ AIphaForge also works perfectly well as a general-purpose backtest framework for
 
 ### Risk Management
 - **Composable risk rules**: `CompositeRiskManager` with `MaxDrawdownHalt`, `ExposureLimit`, `DailyLossLimit`, `ConcentrationLimit`
+- **Trailing stop loss**: `TrailingStopLoss` exit rule tracks price highs/lows and exits on pullback
 - **Agent-controlled risk**: MetaController adjusts stop-loss, take-profit, sizing, and signals per bar
 
 ### Parameter Optimization
