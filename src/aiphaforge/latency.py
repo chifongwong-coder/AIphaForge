@@ -50,10 +50,61 @@ class _CapturingBrokerProxy:
 
 
 # ---------------------------------------------------------------------------
+# Internal meta proxy
+# ---------------------------------------------------------------------------
+
+class _CapturingMetaProxy:
+    """Wraps a real MetaContext, capturing mutable method calls.
+
+    Uses an explicit MUTABLE_METHODS allowlist. Only known mutable
+    methods are captured for delayed replay. Everything else (non-
+    callable attributes AND unknown/read-only methods) is forwarded
+    to the real MetaContext.
+
+    This design is safe by default: new read-only methods added to
+    MetaContext are automatically forwarded (not accidentally captured).
+    New mutable methods need to be added to _MUTABLE_METHODS.
+    """
+
+    _MUTABLE_METHODS = {
+        'set_strategy', 'adjust_strategy_params',
+        'adjust_sizing', 'adjust_stop_loss', 'adjust_take_profit',
+        'suppress_signals', 'resume_signals', 'set_target_weights',
+        'set_weights', 'swap_child',
+    }
+
+    def __init__(self, real_meta: Any) -> None:
+        object.__setattr__(self, '_real_meta', real_meta)
+        object.__setattr__(self, 'captured_ops', [])
+
+    def __getattr__(self, name: str) -> Any:
+        if name in self._MUTABLE_METHODS:
+            # Known mutable method: capture for delayed replay.
+            def _capture(*args: Any, **kwargs: Any) -> None:
+                self.captured_ops.append((name, args, kwargs))
+            return _capture
+        # Everything else: forward to real MetaContext.
+        # Covers non-callable attributes (_suppress, _strategy, etc.),
+        # properties (current_strategy, audit_log), and read-only
+        # methods (get_children, _is_composite, _log, _apply_overrides).
+        return getattr(self._real_meta, name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        # Prevent direct attribute assignment from bypassing the proxy.
+        # Hooks should use methods (e.g., suppress_signals()) not
+        # direct assignment (e.g., _suppress = True).
+        raise AttributeError(
+            f"Cannot set '{name}' on LatencyHook meta proxy. "
+            f"Use the corresponding method instead "
+            f"(e.g., suppress_signals() instead of _suppress = True).")
+
+
+# ---------------------------------------------------------------------------
 # Queued-order record
 # ---------------------------------------------------------------------------
 
 _QueuedOrder = Tuple[int, Order, Any]  # (submit_at_bar, order, decision_timestamp)
+_MetaQueueEntry = Tuple[int, List[Tuple[str, tuple, dict]], Any]  # (submit_at_bar, meta_ops, decision_timestamp)
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +123,7 @@ class LatencyHook(BacktestHook):
         inner_hook: The hook whose orders will be delayed.
         latency_model: ``"fixed"``, ``"statistical"``, or ``"custom"``.
         latency_params: Model-specific parameters.
-            - fixed: ``{"bars": int}`` (>= 1).
+            - fixed: ``{"bars": int}`` (>= 0). 0 = immediate (same bar).
             - statistical: ``{"distribution": "normal"|"uniform", ...}``.
               For ``"normal"``: ``{"mean": float, "std": float}``.
               For ``"uniform"``: ``{"low": float, "high": float}``.
@@ -97,7 +148,8 @@ class LatencyHook(BacktestHook):
         self.inner_hook = inner_hook
         self.latency_model = latency_model
         self.latency_params: Dict[str, Any] = latency_params or {}
-        self._queue: Deque[_QueuedOrder] = deque()
+        self._order_queue: Deque[_QueuedOrder] = deque()
+        self._meta_queue: Deque[_MetaQueueEntry] = deque()
         self._warned_signal_conflict = False
         self._warned_custom_clamp = False
         self._current_order: Optional[Order] = None
@@ -118,9 +170,17 @@ class LatencyHook(BacktestHook):
         """
         if model == "fixed":
             bars = params.get("bars", 1)
-            if not isinstance(bars, int) or bars < 1:
+            if not isinstance(bars, int) or bars < 0:
                 raise ValueError(
-                    f"fixed latency requires 'bars' >= 1, got {bars!r}"
+                    f"fixed latency requires 'bars' >= 0, got {bars!r}"
+                )
+            if bars == 0:
+                import warnings as _w
+                _w.warn(
+                    "bars=0 means zero decision latency (same as bars=1). "
+                    "In practice, agent decisions always have latency. "
+                    "Consider bars=1 or higher for realistic simulation.",
+                    stacklevel=4,
                 )
         elif model == "statistical":
             dist = params.get("distribution")
@@ -156,7 +216,8 @@ class LatencyHook(BacktestHook):
         config: Any = None,
     ) -> None:
         """Validate execution mode and forward to the inner hook."""
-        self._queue.clear()
+        self._order_queue.clear()
+        self._meta_queue.clear()
         self._warned_signal_conflict = False
         self._warned_custom_clamp = False
 
@@ -198,28 +259,51 @@ class LatencyHook(BacktestHook):
             self._on_pre_signal_single(context)
 
     def _on_pre_signal_single(self, context: HookContext) -> None:
-        """Single-asset path: proxy context.broker."""
+        """Single-asset path: proxy context.broker and context.meta."""
         proxy = _CapturingBrokerProxy(context.broker)
-        proxied_ctx = dataclasses.replace(context, broker=proxy)
+        meta_proxy = (
+            _CapturingMetaProxy(context.meta)
+            if context.meta is not None else None
+        )
+        proxied_ctx = dataclasses.replace(
+            context,
+            broker=proxy,
+            meta=meta_proxy if meta_proxy is not None else context.meta,
+        )
         self.inner_hook.on_pre_signal(proxied_ctx)
 
+        # Queue captured orders (per-order delay, same as before)
         for order, ts in proxy.captured_orders:
             self._current_order = order
             delay = self._calculate_delay(context.bar_index, context)
             self._current_order = None
             submit_at = context.bar_index + delay - 1
             decision_ts = context.timestamp
-            self._queue.append((submit_at, order, decision_ts))
+            self._order_queue.append((submit_at, order, decision_ts))
 
-        self._flush_ready_orders(context)
+        # Queue captured meta ops (one batch, default delay)
+        if meta_proxy is not None and meta_proxy.captured_ops:
+            delay = self._calculate_delay(context.bar_index, context)
+            submit_at = context.bar_index + delay - 1
+            self._meta_queue.append(
+                (submit_at, list(meta_proxy.captured_ops), context.timestamp))
+
+        self._flush_ready_actions(context)
 
     def _on_pre_signal_multi(self, context: HookContext) -> None:
-        """Multi-asset path: proxy all brokers in context.all_brokers."""
+        """Multi-asset path: proxy all brokers and meta."""
         proxied_brokers = {}
         for sym, broker in context.all_brokers.items():
             proxied_brokers[sym] = _CapturingBrokerProxy(broker)
+        meta_proxy = (
+            _CapturingMetaProxy(context.meta)
+            if context.meta is not None else None
+        )
         proxied_ctx = dataclasses.replace(
-            context, all_brokers=proxied_brokers)
+            context,
+            all_brokers=proxied_brokers,
+            meta=meta_proxy if meta_proxy is not None else context.meta,
+        )
         self.inner_hook.on_pre_signal(proxied_ctx)
 
         # Collect captured orders from all proxies
@@ -231,27 +315,60 @@ class LatencyHook(BacktestHook):
                 self._current_order = None
                 submit_at = context.bar_index + delay - 1
                 decision_ts = context.timestamp
-                self._queue.append((submit_at, order, decision_ts))
+                self._order_queue.append((submit_at, order, decision_ts))
 
-        self._flush_ready_orders(context)
+        # Queue captured meta ops (one batch, default delay)
+        if meta_proxy is not None and meta_proxy.captured_ops:
+            delay = self._calculate_delay(context.bar_index, context)
+            submit_at = context.bar_index + delay - 1
+            self._meta_queue.append(
+                (submit_at, list(meta_proxy.captured_ops), context.timestamp))
+
+        self._flush_ready_actions(context)
 
     def on_bar(self, context: HookContext) -> None:
         """Forward to the inner hook (no proxying needed)."""
         self.inner_hook.on_bar(context)
 
     def on_backtest_end(self) -> None:
-        """Forward to the inner hook."""
+        """Warn about pending queue items, then forward to the inner hook."""
+        n_orders = len(self._order_queue)
+        n_meta = len(self._meta_queue)
+        if n_orders + n_meta > 0:
+            parts = []
+            if n_orders:
+                parts.append(f"{n_orders} order(s)")
+            if n_meta:
+                parts.append(f"{n_meta} meta operation(s)")
+            warnings.warn(
+                f"LatencyHook: {' and '.join(parts)} were not executed "
+                f"(backtest ended before delay elapsed).")
+        self._order_queue.clear()
+        self._meta_queue.clear()
         self.inner_hook.on_backtest_end()
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _flush_ready_orders(self, context: HookContext) -> None:
-        """Submit queued orders that are due on or before the current bar."""
-        remaining: Deque[_QueuedOrder] = deque()
-        while self._queue:
-            submit_at, order, decision_ts = self._queue.popleft()
+    def _flush_ready_actions(self, context: HookContext) -> None:
+        """Flush meta operations and orders that are due on or before the current bar."""
+        # 1. Flush meta queue first (strategy changes take effect before orders)
+        remaining_meta: Deque[_MetaQueueEntry] = deque()
+        while self._meta_queue:
+            submit_at, meta_ops, decision_ts = self._meta_queue.popleft()
+            if submit_at <= context.bar_index:
+                if context.meta is not None:
+                    for method_name, args, kwargs in meta_ops:
+                        getattr(context.meta, method_name)(*args, **kwargs)
+            else:
+                remaining_meta.append((submit_at, meta_ops, decision_ts))
+        self._meta_queue = remaining_meta
+
+        # 2. Then flush order queue (submit orders)
+        remaining_orders: Deque[_QueuedOrder] = deque()
+        while self._order_queue:
+            submit_at, order, decision_ts = self._order_queue.popleft()
             if submit_at <= context.bar_index:
                 # Preserve decision-time TIF semantics
                 if order.created_time is None:
@@ -264,8 +381,8 @@ class LatencyHook(BacktestHook):
                 else:
                     context.broker.submit_order(order, decision_ts)
             else:
-                remaining.append((submit_at, order, decision_ts))
-        self._queue = remaining
+                remaining_orders.append((submit_at, order, decision_ts))
+        self._order_queue = remaining_orders
 
     @staticmethod
     def _calculate_delay_for_model(
@@ -281,7 +398,7 @@ class LatencyHook(BacktestHook):
         and context as-is.
 
         Returns:
-            int: Delay in bars (always >= 1 for fixed/statistical).
+            int: Delay in bars (>= 0 for fixed, >= 1 for statistical).
                  For custom, returns the raw int(value) — caller is
                  responsible for clamping and validation.
         """
@@ -310,7 +427,7 @@ class LatencyHook(BacktestHook):
         return 1  # pragma: no cover
 
     def _calculate_delay(self, bar_index: int, ctx: HookContext) -> int:
-        """Return the delay in bars (always >= 1)."""
+        """Return the delay in bars (>= 0 for fixed, >= 1 for statistical/custom)."""
         value = self._calculate_delay_for_model(
             bar_index, ctx, self.latency_model, self.latency_params,
         )
@@ -394,30 +511,41 @@ class SimpleLatencyHook(LatencyHook):
 # ---------------------------------------------------------------------------
 
 class SymbolRoutingLatencyHook(LatencyHook):
-    """LatencyHook subclass that routes delay calculation by symbol.
+    """LatencyHook with per-symbol execution delay on top of decision delay.
 
-    Different assets can have different latency profiles (e.g., an LLM
-    agent may take longer to analyze Chinese stocks than US stocks).
-    This hook lets you specify per-symbol overrides while sharing a
-    single inner hook instance.
+    Total delay for orders = decision delay (base) + execution delay (per-symbol).
+    Meta operations only have decision delay (no execution delay).
+
+    The base latency model (``default_latency_model``) represents the
+    agent's **decision latency** (inference time). This applies equally
+    to all orders and meta operations.
+
+    The ``symbol_overrides`` represent **execution latency** per symbol
+    (e.g., different markets have different order routing times). This
+    is **additive** on top of the decision delay and only applies to
+    orders, not meta operations.
 
     Parameters:
-        inner_hook: The hook whose orders will be delayed.
-        default_latency_model: Default latency model for unmatched symbols.
-        default_latency_params: Default latency parameters.
-        symbol_overrides: Mapping of symbol to ``(model, params)`` tuples.
+        inner_hook: The hook whose actions will be delayed.
+        default_latency_model: Decision latency model (base).
+        default_latency_params: Decision latency parameters.
+        symbol_overrides: Per-symbol execution delay. Mapping of
+            symbol to ``(model, params)`` tuples. Additive on top of
+            decision delay. Symbols not listed get 0 execution delay.
 
     Example::
 
         hook = SymbolRoutingLatencyHook(
             inner_hook=agent_hook,
             default_latency_model="fixed",
-            default_latency_params={"bars": 3},
+            default_latency_params={"bars": 3},   # decision: 3 bars
             symbol_overrides={
-                "AAPL": ("fixed", {"bars": 1}),
-                "600519.SH": ("fixed", {"bars": 5}),
+                "600519.SH": ("fixed", {"bars": 2}),  # +2 execution
             },
         )
+        # AAPL order:   3 + 0 = 3 bars total
+        # 600519 order: 3 + 2 = 5 bars total
+        # Meta ops:     3 bars (decision only)
     """
 
     def __init__(
@@ -447,26 +575,41 @@ class SymbolRoutingLatencyHook(LatencyHook):
                 ) from exc
 
     def _calculate_delay(self, bar_index: int, ctx: HookContext) -> int:
-        """Route delay calculation by the current order's symbol."""
+        """Compute total delay = decision delay + execution delay.
+
+        Decision delay comes from the base latency model (same for all
+        symbols and meta ops). Execution delay comes from per-symbol
+        overrides (additive, only applies to orders).
+
+        For meta operations (_current_order is None), only the decision
+        delay is used — meta ops have no execution delay.
+        """
+        # Base decision delay (always applies)
+        base_delay = super()._calculate_delay(bar_index, ctx)
+
+        # Add per-symbol execution delay for orders
         order = self._current_order
         if order is not None and order.symbol in self._symbol_overrides:
             model, params = self._symbol_overrides[order.symbol]
-            value = self._calculate_delay_for_model(bar_index, ctx, model, params)
-            # Apply same guard+clamp as base class for custom callables
+            exec_value = self._calculate_delay_for_model(
+                bar_index, ctx, model, params)
+            # Guard+clamp for custom callables
             if model == "custom":
-                if not isinstance(value, (int, float)) or math.isnan(value) or math.isinf(value):
+                if not isinstance(exec_value, (int, float)) or math.isnan(exec_value) or math.isinf(exec_value):
                     raise ValueError(
-                        f"Custom latency callable returned invalid value: {value}"
+                        f"Custom latency callable returned invalid value: {exec_value}"
                     )
-                clamped = max(1, int(value))
-                if clamped != int(value) and not self._warned_custom_clamp:
+                clamped = max(0, int(exec_value))
+                if clamped != int(exec_value) and not self._warned_custom_clamp:
                     warnings.warn(
-                        f"Custom latency callable returned {value} at bar "
-                        f"{bar_index}, clamped to {clamped} (minimum delay "
-                        f"is 1 bar). Further clamp warnings suppressed.",
+                        f"Custom execution latency callable returned "
+                        f"{exec_value} at bar {bar_index}, clamped to "
+                        f"{clamped} (minimum execution delay is 0). "
+                        f"Further clamp warnings suppressed.",
                         stacklevel=2,
                     )
                     self._warned_custom_clamp = True
-                return clamped
-            return value
-        return super()._calculate_delay(bar_index, ctx)
+                exec_value = clamped
+            return base_delay + exec_value
+
+        return base_delay

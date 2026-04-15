@@ -1859,3 +1859,245 @@ class TestBayesianAndScheduling:
         r2 = optimize_bayesian(**kwargs)
 
         assert r1.best_params == r2.best_params
+
+
+# ===================================================================
+# MetaController Latency Simulation (v1.8)
+# ===================================================================
+
+
+class TestMetaLatency:
+
+    def test_meta_set_weights_delayed(self):
+        """Meta operations are delayed by LatencyHook, not applied immediately."""
+        data = make_ohlcv(30)
+        tree = WeightedBlend(
+            children=[MACrossover(short=5, long=20), RSIMeanReversion()],
+            weights=[0.5, 0.5],
+        )
+
+        class WeightChanger(BacktestHook):
+            def on_pre_signal(self, ctx):
+                if ctx.bar_index == 10 and ctx.meta:
+                    ctx.meta.set_weights([0.3, 0.7])
+
+        class WeightRecorder(BacktestHook):
+            def __init__(self):
+                self.weights_log = {}
+
+            def on_bar(self, ctx):
+                if ctx.meta and hasattr(ctx.meta.current_strategy, 'weights'):
+                    self.weights_log[ctx.bar_index] = list(
+                        ctx.meta.current_strategy.weights)
+
+        recorder = WeightRecorder()
+        engine = BacktestEngine(
+            mode='event_driven', fee_model=ZeroFeeModel(),
+            initial_capital=100_000, include_benchmark=False,
+            hooks=[
+                LatencyHook(
+                    inner_hook=WeightChanger(),
+                    latency_model="fixed",
+                    latency_params={"bars": 3},
+                ),
+                recorder,
+            ],
+        )
+        engine.set_strategy(tree)
+        result = engine.run(data)
+
+        assert isinstance(result, BacktestResult)
+        # Before bar 12 (10 + 3 - 1): weights should still be [0.5, 0.5]
+        assert recorder.weights_log.get(9) == [0.5, 0.5]
+        assert recorder.weights_log.get(11) == [0.5, 0.5]
+        # From bar 12 onward: weights should be [0.3, 0.7]
+        assert recorder.weights_log.get(12) == [0.3, 0.7]
+
+    def test_meta_bars_zero_immediate(self):
+        """bars=0 allows immediate execution through capture-replay pipeline."""
+        data = make_ohlcv(20)
+        tree = WeightedBlend(
+            children=[MACrossover(short=5, long=20), RSIMeanReversion()],
+            weights=[0.5, 0.5],
+        )
+
+        class WeightChanger(BacktestHook):
+            def on_pre_signal(self, ctx):
+                if ctx.bar_index == 5 and ctx.meta:
+                    ctx.meta.set_weights([0.2, 0.8])
+
+        class WeightRecorder(BacktestHook):
+            def __init__(self):
+                self.weights_log = {}
+
+            def on_bar(self, ctx):
+                if ctx.meta and hasattr(ctx.meta.current_strategy, 'weights'):
+                    self.weights_log[ctx.bar_index] = list(
+                        ctx.meta.current_strategy.weights)
+
+        recorder = WeightRecorder()
+        engine = BacktestEngine(
+            mode='event_driven', fee_model=ZeroFeeModel(),
+            initial_capital=100_000, include_benchmark=False,
+            hooks=[
+                LatencyHook(
+                    inner_hook=WeightChanger(),
+                    latency_model="fixed",
+                    latency_params={"bars": 0},
+                ),
+                recorder,
+            ],
+        )
+        engine.set_strategy(tree)
+        result = engine.run(data)
+
+        assert isinstance(result, BacktestResult)
+        # bars=0: submit_at = 5 + 0 - 1 = 4, flushed same bar (4 <= 5)
+        # So by bar 5, weights should already be changed
+        assert recorder.weights_log.get(4) == [0.5, 0.5]  # before change
+        assert recorder.weights_log.get(5) == [0.2, 0.8]  # immediate
+
+    def test_meta_only_no_orders(self):
+        """Hook that only uses meta (no broker orders) works with LatencyHook."""
+        data = make_ohlcv(20)
+        tree = WeightedBlend(
+            children=[MACrossover(short=5, long=20), RSIMeanReversion()],
+            weights=[0.5, 0.5],
+        )
+
+        class MetaOnlyHook(BacktestHook):
+            def on_pre_signal(self, ctx):
+                if ctx.bar_index == 5 and ctx.meta:
+                    ctx.meta.set_weights([0.4, 0.6])
+
+        engine = BacktestEngine(
+            mode='event_driven', fee_model=ZeroFeeModel(),
+            initial_capital=100_000, include_benchmark=False,
+            hooks=[
+                LatencyHook(
+                    inner_hook=MetaOnlyHook(),
+                    latency_model="fixed",
+                    latency_params={"bars": 2},
+                ),
+            ],
+        )
+        engine.set_strategy(tree)
+        result = engine.run(data)
+
+        assert isinstance(result, BacktestResult)
+        # submit_at = 5 + 2 - 1 = 6, so replayed at bar 6
+        assert tree.weights == [0.4, 0.6]
+
+    def test_on_bar_meta_not_proxied(self):
+        """Meta ops in on_bar take effect immediately, even with LatencyHook."""
+        data = make_ohlcv(20)
+        tree = WeightedBlend(
+            children=[MACrossover(short=5, long=20), RSIMeanReversion()],
+            weights=[0.5, 0.5],
+        )
+
+        class OnBarMetaHook(BacktestHook):
+            """Uses meta in on_bar (not on_pre_signal), so not proxied."""
+            def on_bar(self, ctx):
+                if ctx.bar_index == 5 and ctx.meta:
+                    ctx.meta.set_weights([0.1, 0.9])
+
+        class WeightRecorder(BacktestHook):
+            def __init__(self):
+                self.weights_log = {}
+
+            def on_bar(self, ctx):
+                if ctx.meta and hasattr(ctx.meta.current_strategy, 'weights'):
+                    self.weights_log[ctx.bar_index] = list(
+                        ctx.meta.current_strategy.weights)
+
+        recorder = WeightRecorder()
+        # The OnBarMetaHook is the inner_hook, but on_bar is forwarded
+        # directly (not proxied), so meta ops take effect immediately.
+        engine = BacktestEngine(
+            mode='event_driven', fee_model=ZeroFeeModel(),
+            initial_capital=100_000, include_benchmark=False,
+            hooks=[
+                LatencyHook(
+                    inner_hook=OnBarMetaHook(),
+                    latency_model="fixed",
+                    latency_params={"bars": 5},
+                ),
+                recorder,
+            ],
+        )
+        engine.set_strategy(tree)
+        result = engine.run(data)
+
+        assert isinstance(result, BacktestResult)
+        # on_bar is not proxied, so weights change immediately on bar 5
+        assert recorder.weights_log.get(5) == [0.1, 0.9]
+
+    def test_order_behavior_unchanged(self):
+        """Order delay behavior is preserved with the two-queue structure."""
+        data = make_ohlcv(30)
+        tree = WeightedBlend(
+            children=[MACrossover(short=5, long=20), RSIMeanReversion()],
+            weights=[0.5, 0.5],
+        )
+
+        class OrderAndMetaHook(BacktestHook):
+            """Hook that submits an order AND changes meta on the same bar."""
+            def on_pre_signal(self, ctx):
+                if ctx.bar_index == 5:
+                    order = ctx.broker.create_market_order(
+                        ctx.symbol, 'buy', 10, 'test', ctx.timestamp)
+                    ctx.broker.submit_order(order, ctx.timestamp)
+                    if ctx.meta:
+                        ctx.meta.set_weights([0.3, 0.7])
+
+        engine = BacktestEngine(
+            mode='event_driven', fee_model=ZeroFeeModel(),
+            initial_capital=100_000, include_benchmark=False,
+            hooks=[
+                LatencyHook(
+                    inner_hook=OrderAndMetaHook(),
+                    latency_model="fixed",
+                    latency_params={"bars": 2},
+                ),
+            ],
+        )
+        engine.set_strategy(tree)
+        result = engine.run(data)
+
+        assert isinstance(result, BacktestResult)
+        # Both meta ops and orders should have been delayed and replayed
+        assert tree.weights == [0.3, 0.7]
+
+    def test_queue_drop_warning(self):
+        """Backtest ending with pending actions emits a warning."""
+        data = make_ohlcv(5)
+        signals = pd.Series(np.nan, index=data.index, dtype=float)
+
+        class LateOrderHook(BacktestHook):
+            def on_pre_signal(self, ctx):
+                if ctx.bar_index == 3:
+                    order = ctx.broker.create_market_order(
+                        ctx.symbol, 'buy', 100, 'test', ctx.timestamp)
+                    ctx.broker.submit_order(order, ctx.timestamp)
+
+        engine = BacktestEngine(
+            mode='event_driven', fee_model=ZeroFeeModel(),
+            initial_capital=100_000, include_benchmark=False,
+            hooks=[
+                LatencyHook(
+                    inner_hook=LateOrderHook(),
+                    latency_model="fixed",
+                    latency_params={"bars": 10},
+                ),
+            ],
+        )
+        engine.set_signals(signals)
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            engine.run(data)
+            drop_warnings = [
+                x for x in w if "were not executed" in str(x.message)
+            ]
+            assert len(drop_warnings) >= 1
