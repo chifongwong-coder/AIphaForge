@@ -2098,6 +2098,6 @@ class TestMetaLatency:
             warnings.simplefilter("always")
             engine.run(data)
             drop_warnings = [
-                x for x in w if "queued actions were not executed" in str(x.message)
+                x for x in w if "were not executed" in str(x.message)
             ]
             assert len(drop_warnings) >= 1

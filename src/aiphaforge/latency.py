@@ -56,21 +56,21 @@ class _CapturingBrokerProxy:
 class _CapturingMetaProxy:
     """Wraps a real MetaContext, capturing mutable method calls.
 
-    Non-callable attributes (bools, dicts, etc.) always pass through
-    to the real MetaContext — this is safe because reading an attribute
-    is never a mutation.
+    Uses an explicit MUTABLE_METHODS allowlist. Only known mutable
+    methods are captured for delayed replay. Everything else (non-
+    callable attributes AND unknown/read-only methods) is forwarded
+    to the real MetaContext.
 
-    Callable attributes (methods) are captured by default, EXCEPT
-    those in ``_READ_ONLY_METHODS`` which are known query methods.
-
-    This design:
-    - Correctly handles attribute reads (e.g., ``_suppress``, ``_strategy``)
-    - Captures new mutable methods added to MetaContext in the future
-    - Forwards known read-only methods (``get_children``, ``_is_composite``)
+    This design is safe by default: new read-only methods added to
+    MetaContext are automatically forwarded (not accidentally captured).
+    New mutable methods need to be added to _MUTABLE_METHODS.
     """
 
-    _READ_ONLY_METHODS = {
-        'get_children', '_is_composite',
+    _MUTABLE_METHODS = {
+        'set_strategy', 'adjust_strategy_params',
+        'adjust_sizing', 'adjust_stop_loss', 'adjust_take_profit',
+        'suppress_signals', 'resume_signals', 'set_target_weights',
+        'set_weights', 'swap_child',
     }
 
     def __init__(self, real_meta: Any) -> None:
@@ -78,18 +78,25 @@ class _CapturingMetaProxy:
         object.__setattr__(self, 'captured_ops', [])
 
     def __getattr__(self, name: str) -> Any:
-        attr = getattr(self._real_meta, name)
-        if not callable(attr):
-            # Non-callable (bool, dict, list, object, etc.): pass through.
-            # Properties like current_strategy, audit_log resolve here.
-            return attr
-        if name in self._READ_ONLY_METHODS:
-            # Known read-only method: forward directly.
-            return attr
-        # Callable and not read-only: capture for delayed replay.
-        def _capture(*args: Any, **kwargs: Any) -> None:
-            self.captured_ops.append((name, args, kwargs))
-        return _capture
+        if name in self._MUTABLE_METHODS:
+            # Known mutable method: capture for delayed replay.
+            def _capture(*args: Any, **kwargs: Any) -> None:
+                self.captured_ops.append((name, args, kwargs))
+            return _capture
+        # Everything else: forward to real MetaContext.
+        # Covers non-callable attributes (_suppress, _strategy, etc.),
+        # properties (current_strategy, audit_log), and read-only
+        # methods (get_children, _is_composite, _log, _apply_overrides).
+        return getattr(self._real_meta, name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        # Prevent direct attribute assignment from bypassing the proxy.
+        # Hooks should use methods (e.g., suppress_signals()) not
+        # direct assignment (e.g., _suppress = True).
+        raise AttributeError(
+            f"Cannot set '{name}' on LatencyHook meta proxy. "
+            f"Use the corresponding method instead "
+            f"(e.g., suppress_signals() instead of _suppress = True).")
 
 
 # ---------------------------------------------------------------------------
@@ -116,7 +123,7 @@ class LatencyHook(BacktestHook):
         inner_hook: The hook whose orders will be delayed.
         latency_model: ``"fixed"``, ``"statistical"``, or ``"custom"``.
         latency_params: Model-specific parameters.
-            - fixed: ``{"bars": int}`` (>= 1).
+            - fixed: ``{"bars": int}`` (>= 0). 0 = immediate (same bar).
             - statistical: ``{"distribution": "normal"|"uniform", ...}``.
               For ``"normal"``: ``{"mean": float, "std": float}``.
               For ``"uniform"``: ``{"low": float, "high": float}``.
@@ -317,11 +324,17 @@ class LatencyHook(BacktestHook):
 
     def on_backtest_end(self) -> None:
         """Warn about pending queue items, then forward to the inner hook."""
-        n_pending = len(self._order_queue) + len(self._meta_queue)
-        if n_pending > 0:
+        n_orders = len(self._order_queue)
+        n_meta = len(self._meta_queue)
+        if n_orders + n_meta > 0:
+            parts = []
+            if n_orders:
+                parts.append(f"{n_orders} order(s)")
+            if n_meta:
+                parts.append(f"{n_meta} meta operation(s)")
             warnings.warn(
-                f"LatencyHook: {n_pending} queued actions were not "
-                f"executed (backtest ended before delay elapsed).")
+                f"LatencyHook: {' and '.join(parts)} were not executed "
+                f"(backtest ended before delay elapsed).")
         self._order_queue.clear()
         self._meta_queue.clear()
         self.inner_hook.on_backtest_end()
@@ -377,7 +390,7 @@ class LatencyHook(BacktestHook):
         and context as-is.
 
         Returns:
-            int: Delay in bars (always >= 1 for fixed/statistical).
+            int: Delay in bars (>= 0 for fixed, >= 1 for statistical).
                  For custom, returns the raw int(value) — caller is
                  responsible for clamping and validation.
         """
@@ -406,7 +419,7 @@ class LatencyHook(BacktestHook):
         return 1  # pragma: no cover
 
     def _calculate_delay(self, bar_index: int, ctx: HookContext) -> int:
-        """Return the delay in bars (always >= 1)."""
+        """Return the delay in bars (>= 0 for fixed, >= 1 for statistical/custom)."""
         value = self._calculate_delay_for_model(
             bar_index, ctx, self.latency_model, self.latency_params,
         )
