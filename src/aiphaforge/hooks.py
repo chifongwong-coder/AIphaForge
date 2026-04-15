@@ -370,40 +370,35 @@ class BandRebalanceHook(BacktestHook):
         target = self._get_weights(ctx)
         current = ctx.portfolio.get_weights()
 
+        # Only include out-of-band assets in target_weights.
+        # The engine rebalances only these; in-band assets are untouched.
         adjusted: Dict[str, float] = {}
-        needs_rebalance = False
         for sym, target_w in target.items():
             actual_w = current.get(sym, 0.0)
             if abs(actual_w - target_w) > self.band:
                 adjusted[sym] = target_w
-                needs_rebalance = True
-            else:
-                adjusted[sym] = actual_w
 
-        if not needs_rebalance:
+        if not adjusted:
             return
 
-        # No normalization — set_target_weights handles partial
-        # allocation. Weights may not sum to exactly 1.0 since
-        # in-band assets keep their current (slightly drifted) values.
         ctx.meta.set_target_weights(adjusted)
 
 
 class CostAwareRebalanceHook(BacktestHook):
     """Rebalance only if expected benefit exceeds transaction costs.
 
-    Compares the drift magnitude against the estimated trading cost.
-    Only triggers when the benefit of rebalancing (reducing drift)
-    outweighs the cost of trading.
+    Only triggers when the total turnover (sum of absolute weight
+    changes) is large enough to justify the transaction costs.
 
     Parameters:
         target_weights: Static dict or callable(HookContext) -> dict.
         frequency: Check frequency.
         fee_rate: Estimated round-trip fee rate (default 0.002 = 0.2%).
-            Used to compute the cost of the weight changes.
-        min_drift: Minimum total drift (turnover) to even consider
-            rebalancing (default 0.01 = 1%). Skips cost calculation
-            if drift is negligible.
+        cost_multiplier: Turnover must exceed fee_rate × cost_multiplier
+            to trigger (default 3.0). Higher = more conservative
+            (rebalance less often).
+        min_drift: Minimum total turnover to even consider rebalancing
+            (default 0.01 = 1%).
     """
 
     def __init__(
@@ -411,6 +406,7 @@ class CostAwareRebalanceHook(BacktestHook):
         target_weights: Union[Dict[str, float], Callable],
         frequency: Union[str, int] = "monthly",
         fee_rate: float = 0.002,
+        cost_multiplier: float = 3.0,
         min_drift: float = 0.01,
     ) -> None:
         if callable(target_weights):
@@ -419,6 +415,7 @@ class CostAwareRebalanceHook(BacktestHook):
             weights = dict(target_weights)
             self._get_weights = lambda ctx: weights
         self.fee_rate = fee_rate
+        self.cost_multiplier = cost_multiplier
         self.min_drift = min_drift
         self._schedule = ScheduleHook(frequency, self._evaluate)
 
@@ -452,17 +449,10 @@ class CostAwareRebalanceHook(BacktestHook):
         if turnover < self.min_drift:
             return  # drift too small to bother
 
-        # Benefit: reduction in tracking error variance (sum of drift^2)
-        benefit = sum(
-            (current.get(sym, 0.0) - target_w) ** 2
-            for sym, target_w in target.items()
-        )
-        for sym in current:
-            if sym not in target:
-                benefit += current[sym] ** 2
-
-        # Cost: estimated trading cost
-        cost = turnover * self.fee_rate
-
-        if benefit > cost:
+        # Only rebalance if turnover justifies the trading cost.
+        # Threshold = fee_rate × cost_multiplier. With default
+        # fee_rate=0.002 and cost_multiplier=3.0, turnover must
+        # exceed 0.6% to trigger.
+        threshold = self.fee_rate * self.cost_multiplier
+        if turnover > threshold:
             ctx.meta.set_target_weights(target)
