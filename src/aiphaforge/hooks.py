@@ -322,7 +322,12 @@ class DriftRebalanceHook(BacktestHook):
                 max_drift = max(max_drift, abs(current[sym]))
 
         if max_drift >= self.threshold:
-            context.meta.set_target_weights(target)
+            # Include weight=0 for unwanted assets so engine closes them
+            complete_target = dict(target)
+            for sym in current:
+                if sym not in target:
+                    complete_target[sym] = 0.0
+            context.meta.set_target_weights(complete_target)
             self._last_rebalance_bar = context.bar_index
 
 
