@@ -599,16 +599,17 @@ class SymbolRoutingLatencyHook(LatencyHook):
                     raise ValueError(
                         f"Custom latency callable returned invalid value: {exec_value}"
                     )
-                exec_value = max(0, int(exec_value))
-                if exec_value != int(exec_value) and not self._warned_custom_clamp:
+                clamped = max(0, int(exec_value))
+                if clamped != int(exec_value) and not self._warned_custom_clamp:
                     warnings.warn(
-                        f"Custom latency callable returned {exec_value} at bar "
-                        f"{bar_index}, clamped to {max(0, int(exec_value))} "
-                        f"(minimum execution delay is 0). "
+                        f"Custom execution latency callable returned "
+                        f"{exec_value} at bar {bar_index}, clamped to "
+                        f"{clamped} (minimum execution delay is 0). "
                         f"Further clamp warnings suppressed.",
                         stacklevel=2,
                     )
                     self._warned_custom_clamp = True
+                exec_value = clamped
             return base_delay + exec_value
 
         return base_delay
