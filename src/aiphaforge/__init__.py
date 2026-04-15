@@ -65,7 +65,7 @@ from .config import BacktestConfig, TurnoverConfig, resolve_config
 from .corporate_actions import CorporateActionHook
 from .costs import BaseTradeCost, DefaultTradeCost
 from .engine import BacktestEngine, ExecutionMode, PositionSizing, backtest
-from .exit_rules import BaseExitRule, PercentageStopLoss, PercentageTakeProfit
+from .exit_rules import BaseExitRule, PercentageStopLoss, PercentageTakeProfit, TrailingStopLoss
 from .fees import (
     BaseFeeModel,
     ChinaAShareFeeModel,
@@ -132,7 +132,7 @@ from .strategies import (
     WeightedBlend,
 )
 
-__version__ = '1.8.0'
+__version__ = '1.9.0'
 
 __all__ = [
     # Main engine
@@ -173,6 +173,7 @@ __all__ = [
     'BaseExitRule',
     'PercentageStopLoss',
     'PercentageTakeProfit',
+    'TrailingStopLoss',
 
     # Trade costs
     'BaseTradeCost',

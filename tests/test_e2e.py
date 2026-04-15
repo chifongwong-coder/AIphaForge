@@ -2101,3 +2101,236 @@ class TestMetaLatency:
                 x for x in w if "were not executed" in str(x.message)
             ]
             assert len(drop_warnings) >= 1
+
+
+# ===================================================================
+# Trailing Stop (v1.9)
+# ===================================================================
+
+
+class TestTrailingStop:
+
+    def test_trailing_stop_order_ratchets_and_triggers(self):
+        """Trailing stop sell order ratchets up then triggers on drop."""
+        # Build data: price rises for 10 bars then drops sharply
+        dates = pd.bdate_range("2024-01-01", periods=20, freq="B")
+        close_vals = [100.0]
+        for i in range(1, 10):
+            close_vals.append(close_vals[-1] * 1.02)  # +2% per bar
+        for i in range(10, 20):
+            close_vals.append(close_vals[-1] * 0.95)  # -5% per bar
+        close = np.array(close_vals)
+        high = close * 1.005
+        low = close * 0.995
+        open_ = np.concatenate([[100.0], close[:-1]])
+        open_ = np.clip(open_, low, high)
+        data = pd.DataFrame({
+            'open': open_, 'high': high, 'low': low,
+            'close': close, 'volume': 1_000_000.0,
+        }, index=dates)
+
+        # Create engine with no signals — agent manages orders via hook
+        signals = pd.Series(np.nan, index=data.index, dtype=float)
+
+        class TrailingStopHook(BacktestHook):
+            def __init__(self):
+                self.submitted = False
+                self.order_id = None
+
+            def on_pre_signal(self, ctx):
+                if ctx.bar_index == 0:
+                    # Buy shares first
+                    order = ctx.broker.create_market_order(
+                        ctx.symbol, 'buy', 100, 'open', ctx.timestamp)
+                    ctx.broker.submit_order(order, ctx.timestamp)
+                if ctx.bar_index == 2 and not self.submitted:
+                    # Place trailing stop sell
+                    order = ctx.broker.create_trailing_stop_order(
+                        ctx.symbol, 'sell', 100,
+                        trail_percent=0.1,
+                        initial_price=ctx.bar_data['close'],
+                        reason='trailing_stop',
+                        timestamp=ctx.timestamp,
+                    )
+                    ctx.broker.submit_order(order, ctx.timestamp)
+                    self.order_id = order.order_id
+                    self.submitted = True
+
+        hook = TrailingStopHook()
+        engine = BacktestEngine(
+            mode='event_driven', fee_model=ZeroFeeModel(),
+            initial_capital=100_000, include_benchmark=False,
+            hooks=[hook],
+        )
+        engine.set_signals(signals)
+        result = engine.run(data)
+
+        # The trailing stop should have been filled (price dropped past stop)
+        assert result.num_trades >= 1
+        # Verify the trailing stop order was filled
+        orders_df = result.orders
+        ts_orders = orders_df[orders_df['order_type'] == 'trailing_stop']
+        assert len(ts_orders) >= 1
+        assert ts_orders.iloc[0]['status'] == 'filled'
+
+    def test_trailing_stop_exit_rule(self):
+        """TrailingStopLoss exit rule closes long on retrace."""
+        from aiphaforge.exit_rules import TrailingStopLoss
+
+        # Price rises then drops
+        dates = pd.bdate_range("2024-01-01", periods=30, freq="B")
+        close_vals = [100.0]
+        for _ in range(14):
+            close_vals.append(close_vals[-1] * 1.03)  # +3%
+        for _ in range(15):
+            close_vals.append(close_vals[-1] * 0.96)  # -4%
+        close = np.array(close_vals)
+        high = close * 1.005
+        low = close * 0.995
+        open_ = np.concatenate([[100.0], close[:-1]])
+        open_ = np.clip(open_, low, high)
+        data = pd.DataFrame({
+            'open': open_, 'high': high, 'low': low,
+            'close': close, 'volume': 1_000_000.0,
+        }, index=dates)
+
+        signals = pd.Series(np.nan, index=data.index, dtype=float)
+        signals.iloc[1] = 1  # buy
+
+        engine = BacktestEngine(
+            mode='event_driven', fee_model=ZeroFeeModel(),
+            initial_capital=100_000, include_benchmark=False,
+            trailing_stop_rule=TrailingStopLoss(trail_percent=0.1),
+        )
+        engine.set_signals(signals)
+        result = engine.run(data)
+
+        # Should have closed the position via trailing stop
+        assert result.num_trades >= 1
+        # The exit should have locked in some gains (not all lost)
+        assert result.final_capital > 90_000
+
+    def test_trailing_stop_exit_rule_short(self):
+        """TrailingStopLoss exit rule closes short on rally."""
+        from aiphaforge.exit_rules import TrailingStopLoss
+
+        # Price drops then rallies
+        dates = pd.bdate_range("2024-01-01", periods=30, freq="B")
+        close_vals = [100.0]
+        for _ in range(14):
+            close_vals.append(close_vals[-1] * 0.97)  # -3%
+        for _ in range(15):
+            close_vals.append(close_vals[-1] * 1.04)  # +4%
+        close = np.array(close_vals)
+        high = close * 1.005
+        low = close * 0.995
+        open_ = np.concatenate([[100.0], close[:-1]])
+        open_ = np.clip(open_, low, high)
+        data = pd.DataFrame({
+            'open': open_, 'high': high, 'low': low,
+            'close': close, 'volume': 1_000_000.0,
+        }, index=dates)
+
+        signals = pd.Series(np.nan, index=data.index, dtype=float)
+        signals.iloc[1] = -1  # sell short
+
+        engine = BacktestEngine(
+            mode='event_driven', fee_model=ZeroFeeModel(),
+            initial_capital=100_000, include_benchmark=False,
+            trailing_stop_rule=TrailingStopLoss(trail_percent=0.1),
+        )
+        engine.set_signals(signals)
+        result = engine.run(data)
+
+        # Should have closed the short via trailing stop
+        assert result.num_trades >= 1
+
+    def test_meta_adjust_trailing_stop(self):
+        """Agent adjusts trailing stop mid-backtest via MetaController."""
+        from aiphaforge.exit_rules import TrailingStopLoss
+
+        dates = pd.bdate_range("2024-01-01", periods=20, freq="B")
+        close_vals = [100.0]
+        for _ in range(19):
+            close_vals.append(close_vals[-1] * 1.01)
+        close = np.array(close_vals)
+        high = close * 1.005
+        low = close * 0.995
+        open_ = np.concatenate([[100.0], close[:-1]])
+        open_ = np.clip(open_, low, high)
+        data = pd.DataFrame({
+            'open': open_, 'high': high, 'low': low,
+            'close': close, 'volume': 1_000_000.0,
+        }, index=dates)
+
+        signals = pd.Series(np.nan, index=data.index, dtype=float)
+        signals.iloc[1] = 1  # buy
+
+        class AdjustTrailingHook(BacktestHook):
+            def on_pre_signal(self, ctx):
+                if ctx.bar_index == 5 and ctx.meta:
+                    ctx.meta.adjust_trailing_stop(0.05)
+
+        engine = BacktestEngine(
+            mode='event_driven', fee_model=ZeroFeeModel(),
+            initial_capital=100_000, include_benchmark=False,
+            hooks=[AdjustTrailingHook()],
+        )
+        engine.set_signals(signals)
+        result = engine.run(data)
+
+        # Verify audit log contains the adjust_trailing_stop action
+        audit = result.metadata.get('meta_audit', [])
+        ts_entries = [e for e in audit if e['action'] == 'adjust_trailing_stop']
+        assert len(ts_entries) == 1
+        assert ts_entries[0]['value'] == 0.05
+
+    def test_trailing_stop_coexists_with_stop_loss(self):
+        """Both PercentageStopLoss and TrailingStopLoss active together."""
+        from aiphaforge.exit_rules import TrailingStopLoss
+
+        # Sharp drop — percentage stop loss should trigger first at 5%
+        dates = pd.bdate_range("2024-01-01", periods=20, freq="B")
+        close_vals = [100.0]
+        for _ in range(5):
+            close_vals.append(close_vals[-1] * 1.01)  # slight rise
+        for _ in range(14):
+            close_vals.append(close_vals[-1] * 0.95)  # -5% per bar
+        close = np.array(close_vals)
+        high = close * 1.005
+        low = close * 0.995
+        open_ = np.concatenate([[100.0], close[:-1]])
+        open_ = np.clip(open_, low, high)
+        data = pd.DataFrame({
+            'open': open_, 'high': high, 'low': low,
+            'close': close, 'volume': 1_000_000.0,
+        }, index=dates)
+
+        signals = pd.Series(np.nan, index=data.index, dtype=float)
+        signals.iloc[1] = 1  # buy
+
+        engine = BacktestEngine(
+            mode='event_driven', fee_model=ZeroFeeModel(),
+            initial_capital=100_000, include_benchmark=False,
+            stop_loss=0.05,
+            trailing_stop_rule=TrailingStopLoss(trail_percent=0.15),
+        )
+        engine.set_signals(signals)
+        result = engine.run(data)
+
+        # Position should be closed by whichever rule triggers first
+        assert result.num_trades >= 1
+        # Loss should be limited (not catastrophic)
+        assert result.final_capital > 85_000
+
+    def test_trailing_stop_vectorized_raises(self):
+        """TrailingStopLoss.apply_vectorized raises NotImplementedError."""
+        from aiphaforge.exit_rules import TrailingStopLoss
+
+        rule = TrailingStopLoss(trail_percent=0.1)
+        with pytest.raises(NotImplementedError):
+            rule.apply_vectorized(
+                pd.Series(dtype=float),
+                pd.Series(dtype=float),
+                pd.DataFrame(),
+            )

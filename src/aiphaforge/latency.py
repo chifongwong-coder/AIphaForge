@@ -69,6 +69,7 @@ class _CapturingMetaProxy:
     _MUTABLE_METHODS = {
         'set_strategy', 'adjust_strategy_params',
         'adjust_sizing', 'adjust_stop_loss', 'adjust_take_profit',
+        'adjust_trailing_stop',
         'suppress_signals', 'resume_signals', 'set_target_weights',
         'set_weights', 'swap_child',
     }
