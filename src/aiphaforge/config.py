@@ -74,6 +74,8 @@ class BacktestConfig:
     turnover_config: Any = None  # TurnoverConfig
     # Risk rules (v1.1)
     risk_rules: Any = None  # CompositeRiskManager
+    # Trailing stop (v1.9)
+    trailing_stop_rule: Optional[BaseExitRule] = None
 
 
 @dataclass

@@ -18,6 +18,7 @@ class OrderType(Enum):
     LIMIT = "limit"
     STOP = "stop"
     STOP_LIMIT = "stop_limit"
+    TRAILING_STOP = "trailing_stop"
 
 
 class OrderSide(Enum):
@@ -85,6 +86,8 @@ class Order:
     slippage: float = 0.0
     reason: str = ""
     time_in_force: str = "GTC"
+    trail_amount: Optional[float] = None
+    trail_percent: Optional[float] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
@@ -97,6 +100,22 @@ class Order:
 
         if self.order_type in (OrderType.STOP, OrderType.STOP_LIMIT) and self.stop_price is None:
             raise ValueError("Stop orders must specify a stop price")
+
+        if self.order_type == OrderType.TRAILING_STOP:
+            if (self.trail_amount is None) == (self.trail_percent is None):
+                raise ValueError(
+                    "TRAILING_STOP requires exactly one of "
+                    "trail_amount or trail_percent")
+            if self.trail_percent is not None and not 0 < self.trail_percent < 1:
+                raise ValueError(
+                    f"trail_percent must be in (0, 1), got {self.trail_percent}")
+            if self.trail_amount is not None and self.trail_amount <= 0:
+                raise ValueError(
+                    f"trail_amount must be positive, got {self.trail_amount}")
+            if self.stop_price is None:
+                raise ValueError(
+                    "TRAILING_STOP requires initial stop_price. "
+                    "Compute from current price and trail distance.")
 
         # Convert string types
         if isinstance(self.side, str):
@@ -235,6 +254,8 @@ class Order:
             'slippage': self.slippage,
             'reason': self.reason,
             'time_in_force': self.time_in_force,
+            'trail_amount': self.trail_amount,
+            'trail_percent': self.trail_percent,
             'metadata': dict(self.metadata),
             'remaining_size': self.remaining_size,
             'notional_value': self.notional_value
@@ -259,6 +280,10 @@ class Order:
             price_str = f"@{self.price:.2f}"
         elif self.order_type == OrderType.STOP:
             price_str = f"STOP@{self.stop_price:.2f}"
+        elif self.order_type == OrderType.TRAILING_STOP:
+            trail = (f"trail={self.trail_percent:.1%}"
+                     if self.trail_percent else f"trail={self.trail_amount}")
+            price_str = f"stop={self.stop_price:.4f} {trail}"
         else:
             price_str = f"STOP@{self.stop_price:.2f}->@{self.price:.2f}"
 
@@ -379,6 +404,66 @@ class OrderManager:
             size=size, stop_price=stop_price, reason=reason, timestamp=timestamp,
             time_in_force=time_in_force,
         )
+
+    def create_trailing_stop_order(
+        self,
+        symbol: str,
+        side: str,
+        size: float,
+        trail_amount: Optional[float] = None,
+        trail_percent: Optional[float] = None,
+        initial_price: Optional[float] = None,
+        reason: str = "",
+        timestamp: Optional[pd.Timestamp] = None,
+        time_in_force: str = "GTC",
+    ) -> Order:
+        """Create a trailing stop order.
+
+        Parameters:
+            symbol: Instrument symbol.
+            side: Direction ('buy' or 'sell').
+            size: Order quantity.
+            trail_amount: Absolute trail distance. Exactly one of
+                trail_amount or trail_percent must be provided.
+            trail_percent: Percentage trail distance as fraction
+                (e.g. 0.1 = 10%). Must be in (0, 1).
+            initial_price: Current market price for computing the
+                initial stop_price.
+            reason: Order reason/tag.
+            timestamp: Creation time.
+            time_in_force: Order validity type ('GTC', 'DAY', etc.).
+
+        Returns:
+            Order: The created trailing stop order.
+        """
+        if initial_price is None:
+            raise ValueError(
+                "initial_price is required for trailing stop orders")
+        parsed_side = OrderSide(side.lower())
+        if parsed_side == OrderSide.SELL:
+            if trail_percent is not None:
+                stop_price = initial_price * (1 - trail_percent)
+            else:
+                stop_price = initial_price - trail_amount
+        else:
+            if trail_percent is not None:
+                stop_price = initial_price * (1 + trail_percent)
+            else:
+                stop_price = initial_price + trail_amount
+        order = Order(
+            order_id=self._generate_order_id(),
+            symbol=symbol,
+            side=parsed_side,
+            order_type=OrderType.TRAILING_STOP,
+            size=size,
+            stop_price=stop_price,
+            trail_amount=trail_amount,
+            trail_percent=trail_percent,
+            reason=reason,
+            created_time=timestamp,
+            time_in_force=time_in_force,
+        )
+        return order
 
     def submit(self, order: Order) -> str:
         """

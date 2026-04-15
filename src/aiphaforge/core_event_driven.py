@@ -143,7 +143,8 @@ def run_event_driven(
 
     # --- Build exit rules list ---
     exit_rules = [r for r in [config.stop_loss_rule,
-                               config.take_profit_rule] if r is not None]
+                               config.take_profit_rule,
+                               config.trailing_stop_rule] if r is not None]
 
     # --- Reset risk rules for this run ---
     if config.risk_rules:
@@ -225,12 +226,15 @@ def run_event_driven(
         if meta is not None and (
             'stop_loss_rule' in meta._overrides
             or 'take_profit_rule' in meta._overrides
+            or 'trailing_stop_rule' in meta._overrides
         ):
             sl = meta._overrides.get(
                 'stop_loss_rule', config.stop_loss_rule)
             tp = meta._overrides.get(
                 'take_profit_rule', config.take_profit_rule)
-            active_exit_rules = [r for r in [sl, tp] if r is not None]
+            ts = meta._overrides.get(
+                'trailing_stop_rule', config.trailing_stop_rule)
+            active_exit_rules = [r for r in [sl, tp, ts] if r is not None]
         for sym in active:
             bar = data_dict[sym].loc[timestamp]
             for rule in active_exit_rules:

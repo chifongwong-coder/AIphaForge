@@ -143,6 +143,45 @@ class Broker:
             time_in_force=time_in_force,
         )
 
+    def create_trailing_stop_order(
+        self,
+        symbol: str,
+        side: str,
+        size: float,
+        trail_amount: Optional[float] = None,
+        trail_percent: Optional[float] = None,
+        initial_price: Optional[float] = None,
+        reason: str = "",
+        timestamp: Optional[pd.Timestamp] = None,
+        time_in_force: str = "GTC",
+    ) -> Order:
+        """Create a trailing stop order.
+
+        Parameters:
+            symbol: Instrument symbol.
+            side: Direction ('buy' or 'sell').
+            size: Order quantity.
+            trail_amount: Absolute trail distance.
+            trail_percent: Percentage trail distance (fraction in (0, 1)).
+            initial_price: Current market price for computing initial
+                stop_price.
+            reason: Order reason/tag.
+            timestamp: Creation time.
+            time_in_force: Order validity type.
+
+        Returns:
+            Order: The created trailing stop order.
+        """
+        return self.order_manager.create_trailing_stop_order(
+            symbol, side, size,
+            trail_amount=trail_amount,
+            trail_percent=trail_percent,
+            initial_price=initial_price,
+            reason=reason,
+            timestamp=timestamp,
+            time_in_force=time_in_force,
+        )
+
     # ========== Order Submission ==========
 
     def submit_order(
@@ -268,6 +307,9 @@ class Broker:
                 continue
             if self._is_day_order_stale(order, timestamp):
                 order.expire("day_session_end")
+
+        # Phase 0: Update trailing stop prices before fill checking
+        self._update_trailing_stops(bar, symbol)
 
         # Refresh the pending list after expiring DAY orders
         pending = self.order_manager.get_pending_orders(symbol)
@@ -427,6 +469,42 @@ class Broker:
         # Calendar-day based: stale when date changes
         return current_timestamp.date() != order.created_time.date()
 
+    def _update_trailing_stops(
+        self,
+        bar: pd.Series,
+        symbol: str,
+    ) -> None:
+        """Ratchet trailing stop prices using current bar data.
+
+        For sell trailing stops (long protection):
+            new_stop = high * (1 - trail_percent)  [or high - trail_amount]
+            stop_price = max(stop_price, new_stop)  # only ratchets UP
+
+        For buy trailing stops (short protection):
+            new_stop = low * (1 + trail_percent)  [or low + trail_amount]
+            stop_price = min(stop_price, new_stop)  # only ratchets DOWN
+
+        Called at the start of process_bar, before fill checking.
+        """
+        pending = self.order_manager.get_pending_orders(symbol)
+        for order in pending:
+            if order.order_type != OrderType.TRAILING_STOP:
+                continue
+            if order.side == OrderSide.SELL:
+                high = bar['high']
+                if order.trail_percent is not None:
+                    new_stop = high * (1 - order.trail_percent)
+                else:
+                    new_stop = high - order.trail_amount
+                order.stop_price = max(order.stop_price, new_stop)
+            else:  # BUY (short protection)
+                low = bar['low']
+                if order.trail_percent is not None:
+                    new_stop = low * (1 + order.trail_percent)
+                else:
+                    new_stop = low + order.trail_amount
+                order.stop_price = min(order.stop_price, new_stop)
+
     def _try_fill_order(
         self,
         order: Order,
@@ -461,7 +539,7 @@ class Broker:
                 fill_price = order.price
                 return self._execute_fill(order, fill_price, order.size, timestamp, volume, bypass_partial_clip)
 
-        elif order.order_type == OrderType.STOP:
+        elif order.order_type in (OrderType.STOP, OrderType.TRAILING_STOP):
             if should_trigger_stop(order.stop_price, order.side, high, low):
                 fill_price = self._get_stop_fill_price(order, bar)
                 return self._execute_fill(order, fill_price, order.size, timestamp, volume, bypass_partial_clip)

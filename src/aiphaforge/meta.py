@@ -82,6 +82,17 @@ class MetaContext:
         self._overrides['take_profit_rule'] = PercentageTakeProfit(threshold)
         self._log('adjust_take_profit', threshold)
 
+    def adjust_trailing_stop(self, trail_percent: float) -> None:
+        """Override trailing stop-loss rule.
+
+        Creates a new TrailingStopLoss with the given trail_percent.
+        Fresh watermark — starts tracking from the current bar.
+        Independent of adjust_stop_loss (both can be active).
+        """
+        from .exit_rules import TrailingStopLoss
+        self._overrides['trailing_stop_rule'] = TrailingStopLoss(trail_percent)
+        self._log('adjust_trailing_stop', trail_percent)
+
     # --- Signal control ---
 
     def suppress_signals(self) -> None:

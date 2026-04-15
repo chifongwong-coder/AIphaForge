@@ -5,6 +5,8 @@ Pluggable exit rule framework for stop-loss, take-profit, and custom exits.
 Each rule implements both vectorized and event-driven interfaces.
 """
 
+from typing import Dict
+
 import numpy as np
 import pandas as pd
 
@@ -177,3 +179,76 @@ class PercentageTakeProfit(BaseExitRule):
                 timestamp,
             )
             broker.submit_order(order, timestamp)
+
+
+class TrailingStopLoss(BaseExitRule):
+    """Trailing stop-loss exit rule.
+
+    Tracks the highest high (for longs) or lowest low (for shorts)
+    since position entry. When price retraces by trail_percent from
+    the watermark, submits a market close order.
+
+    Unlike TRAILING_STOP broker orders, this rule manages the
+    watermark internally and submits market orders — no persistent
+    broker orders needed.
+
+    Parameters:
+        trail_percent: Trail distance as fraction (e.g. 0.05 = 5%).
+    """
+
+    def __init__(self, trail_percent: float):
+        if not 0 < trail_percent < 1:
+            raise ValueError(
+                f"trail_percent must be in (0, 1), got {trail_percent}")
+        self.trail_percent = trail_percent
+        self._watermarks: Dict[str, float] = {}
+
+    def check_event_driven(
+        self,
+        portfolio: Portfolio,
+        broker: Broker,
+        symbol: str,
+        bar: pd.Series,
+        timestamp: pd.Timestamp,
+    ) -> None:
+        """Check and execute trailing stop in event-driven mode."""
+        position = portfolio.get_position(symbol)
+        if position is None or position.size == 0:
+            # No position: clear watermark if exists
+            self._watermarks.pop(symbol, None)
+            return
+
+        high = bar['high']
+        low = bar['low']
+
+        if position.size > 0:  # long
+            wm = max(self._watermarks.get(symbol, high), high)
+            self._watermarks[symbol] = wm
+            stop_level = wm * (1 - self.trail_percent)
+            if low <= stop_level:
+                order = broker.create_market_order(
+                    symbol, 'sell', abs(position.size),
+                    'trailing_stop_exit', timestamp)
+                broker.submit_order(order, timestamp)
+                self._watermarks.pop(symbol, None)
+        else:  # short
+            wm = min(self._watermarks.get(symbol, low), low)
+            self._watermarks[symbol] = wm
+            stop_level = wm * (1 + self.trail_percent)
+            if high >= stop_level:
+                order = broker.create_market_order(
+                    symbol, 'buy', abs(position.size),
+                    'trailing_stop_exit', timestamp)
+                broker.submit_order(order, timestamp)
+                self._watermarks.pop(symbol, None)
+
+    def apply_vectorized(
+        self,
+        returns: pd.Series,
+        positions: pd.Series,
+        data: pd.DataFrame,
+    ) -> pd.Series:
+        """Not implemented — trailing stops are path-dependent."""
+        raise NotImplementedError(
+            "TrailingStopLoss does not support vectorized mode. "
+            "Use event-driven mode for trailing stop simulation.")
