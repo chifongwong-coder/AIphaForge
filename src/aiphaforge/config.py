@@ -78,6 +78,10 @@ class BacktestConfig:
     trailing_stop_rule: Optional[BaseExitRule] = None
     # Dynamic universe (v1.9.2)
     initial_universe: Optional[List[str]] = None
+    # Market impact (v1.9.4)
+    impact_model: Optional[Any] = None  # BaseImpactModel
+    impact_adv_lookback: int = 20
+    impact_vol_lookback: int = 20
 
 
 @dataclass

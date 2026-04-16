@@ -2975,3 +2975,197 @@ class TestPortfolioOptimizer:
         # With only 1 row, covariance is NaN -> optimizer should fail
         with pytest.raises((RuntimeError, ValueError)):
             opt.compute_weights(returns)
+
+
+# ===================================================================
+# Market Impact
+# ===================================================================
+
+class TestMarketImpact:
+    """E2E tests for market impact models and capacity estimation."""
+
+    def test_impact_makes_fills_worse(self):
+        """With SquareRootImpactModel, final capital is lower than without."""
+        from aiphaforge import SquareRootImpactModel
+
+        data = make_ohlcv(100)
+        signals = pd.Series(np.nan, index=data.index, dtype=float)
+        signals.iloc[5] = 1    # buy
+        signals.iloc[50] = 0   # flat
+        signals.iloc[55] = -1  # sell short
+        signals.iloc[90] = 0   # flat
+
+        engine_no_impact = BacktestEngine(
+            initial_capital=100000,
+            mode="event_driven",
+            fee_model="zero",
+        )
+        engine_no_impact.set_signals(signals)
+        result_no = engine_no_impact.run(data, symbol="TEST")
+
+        engine_impact = BacktestEngine(
+            initial_capital=100000,
+            mode="event_driven",
+            fee_model="zero",
+            impact_model=SquareRootImpactModel(eta=0.5, gamma=0.1),
+        )
+        engine_impact.set_signals(signals)
+        result_yes = engine_impact.run(data, symbol="TEST")
+
+        # Impact always makes performance worse (or equal if no fills)
+        assert result_yes.final_capital <= result_no.final_capital
+
+    def test_buy_fills_higher_sell_lower(self):
+        """Buy fill price > no-impact price, sell fill price < no-impact."""
+        from aiphaforge import LinearImpactModel
+
+        data = make_ohlcv(60)
+        # Simple buy then sell
+        signals = pd.Series(np.nan, index=data.index, dtype=float)
+        signals.iloc[5] = 1
+        signals.iloc[30] = 0
+
+        engine_no = BacktestEngine(
+            initial_capital=100000,
+            mode="event_driven",
+            fee_model="zero",
+        )
+        engine_no.set_signals(signals)
+        res_no = engine_no.run(data, symbol="TEST")
+
+        engine_yes = BacktestEngine(
+            initial_capital=100000,
+            mode="event_driven",
+            fee_model="zero",
+            impact_model=LinearImpactModel(eta=0.1),
+        )
+        engine_yes.set_signals(signals)
+        res_yes = engine_yes.run(data, symbol="TEST")
+
+        # Find the buy and sell trades
+        trades_no = res_no.trades
+        trades_yes = res_yes.trades
+        assert len(trades_no) > 0
+        assert len(trades_yes) > 0
+
+        # Buy fill should be more expensive with impact
+        assert trades_yes[0].entry_price >= trades_no[0].entry_price
+        # Sell (close) fill should be cheaper with impact
+        assert trades_yes[0].exit_price <= trades_no[0].exit_price
+
+    def test_no_impact_default(self):
+        """impact_model=None produces identical results to current behavior."""
+        data = make_ohlcv(60)
+        signals = pd.Series(np.nan, index=data.index, dtype=float)
+        signals.iloc[5] = 1
+        signals.iloc[30] = 0
+
+        engine_a = BacktestEngine(
+            initial_capital=100000,
+            mode="event_driven",
+            fee_model="zero",
+        )
+        engine_a.set_signals(signals)
+        res_a = engine_a.run(data, symbol="TEST")
+
+        engine_b = BacktestEngine(
+            initial_capital=100000,
+            mode="event_driven",
+            fee_model="zero",
+            impact_model=None,
+        )
+        engine_b.set_signals(signals)
+        res_b = engine_b.run(data, symbol="TEST")
+
+        assert abs(res_a.final_capital - res_b.final_capital) < 0.01
+
+    def test_volume_based_auto_override(self):
+        """VOLUME_BASED slippage + impact_model triggers warning and override."""
+        from aiphaforge import SquareRootImpactModel
+        from aiphaforge.broker import Broker, SlippageModel
+
+        broker = Broker(slippage_model=SlippageModel.VOLUME_BASED)
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            broker.set_impact_model(SquareRootImpactModel())
+            assert any("VOLUME_BASED" in str(x.message) for x in w)
+        assert broker.slippage_model == SlippageModel.FIXED
+
+    def test_estimate_capacity(self):
+        """Run backtest then estimate_capacity; higher capital -> lower Sharpe."""
+        from aiphaforge import SquareRootImpactModel, estimate_capacity
+
+        data = make_ohlcv(120, volatility=0.03)
+        signals = pd.Series(np.nan, index=data.index, dtype=float)
+        signals.iloc[5] = 1
+        signals.iloc[50] = 0
+        signals.iloc[55] = 1
+        signals.iloc[100] = 0
+
+        engine = BacktestEngine(
+            initial_capital=100000,
+            mode="event_driven",
+            fee_model="zero",
+        )
+        engine.set_signals(signals)
+        result = engine.run(data, symbol="TEST")
+
+        cap_result = estimate_capacity(
+            result, data,
+            impact_model=SquareRootImpactModel(eta=0.5, gamma=0.1),
+            capital_multipliers=[1, 5, 10, 50],
+            min_sharpe=0.5,
+        )
+
+        df = cap_result.results_by_capital
+        assert 'capital_multiplier' in df.columns
+        assert 'adjusted_sharpe' in df.columns
+        assert 'capital' in df.columns
+
+        # Higher capital should have lower or equal adjusted Sharpe
+        sharpes = df['adjusted_sharpe'].tolist()
+        for i in range(len(sharpes) - 1):
+            assert sharpes[i] >= sharpes[i + 1] - 1e-9
+
+    def test_impact_stored_in_metadata(self):
+        """order.metadata contains 'market_impact_bps' after fill."""
+        from aiphaforge import LinearImpactModel
+
+        data = make_ohlcv(60)
+        signals = pd.Series(np.nan, index=data.index, dtype=float)
+        signals.iloc[5] = 1
+        signals.iloc[30] = 0
+
+        engine = BacktestEngine(
+            initial_capital=100000,
+            mode="event_driven",
+            fee_model="zero",
+            impact_model=LinearImpactModel(eta=0.1),
+        )
+        engine.set_signals(signals)
+        result = engine.run(data, symbol="TEST")
+
+        # Check that at least one filled order has impact metadata
+        assert len(result.orders) > 0
+        filled = result.orders[result.orders['status'] == 'filled']
+        assert len(filled) > 0
+        # Metadata is stored on the order objects; verify via trades
+        # The impact should be reflected in worse fill prices (already
+        # tested above). Here we verify the metadata field by checking
+        # the orders dataframe has metadata column.
+        # We also run a lower-level check:
+        from aiphaforge.broker import Broker, SlippageModel
+        from aiphaforge.fees import ZeroFeeModel
+        broker = Broker(fee_model=ZeroFeeModel())
+        broker.set_impact_model(LinearImpactModel(eta=0.1))
+        broker._adv = 500000
+        broker._volatility = 0.02
+        order = broker.create_market_order("X", "buy", 100)
+        broker.submit_order(order)
+        bar = pd.Series({
+            'open': 100, 'high': 105, 'low': 95,
+            'close': 100, 'volume': 500000,
+        })
+        broker.process_bar(bar, pd.Timestamp("2024-01-02"), "X")
+        assert 'market_impact_bps' in order.metadata
+        assert order.metadata['market_impact_bps'] > 0

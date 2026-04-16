@@ -97,6 +97,16 @@ from .margin import (
     MarginConfig,
     PeriodicCostModel,
 )
+from .market_impact import (
+    BaseImpactModel,
+    CapacityResult,
+    LinearImpactModel,
+    PowerLawImpactModel,
+    SquareRootImpactModel,
+    corwin_schultz_spread,
+    estimate_capacity,
+    suggested_impact_params,
+)
 from .meta import MetaContext
 from .optimizer import BayesianResult, optimize, optimize_bayesian, walk_forward
 from .orders import Order, OrderManager, OrderSide, OrderStatus, OrderType
@@ -144,7 +154,7 @@ from .strategies import (
     WeightedBlend,
 )
 
-__version__ = '1.9.3'
+__version__ = '1.9.4'
 
 __all__ = [
     # Main engine
@@ -271,6 +281,16 @@ __all__ = [
     'monte_carlo_test',
     'multiple_comparison_correction',
     'build_returns_matrix',
+
+    # Market impact (v1.9.4)
+    'BaseImpactModel',
+    'LinearImpactModel',
+    'SquareRootImpactModel',
+    'PowerLawImpactModel',
+    'estimate_capacity',
+    'CapacityResult',
+    'suggested_impact_params',
+    'corwin_schultz_spread',
 
     # Portfolio optimization
     'BasePortfolioOptimizer',
