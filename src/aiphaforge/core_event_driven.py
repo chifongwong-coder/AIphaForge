@@ -372,6 +372,9 @@ def run_event_driven(
         if meta is not None and meta._pending_removals:
             for sym in list(meta._pending_removals):
                 if sym in brokers:
+                    # Cancel all pending orders first (prevent orphan fills)
+                    brokers[sym].cancel_all_orders(sym)
+                    # Close open position if any
                     pos = portfolio.get_position(sym)
                     if pos is not None and not pos.is_flat:
                         _submit_order(sym, -pos.size, prices[sym],
