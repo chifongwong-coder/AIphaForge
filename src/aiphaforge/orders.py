@@ -101,6 +101,10 @@ class Order:
         if self.order_type in (OrderType.STOP, OrderType.STOP_LIMIT) and self.stop_price is None:
             raise ValueError("Stop orders must specify a stop price")
 
+        if self.order_type == OrderType.STOP_LIMIT and self.price is None:
+            raise ValueError(
+                "Stop-limit orders must specify both stop_price and price")
+
         if self.order_type == OrderType.TRAILING_STOP:
             if (self.trail_amount is None) == (self.trail_percent is None):
                 raise ValueError(
