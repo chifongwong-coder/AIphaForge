@@ -37,7 +37,8 @@ AIphaForge also works perfectly well as a general-purpose backtest framework for
 - **Hook framework**: `on_pre_signal` / `on_bar` callbacks with full broker and portfolio access
 - **MetaController**: Agent dynamically adjusts strategy, risk, sizing, and target weights mid-backtest via `ctx.meta`
 - **Strategy composition tree**: `WeightedBlend`, `SelectBest`, `PriorityCascade`, `VoteEnsemble`, `ConditionalSwitch` — composable strategy nodes that work with MetaController
-- **Latency simulation**: `LatencyHook` models LLM inference delay (fixed, statistical, or custom distributions)
+- **Latency simulation**: `LatencyHook` models LLM inference delay with decision/execution delay separation — decision latency applies to both orders and MetaController operations, per-symbol execution latency is additive
+- **Dynamic universe selection**: `add_to_universe()` / `remove_from_universe()` / `set_universe()` — agent decides what to trade at runtime, with automatic position closing on removal
 - **Multi-timeframe**: `secondary_data` for daily trend analysis while executing on minute bars
 - **Scheduled rebalancing**: `ScheduleHook` for periodic callbacks (daily/weekly/monthly/quarterly/N-bar)
 - **Rebalancing hooks**: `DriftRebalanceHook` (threshold-based), `BandRebalanceHook` (per-asset band), `CostAwareRebalanceHook` (turnover vs. cost) — all support static or dynamic weights
@@ -183,6 +184,47 @@ print(f"In-sample Sharpe:  {result.in_sample_result.sharpe_ratio:.2f}")
 print(f"Out-of-sample:     {result.out_of_sample_result.sharpe_ratio:.2f}")
 ```
 
+### Dynamic Universe Selection
+
+```python
+from aiphaforge import BacktestEngine, BacktestHook
+
+class UniverseRotator(BacktestHook):
+    def on_pre_signal(self, ctx):
+        if ctx.meta and ctx.bar_index % 20 == 0:
+            # Rotate: keep top 3 by recent momentum
+            momentum = {}
+            for sym in ctx.meta._all_symbols:
+                df = ctx.all_data.get(sym)
+                if df is not None and len(df) > 20:
+                    momentum[sym] = df['close'].iloc[-1] / df['close'].iloc[-20] - 1
+            top3 = sorted(momentum, key=momentum.get, reverse=True)[:3]
+            ctx.meta.set_universe(top3)
+
+engine = BacktestEngine(mode='event_driven', hooks=[UniverseRotator()],
+                         initial_universe=["AAPL", "TSLA"])
+result = engine.run(data_dict)  # data_dict has 10+ symbols
+```
+
+### Market Impact Estimation
+
+```python
+from aiphaforge import BacktestEngine
+from aiphaforge.market_impact import SquareRootImpactModel, estimate_capacity
+
+# Backtest with realistic market impact
+engine = BacktestEngine(
+    impact_model=SquareRootImpactModel(eta=0.5, gamma=0.1),
+    fee_model='us',
+)
+engine.set_strategy(strategy)
+result = engine.run(data)
+
+# Estimate how much capital this strategy can handle
+capacity = estimate_capacity(result, data, min_sharpe=1.0)
+print(f"Max capacity: ${capacity.estimated_capacity:,.0f}")
+```
+
 ## Installation
 
 ```bash
@@ -196,6 +238,7 @@ pip install aiphaforge[plot]          # matplotlib for visualization
 pip install aiphaforge[data]          # yfinance for data loading
 pip install aiphaforge[optimize]      # optuna for Bayesian optimization
 pip install aiphaforge[significance]  # arch for Model Confidence Set
+pip install aiphaforge[portfolio]     # scipy for portfolio optimization
 pip install aiphaforge[all]           # everything
 ```
 
