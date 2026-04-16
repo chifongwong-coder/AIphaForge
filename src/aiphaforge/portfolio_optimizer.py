@@ -107,6 +107,41 @@ class InverseVolatilityOptimizer(BasePortfolioOptimizer):
         return dict(zip(cols, weights))
 
 
+def _postprocess_weights(
+    raw_weights: np.ndarray, columns: object,
+    bounds: list, allow_short: bool = False,
+) -> Dict[str, float]:
+    """Clip to bounds and normalize to sum=1 after scipy solve."""
+    w = raw_weights.copy()
+    # Clip to bounds
+    for i, (lo, hi) in enumerate(bounds):
+        if lo is not None:
+            w[i] = max(w[i], lo)
+        if hi is not None:
+            w[i] = min(w[i], hi)
+    # Normalize to sum=1
+    total = w.sum()
+    if total > 0:
+        w = w / total
+    elif not allow_short:
+        n = len(w)
+        w = np.ones(n) / n if n > 0 else w
+    return dict(zip(columns, w))
+
+
+def _check_min_rows(
+    data: pd.DataFrame, on_failure: str,
+) -> Optional[Dict[str, float]]:
+    """Return failure result if data has too few rows for covariance."""
+    n = len(data.columns)
+    t = len(data)
+    if t < max(n + 1, 2):
+        msg = (f"Insufficient data: {t} rows for {n} assets. "
+               f"Need at least {max(n + 1, 2)} rows for covariance.")
+        return _handle_failure(on_failure, msg, data.columns)
+    return None  # OK to proceed
+
+
 def _handle_failure(
     on_failure: str, message: str, columns: object,
 ) -> Optional[Dict[str, float]]:
@@ -119,6 +154,8 @@ def _handle_failure(
     warnings.warn(f"Optimizer failed: {message}. Equal weight fallback.")
     col_list = list(columns)
     n = len(col_list)
+    if n == 0:
+        return {}
     return {sym: 1.0 / n for sym in col_list}
 
 
@@ -176,6 +213,11 @@ class MeanVarianceOptimizer(BasePortfolioOptimizer):
         if n == 0:
             return {}
 
+        # Check minimum rows for covariance
+        fail = _check_min_rows(data, self.on_failure)
+        if fail is not None:
+            return fail
+
         # Annualize
         mu = data.mean().values * self.trading_days
         sigma = data.cov().values * self.trading_days
@@ -183,7 +225,7 @@ class MeanVarianceOptimizer(BasePortfolioOptimizer):
         # Regularize if needed
         if n >= t:
             warnings.warn(
-                f"N({n}) >= T({t}): covariance is singular. "
+                f"N({n}) >= T({t}): covariance may be ill-conditioned. "
                 f"Adding diagonal regularization eps={self.regularize_eps}."
             )
             sigma += self.regularize_eps * np.eye(n)
@@ -211,7 +253,8 @@ class MeanVarianceOptimizer(BasePortfolioOptimizer):
         if not result.success:
             return _handle_failure(self.on_failure, str(result.message), data.columns)
 
-        return dict(zip(data.columns, result.x))
+        return _postprocess_weights(
+            result.x, data.columns, bounds, self.allow_short)
 
 
 class RiskParityOptimizer(BasePortfolioOptimizer):
@@ -254,16 +297,20 @@ class RiskParityOptimizer(BasePortfolioOptimizer):
 
         data = returns.iloc[-self.lookback:]
         n = len(data.columns)
-        t = len(data)
 
         if n == 0:
             return {}
 
+        fail = _check_min_rows(data, self.on_failure)
+        if fail is not None:
+            return fail
+
         sigma = data.cov().values * self.trading_days
+        t = len(data)
 
         if n >= t:
             warnings.warn(
-                f"N({n}) >= T({t}): covariance is singular. "
+                f"N({n}) >= T({t}): covariance may be ill-conditioned. "
                 f"Adding diagonal regularization eps={self.regularize_eps}."
             )
             sigma += self.regularize_eps * np.eye(n)
@@ -275,12 +322,9 @@ class RiskParityOptimizer(BasePortfolioOptimizer):
             if port_var <= 0:
                 return 0.0
             marginal = sigma @ w
-            # Normalized risk contributions (sum to 1.0)
             risk_contrib = w * marginal / port_var
             return float(np.sum((risk_contrib - target) ** 2))
 
-        # Skip analytical jac for RiskParity -- SLSQP will use finite
-        # differences, which is acceptable for the typical case (<50 assets).
         constraints = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
         bounds = [(0.001, 1.0)] * n
         x0 = np.ones(n) / n
@@ -293,7 +337,7 @@ class RiskParityOptimizer(BasePortfolioOptimizer):
         if not result.success:
             return _handle_failure(self.on_failure, str(result.message), data.columns)
 
-        return dict(zip(data.columns, result.x))
+        return _postprocess_weights(result.x, data.columns, bounds)
 
 
 class MinimumVarianceOptimizer(BasePortfolioOptimizer):
@@ -336,16 +380,20 @@ class MinimumVarianceOptimizer(BasePortfolioOptimizer):
 
         data = returns.iloc[-self.lookback:]
         n = len(data.columns)
-        t = len(data)
 
         if n == 0:
             return {}
 
+        fail = _check_min_rows(data, self.on_failure)
+        if fail is not None:
+            return fail
+
         sigma = data.cov().values * self.trading_days
+        t = len(data)
 
         if n >= t:
             warnings.warn(
-                f"N({n}) >= T({t}): covariance is singular. "
+                f"N({n}) >= T({t}): covariance may be ill-conditioned. "
                 f"Adding diagonal regularization eps={self.regularize_eps}."
             )
             sigma += self.regularize_eps * np.eye(n)
@@ -371,4 +419,5 @@ class MinimumVarianceOptimizer(BasePortfolioOptimizer):
         if not result.success:
             return _handle_failure(self.on_failure, str(result.message), data.columns)
 
-        return dict(zip(data.columns, result.x))
+        return _postprocess_weights(
+            result.x, data.columns, bounds, self.allow_short)

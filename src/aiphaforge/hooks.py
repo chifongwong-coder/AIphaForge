@@ -284,10 +284,15 @@ class DriftRebalanceHook(BacktestHook):
             self._get_weights = target_weights
         else:
             weights = dict(target_weights)
-            self._get_weights = lambda ctx: weights
+            self._static_weights = weights
+            self._get_weights = self._return_static_weights
         self.threshold = threshold
         self.min_interval = min_interval
         self._last_rebalance_bar: int = -999
+
+    def _return_static_weights(self, ctx: HookContext) -> Dict[str, float]:
+        """Return stored static weights (deep-copy safe, no lambda)."""
+        return self._static_weights  # type: ignore[return-value]
 
     def on_backtest_start(
         self,
@@ -354,9 +359,14 @@ class BandRebalanceHook(BacktestHook):
             self._get_weights = target_weights
         else:
             weights = dict(target_weights)
-            self._get_weights = lambda ctx: weights
+            self._static_weights = weights
+            self._get_weights = self._return_static_weights
         self.band = band
         self._schedule = ScheduleHook(frequency, self._check_bands)
+
+    def _return_static_weights(self, ctx: HookContext) -> Dict[str, float]:
+        """Return stored static weights (deep-copy safe, no lambda)."""
+        return self._static_weights  # type: ignore[return-value]
 
     def on_backtest_start(
         self,
@@ -419,10 +429,15 @@ class CostAwareRebalanceHook(BacktestHook):
             self._get_weights = target_weights
         else:
             weights = dict(target_weights)
-            self._get_weights = lambda ctx: weights
+            self._static_weights = weights
+            self._get_weights = self._return_static_weights
         self.fee_rate = fee_rate
         self.cost_multiplier = cost_multiplier
         self._schedule = ScheduleHook(frequency, self._evaluate)
+
+    def _return_static_weights(self, ctx: HookContext) -> Dict[str, float]:
+        """Return stored static weights (deep-copy safe, no lambda)."""
+        return self._static_weights  # type: ignore[return-value]
 
     def on_backtest_start(
         self,
