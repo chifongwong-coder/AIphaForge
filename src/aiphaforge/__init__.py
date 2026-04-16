@@ -83,6 +83,7 @@ from .hooks import (
     CostAwareRebalanceHook,
     DriftRebalanceHook,
     HookContext,
+    OptimizedRebalanceHook,
     ScheduleHook,
     SecondaryTimeframe,
     schedule_rebalance,
@@ -101,6 +102,14 @@ from .optimizer import BayesianResult, optimize, optimize_bayesian, walk_forward
 from .orders import Order, OrderManager, OrderSide, OrderStatus, OrderType
 from .performance import PerformanceAnalyzer, analyze, compare_strategies
 from .portfolio import Portfolio, Position
+from .portfolio_optimizer import (
+    BasePortfolioOptimizer,
+    EqualWeightOptimizer,
+    InverseVolatilityOptimizer,
+    MeanVarianceOptimizer,
+    MinimumVarianceOptimizer,
+    RiskParityOptimizer,
+)
 from .position_sizing import AllInSizer, BasePositionSizer, FixedSizer, FractionSizer
 from .results import BacktestResult, EquityPoint, PositionSnapshot, Trade, trades_to_dataframe
 from .risk import (
@@ -135,7 +144,7 @@ from .strategies import (
     WeightedBlend,
 )
 
-__version__ = '1.9.2'
+__version__ = '1.9.3'
 
 __all__ = [
     # Main engine
@@ -197,6 +206,7 @@ __all__ = [
     'DriftRebalanceHook',
     'BandRebalanceHook',
     'CostAwareRebalanceHook',
+    'OptimizedRebalanceHook',
     'LatencyHook',
     'SimpleLatencyHook',
     'SymbolRoutingLatencyHook',
@@ -261,6 +271,14 @@ __all__ = [
     'monte_carlo_test',
     'multiple_comparison_correction',
     'build_returns_matrix',
+
+    # Portfolio optimization
+    'BasePortfolioOptimizer',
+    'EqualWeightOptimizer',
+    'InverseVolatilityOptimizer',
+    'MeanVarianceOptimizer',
+    'RiskParityOptimizer',
+    'MinimumVarianceOptimizer',
 
     # Results
     'Trade',
