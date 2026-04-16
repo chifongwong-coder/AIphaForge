@@ -654,6 +654,13 @@ class Broker:
                 adjusted_price *= (1 + impact)
             else:
                 adjusted_price *= (1 - impact)
+            # Clamp limit/stop-limit orders to their limit price
+            # (impact cannot make fills worse than the limit guarantee)
+            if order.order_type in (OrderType.LIMIT, OrderType.STOP_LIMIT):
+                if order.is_buy and order.price is not None:
+                    adjusted_price = min(adjusted_price, order.price)
+                elif not order.is_buy and order.price is not None:
+                    adjusted_price = max(adjusted_price, order.price)
             if 'market_impact_bps' not in order.metadata:
                 order.metadata['market_impact_bps'] = 0.0
             order.metadata['market_impact_bps'] += impact * 10000

@@ -270,9 +270,8 @@ def corwin_schultz_spread(
 
     # Alpha
     sqrt_2 = math.sqrt(2)
-    k = 2 * math.sqrt(2) - 1
-    denom = 3 - 2 * sqrt_2
-    alpha = (np.sqrt(2 * beta) - np.sqrt(beta)) / k - np.sqrt(gamma / denom)
+    denom = 3 - 2 * sqrt_2  # ≈ 0.172 (Corwin & Schultz 2012)
+    alpha = (np.sqrt(2 * beta) - np.sqrt(beta)) / denom - np.sqrt(gamma / denom)
 
     # Spread = 2 * (exp(alpha) - 1) / (1 + exp(alpha))
     spread = 2 * (np.exp(alpha) - 1) / (1 + np.exp(alpha))
