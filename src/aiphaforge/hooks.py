@@ -17,6 +17,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 import pandas as pd
 
 from .portfolio import Portfolio
+from .portfolio_optimizer import BasePortfolioOptimizer
 
 
 @dataclass
@@ -457,3 +458,78 @@ class CostAwareRebalanceHook(BacktestHook):
         threshold = self.fee_rate * self.cost_multiplier
         if turnover > threshold:
             ctx.meta.set_target_weights(target)
+
+
+class OptimizedRebalanceHook(BacktestHook):
+    """Periodically rebalance using a portfolio optimizer.
+
+    Computes target weights from historical return data using the
+    provided optimizer, then sets them via MetaContext. Uses the
+    active universe (v1.9.2) when available.
+
+    Parameters:
+        optimizer: A BasePortfolioOptimizer instance that computes
+            target weights from returns.
+        frequency: Rebalance frequency (same as ScheduleHook):
+            "daily", "weekly", "monthly", "quarterly", or int.
+        lookback: Number of bars of price history to pass to the
+            optimizer for return calculation.
+        start_delay: Bars to skip before first rebalance.
+    """
+
+    def __init__(
+        self,
+        optimizer: BasePortfolioOptimizer,
+        frequency: Union[str, int] = "monthly",
+        lookback: int = 60,
+        start_delay: int = 0,
+    ) -> None:
+        self.optimizer = optimizer
+        self.lookback = lookback
+        self._schedule = ScheduleHook(frequency, self._rebalance, start_delay)
+
+    def on_backtest_start(
+        self,
+        data: pd.DataFrame,
+        symbol: str,
+        *,
+        config: Any = None,
+    ) -> None:
+        self._schedule.on_backtest_start(data, symbol, config=config)
+
+    def on_pre_signal(self, context: HookContext) -> None:
+        self._schedule.on_pre_signal(context)
+
+    def _rebalance(self, ctx: HookContext) -> None:
+        if ctx.meta is None:
+            return
+
+        # Use active universe if populated, else all available data
+        if ctx.meta.active_universe:
+            target_symbols = ctx.meta.active_universe
+        elif ctx.all_data is not None:
+            target_symbols = list(ctx.all_data.keys())
+        elif ctx.data is not None:
+            target_symbols = [ctx.symbol]
+        else:
+            return
+
+        # Build returns DataFrame from price history
+        data_source = ctx.all_data or {ctx.symbol: ctx.data}
+        returns_dict: Dict[str, pd.Series] = {}
+        for sym in target_symbols:
+            df = data_source.get(sym)
+            if df is not None and len(df) > self.lookback:
+                close = df["close"].iloc[-self.lookback:]
+                returns_dict[sym] = close.pct_change().dropna()
+
+        if not returns_dict:
+            return
+
+        returns = pd.DataFrame(returns_dict).dropna()
+        if len(returns) < 2:
+            return
+
+        weights = self.optimizer.compute_weights(returns)
+        if weights is not None:  # on_failure="none" returns None
+            ctx.meta.set_target_weights(weights)

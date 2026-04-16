@@ -42,8 +42,9 @@ dev = [
 plot = ["matplotlib>=3.5"]
 data = ["yfinance>=0.2"]
 optimize = ["optuna>=3.0"]
+portfolio = ["scipy>=1.10"]
 significance = ["arch>=6.0"]
-all = ["matplotlib>=3.5", "yfinance>=0.2", "optuna>=3.0", "arch>=6.0"]
+all = ["matplotlib>=3.5", "yfinance>=0.2", "optuna>=3.0", "arch>=6.0", "scipy>=1.10"]
 
 [project.urls]
 Homepage = "https://github.com/chifongwong-coder/AIphaForge"

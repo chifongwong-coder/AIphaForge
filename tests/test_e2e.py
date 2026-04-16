@@ -21,9 +21,13 @@ from aiphaforge import (
     CostAwareRebalanceHook,
     DriftRebalanceHook,
     EqualWeightAllocator,
+    EqualWeightOptimizer,
     HookContext,
+    InverseVolatilityOptimizer,
     LatencyHook,
+    MeanVarianceOptimizer,
     MetaContext,
+    OptimizedRebalanceHook,
     OrderStatus,
     PerformanceAnalyzer,
     Portfolio,
@@ -2845,3 +2849,129 @@ class TestDynamicUniverse:
         # B never had a position, removing should not produce any B trades
         b_trades = [t for t in result.trades if t.symbol == "B"]
         assert len(b_trades) == 0
+
+
+# ===================================================================
+# Portfolio Optimizer
+# ===================================================================
+
+
+class TestPortfolioOptimizer:
+    """E2E tests for portfolio optimization algorithms."""
+
+    @staticmethod
+    def _make_returns(n_assets: int = 3, n_periods: int = 200,
+                      seed: int = 42) -> pd.DataFrame:
+        """Generate synthetic return data with known properties."""
+        rng = np.random.default_rng(seed)
+        symbols = [f"ASSET_{i}" for i in range(n_assets)]
+        # Different vol levels: 2%, 5%, 10% annualized daily
+        daily_vols = np.linspace(0.02, 0.10, n_assets) / np.sqrt(252)
+        data = {}
+        for i, sym in enumerate(symbols):
+            data[sym] = rng.normal(0.0005, daily_vols[i], n_periods)
+        return pd.DataFrame(data)
+
+    def test_equal_weight_optimizer(self):
+        """EqualWeightOptimizer assigns 1/N to each asset."""
+        returns = self._make_returns(3)
+        opt = EqualWeightOptimizer()
+        weights = opt.compute_weights(returns)
+
+        assert len(weights) == 3
+        for w in weights.values():
+            assert abs(w - 1 / 3) < 1e-10
+
+    def test_inverse_vol_optimizer(self):
+        """InverseVolatilityOptimizer gives higher weight to lower-vol asset."""
+        returns = self._make_returns(3)
+        opt = InverseVolatilityOptimizer()
+        weights = opt.compute_weights(returns)
+
+        assert len(weights) == 3
+        assert abs(sum(weights.values()) - 1.0) < 1e-10
+        # ASSET_0 has lowest vol -> highest weight
+        assert weights["ASSET_0"] > weights["ASSET_1"]
+        assert weights["ASSET_1"] > weights["ASSET_2"]
+
+    def test_mean_variance_optimizer(self):
+        """MeanVarianceOptimizer produces valid long-only weights."""
+        pytest.importorskip("scipy")
+        returns = self._make_returns(3, 200)
+        opt = MeanVarianceOptimizer(lookback=200, risk_aversion=1.0)
+        weights = opt.compute_weights(returns)
+
+        assert weights is not None
+        assert len(weights) == 3
+        assert abs(sum(weights.values()) - 1.0) < 1e-6
+        for w in weights.values():
+            assert w >= -1e-8  # long only
+
+    def test_mean_variance_max_weight(self):
+        """MeanVarianceOptimizer respects max_weight constraint."""
+        pytest.importorskip("scipy")
+        returns = self._make_returns(3, 200)
+        opt = MeanVarianceOptimizer(
+            lookback=200, max_weight=0.4, risk_aversion=1.0,
+        )
+        weights = opt.compute_weights(returns)
+
+        assert weights is not None
+        for w in weights.values():
+            assert w <= 0.4 + 1e-8
+
+    def test_optimized_rebalance_hook(self):
+        """OptimizedRebalanceHook with InverseVol runs a full backtest."""
+        data_a = make_ohlcv(120, start_price=100, volatility=0.01)
+        data_b = make_ohlcv(120, start_price=200, volatility=0.03)
+        data = {"A": data_a, "B": data_b}
+
+        signals = {
+            sym: pd.Series(np.nan, index=df.index, dtype=float)
+            for sym, df in data.items()
+        }
+
+        opt = InverseVolatilityOptimizer()
+        hook = OptimizedRebalanceHook(
+            optimizer=opt, frequency="monthly", lookback=40,
+        )
+
+        engine = BacktestEngine(
+            mode='event_driven', fee_model=ZeroFeeModel(),
+            initial_capital=100_000, hooks=[hook],
+            capital_allocator=EqualWeightAllocator(),
+            include_benchmark=False,
+        )
+        engine.set_signals(signals)
+        result = engine.run(data)
+
+        assert isinstance(result, BacktestResult)
+        assert len(result.equity_curve) > 0
+        # Should have produced trades from rebalancing
+        assert result.num_trades > 0
+
+    def test_optimizer_scipy_import_error(self):
+        """Scipy-dependent optimizers raise ImportError with clear message."""
+        # We test the message format by checking against a mock
+        # (scipy is likely installed, so we patch the import)
+        import unittest.mock
+        returns = self._make_returns(3)
+
+        with unittest.mock.patch.dict(
+            "sys.modules", {"scipy": None, "scipy.optimize": None},
+        ):
+            opt = MeanVarianceOptimizer()
+            with pytest.raises(ImportError, match="requires scipy"):
+                opt.compute_weights(returns)
+
+    def test_on_failure_raise(self):
+        """MeanVarianceOptimizer(on_failure='raise') raises on bad data."""
+        pytest.importorskip("scipy")
+        # Single row of data -> optimizer will likely fail
+        returns = pd.DataFrame({"A": [0.01], "B": [0.02]})
+        opt = MeanVarianceOptimizer(
+            lookback=10, on_failure="raise",
+        )
+        # With only 1 row, covariance is NaN -> optimizer should fail
+        with pytest.raises((RuntimeError, ValueError)):
+            opt.compute_weights(returns)
