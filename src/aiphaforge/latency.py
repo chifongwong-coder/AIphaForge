@@ -72,6 +72,7 @@ class _CapturingMetaProxy:
         'adjust_trailing_stop',
         'suppress_signals', 'resume_signals', 'set_target_weights',
         'set_weights', 'swap_child',
+        'add_to_universe', 'remove_from_universe', 'set_universe',
     }
 
     def __init__(self, real_meta: Any) -> None:

@@ -13,7 +13,7 @@ overrides are applied via ``dataclasses.replace`` each bar.
 Event-driven mode only. Vectorized mode has no per-bar hook mechanism.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 
 class MetaContext:
@@ -26,7 +26,13 @@ class MetaContext:
     applies per-bar overrides. Base config is never mutated.
     """
 
-    def __init__(self, config: Any, strategy: Any = None) -> None:
+    def __init__(
+        self,
+        config: Any,
+        strategy: Any = None,
+        all_symbols: Optional[List[str]] = None,
+        initial_universe: Optional[List[str]] = None,
+    ) -> None:
         self._config = config
         self._strategy = strategy
         self._overrides: Dict[str, Any] = {}
@@ -35,6 +41,19 @@ class MetaContext:
         self._needs_regeneration: bool = False
         self._audit: List[Dict[str, Any]] = []
         self._audit_cursor: int = 0
+
+        # Dynamic universe (v1.9.2)
+        self._all_symbols: List[str] = list(all_symbols or [])
+        self._pending_removals: Set[str] = set()
+
+        if initial_universe is not None:
+            invalid = set(initial_universe) - set(self._all_symbols)
+            if invalid:
+                raise ValueError(
+                    f"initial_universe contains unknown symbols: {invalid}")
+            self._universe: Optional[Set[str]] = set(initial_universe)
+        else:
+            self._universe = None  # None = all symbols active
 
     # --- Internal logging ---
 
@@ -109,6 +128,46 @@ class MetaContext:
         """Override signal processing with target weights for this bar."""
         self._target_weights = dict(weights)
         self._log('set_target_weights', dict(weights))
+
+    # --- Universe control (v1.9.2) ---
+
+    def add_to_universe(self, symbol: str) -> None:
+        """Add a symbol to the active universe."""
+        if symbol not in self._all_symbols:
+            raise ValueError(f"Unknown symbol: {symbol!r}")
+        if self._universe is None:
+            return  # all already active
+        self._universe.add(symbol)
+        self._log('add_to_universe', symbol)
+
+    def remove_from_universe(self, symbol: str) -> None:
+        """Remove a symbol. Open positions will be closed."""
+        if self._universe is None:
+            self._universe = set(self._all_symbols)
+        self._universe.discard(symbol)
+        self._pending_removals.add(symbol)
+        self._log('remove_from_universe', symbol)
+
+    def set_universe(self, symbols: List[str]) -> None:
+        """Replace the entire active universe."""
+        invalid = set(symbols) - set(self._all_symbols)
+        if invalid:
+            raise ValueError(f"Unknown symbols: {invalid}")
+        new = set(symbols)
+        if self._universe is not None:
+            removed = self._universe - new
+        else:
+            removed = set(self._all_symbols) - new
+        self._pending_removals.update(removed)
+        self._universe = new
+        self._log('set_universe', list(symbols))
+
+    @property
+    def active_universe(self) -> List[str]:
+        """Sorted list of currently active symbols."""
+        if self._universe is None:
+            return sorted(self._all_symbols)
+        return sorted(self._universe)
 
     # --- Read state ---
 
