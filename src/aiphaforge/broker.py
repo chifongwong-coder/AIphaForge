@@ -566,7 +566,10 @@ class Broker:
                     fill_price = order.price
                     return self._execute_fill(order, fill_price, order.size, timestamp, volume, bypass_partial_clip)
                 else:
-                    # Stop triggered but limit not filled: convert to limit order
+                    # Stop triggered but limit not filled: convert to limit
+                    # Preserve original type in metadata for audit trail
+                    if 'original_order_type' not in order.metadata:
+                        order.metadata['original_order_type'] = order.order_type.value
                     order.order_type = OrderType.LIMIT
 
         return False

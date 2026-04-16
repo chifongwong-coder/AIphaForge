@@ -107,28 +107,6 @@ class InverseVolatilityOptimizer(BasePortfolioOptimizer):
         return dict(zip(cols, weights))
 
 
-def _postprocess_weights(
-    raw_weights: np.ndarray, columns: object,
-    bounds: list, allow_short: bool = False,
-) -> Dict[str, float]:
-    """Clip to bounds and normalize to sum=1 after scipy solve."""
-    w = raw_weights.copy()
-    # Clip to bounds
-    for i, (lo, hi) in enumerate(bounds):
-        if lo is not None:
-            w[i] = max(w[i], lo)
-        if hi is not None:
-            w[i] = min(w[i], hi)
-    # Normalize to sum=1
-    total = w.sum()
-    if total > 0:
-        w = w / total
-    elif not allow_short:
-        n = len(w)
-        w = np.ones(n) / n if n > 0 else w
-    return dict(zip(columns, w))
-
-
 def _check_min_rows(
     data: pd.DataFrame, on_failure: str,
 ) -> Optional[Dict[str, float]]:
@@ -253,8 +231,10 @@ class MeanVarianceOptimizer(BasePortfolioOptimizer):
         if not result.success:
             return _handle_failure(self.on_failure, str(result.message), data.columns)
 
-        return _postprocess_weights(
-            result.x, data.columns, bounds, self.allow_short)
+        w = result.x
+        if not self.allow_short:
+            w = np.maximum(w, 0.0)  # clamp numerical noise to enforce bounds
+        return dict(zip(data.columns, w))
 
 
 class RiskParityOptimizer(BasePortfolioOptimizer):
@@ -337,7 +317,7 @@ class RiskParityOptimizer(BasePortfolioOptimizer):
         if not result.success:
             return _handle_failure(self.on_failure, str(result.message), data.columns)
 
-        return _postprocess_weights(result.x, data.columns, bounds)
+        return dict(zip(data.columns, result.x))
 
 
 class MinimumVarianceOptimizer(BasePortfolioOptimizer):
@@ -419,5 +399,7 @@ class MinimumVarianceOptimizer(BasePortfolioOptimizer):
         if not result.success:
             return _handle_failure(self.on_failure, str(result.message), data.columns)
 
-        return _postprocess_weights(
-            result.x, data.columns, bounds, self.allow_short)
+        w = result.x
+        if not self.allow_short:
+            w = np.maximum(w, 0.0)  # clamp numerical noise to enforce bounds
+        return dict(zip(data.columns, w))

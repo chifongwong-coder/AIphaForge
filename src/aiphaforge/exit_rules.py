@@ -111,7 +111,7 @@ class PercentageStopLoss(BaseExitRule):
                 # Stop price is the entry price moved by -threshold
                 stop_price = entry_p * (1 - self.threshold * dir_val)
                 # Return on this bar is the move from prev close to stop price
-                returns_with_stop.loc[idx] = (stop_price - prev) / prev * dir_val * dir_val
+                returns_with_stop.loc[idx] = (stop_price - prev) / prev * dir_val
             else:
                 returns_with_stop.loc[idx] = 0
 
