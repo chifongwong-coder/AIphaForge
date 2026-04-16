@@ -129,6 +129,9 @@ class BacktestEngine:
         risk_rules=None,
         trailing_stop_rule=None,
         initial_universe: Optional[List[str]] = None,
+        impact_model=None,
+        impact_adv_lookback: int = 20,
+        impact_vol_lookback: int = 20,
     ):
         # Fee model
         if isinstance(fee_model, str):
@@ -208,6 +211,11 @@ class BacktestEngine:
         self.risk_rules = risk_rules
         self.trailing_stop_rule = trailing_stop_rule
         self.initial_universe = initial_universe
+
+        # Market impact (v1.9.4)
+        self.impact_model = impact_model
+        self.impact_adv_lookback = impact_adv_lookback
+        self.impact_vol_lookback = impact_vol_lookback
         self.asset_lot_sizes: Dict = asset_lot_sizes or {}
         for sym, ls in self.asset_lot_sizes.items():
             if not isinstance(ls, int) or ls < 1:
@@ -798,6 +806,9 @@ class BacktestEngine:
             risk_rules=self.risk_rules,
             trailing_stop_rule=self.trailing_stop_rule,
             initial_universe=self.initial_universe,
+            impact_model=self.impact_model,
+            impact_adv_lookback=self.impact_adv_lookback,
+            impact_vol_lookback=self.impact_vol_lookback,
         )
 
     def _build_result(

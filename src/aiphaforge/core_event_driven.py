@@ -82,6 +82,19 @@ def run_event_driven(
         )
         brokers[symbol].set_portfolio(portfolio)
 
+    # --- Market impact: set model and pre-compute ADV/vol (v1.9.4) ---
+    precomputed_adv: Dict[str, pd.Series] = {}
+    precomputed_vol: Dict[str, pd.Series] = {}
+    if config.impact_model is not None:
+        from .market_impact import compute_adv_series, parkinson_volatility_series
+        for sym in symbols:
+            brokers[sym].set_impact_model(config.impact_model)
+            df = data_dict[sym]
+            precomputed_adv[sym] = compute_adv_series(
+                df['volume'], config.impact_adv_lookback)
+            precomputed_vol[sym] = parkinson_volatility_series(
+                df['high'], df['low'], config.impact_vol_lookback)
+
     # --- Build unified timeline ---
     timeline, bar_avail = build_unified_timeline(data_dict)
 
@@ -179,6 +192,15 @@ def run_event_driven(
             else:
                 prices[sym] = last_known[sym]
         portfolio.update_prices(prices, timestamp, record=False)
+
+        # 1.5 Update broker liquidity data for market impact (v1.9.4)
+        if config.impact_model is not None:
+            for sym in active:
+                idx_loc = data_dict[sym].index.get_loc(timestamp)
+                brokers[sym]._adv = float(
+                    precomputed_adv[sym].iloc[idx_loc])
+                brokers[sym]._volatility = float(
+                    precomputed_vol[sym].iloc[idx_loc])
 
         # Reset per-bar realized PnL tracker
         if pnl_tracker is not None:

@@ -4,6 +4,7 @@ Broker Simulation
 Simulates order execution, slippage, and fill logic.
 """
 
+import warnings
 from datetime import time
 from enum import Enum
 from typing import Dict, List, Optional, Tuple
@@ -79,6 +80,11 @@ class Broker:
             )
         self.immediate_fill_price = immediate_fill_price
 
+        # Market impact model (v1.9.4)
+        self._impact_model = None  # BaseImpactModel or None
+        self._adv: float = 0.0    # updated per-bar by event loop
+        self._volatility: float = 0.0  # updated per-bar by event loop
+
         # Order management
         self.order_manager = OrderManager()
 
@@ -93,6 +99,16 @@ class Broker:
     def set_portfolio(self, portfolio: Portfolio):
         """Set the associated portfolio."""
         self._portfolio = portfolio
+
+    def set_impact_model(self, model: object) -> None:
+        """Assign a market impact model and auto-override VOLUME_BASED slippage."""
+        self._impact_model = model
+        if self.slippage_model == SlippageModel.VOLUME_BASED:
+            warnings.warn(
+                "VOLUME_BASED slippage auto-replaced with FIXED when "
+                "impact_model is set (both model the same effect)."
+            )
+            self.slippage_model = SlippageModel.FIXED
 
     # ========== Order Creation ==========
 
@@ -629,6 +645,25 @@ class Broker:
             adjusted_price = price + slippage / size if size > 0 else price
         else:
             adjusted_price = price - slippage / size if size > 0 else price
+
+        # Apply market impact (v1.9.4)
+        if self._impact_model is not None and self._adv > 0:
+            impact = self._impact_model.estimate_impact(
+                size, adjusted_price, self._adv, self._volatility)
+            if order.is_buy:
+                adjusted_price *= (1 + impact)
+            else:
+                adjusted_price *= (1 - impact)
+            # Clamp limit/stop-limit orders to their limit price
+            # (impact cannot make fills worse than the limit guarantee)
+            if order.order_type in (OrderType.LIMIT, OrderType.STOP_LIMIT):
+                if order.is_buy and order.price is not None:
+                    adjusted_price = min(adjusted_price, order.price)
+                elif not order.is_buy and order.price is not None:
+                    adjusted_price = max(adjusted_price, order.price)
+            if 'market_impact_bps' not in order.metadata:
+                order.metadata['market_impact_bps'] = 0.0
+            order.metadata['market_impact_bps'] += impact * 10000
 
         # Calculate commission
         commission = self.fee_model.calculate_commission(
