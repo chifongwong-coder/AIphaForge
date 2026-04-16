@@ -153,8 +153,11 @@ def run_event_driven(
     # --- MetaContext lifecycle (v1.2) ---
     current_strategy = strategy
     meta: Optional[MetaContext] = (
-        MetaContext(config, strategy=current_strategy)
-        if config.hooks else None
+        MetaContext(config, strategy=current_strategy,
+                    all_symbols=symbols,
+                    initial_universe=config.initial_universe)
+        if config.hooks or config.initial_universe is not None
+        else None
     )
 
     # ===================================================================
@@ -365,6 +368,17 @@ def run_event_driven(
                         + trade.slippage_cost
                     )
 
+        # 4c. Close positions for symbols removed from universe (v1.9.2)
+        if meta is not None and meta._pending_removals:
+            for sym in list(meta._pending_removals):
+                if sym in brokers:
+                    pos = portfolio.get_position(sym)
+                    if pos is not None and not pos.is_flat:
+                        _submit_order(sym, -pos.size, prices[sym],
+                                      brokers[sym], timestamp,
+                                      "universe_removal")
+            meta._pending_removals.clear()
+
         # 5. Signal processing
         equity = portfolio.total_equity
         bar_turnover = 0.0
@@ -375,6 +389,9 @@ def run_event_driven(
             # First: process any signal=0 closes from current signals
             # (Phase 1 exempt — closes should always execute)
             for sym in active:
+                if meta is not None and meta._universe is not None \
+                        and sym not in meta._universe:
+                    continue
                 raw_sig = signals_as_dict[sym].get(
                     timestamp, float('nan'))
                 if not pd.isna(raw_sig) and abs(raw_sig) < 1e-8:
@@ -399,6 +416,9 @@ def run_event_driven(
             # Phase A: collect signals
             current_signals: Dict[str, float] = {}
             for sym in active:
+                if meta is not None and meta._universe is not None \
+                        and sym not in meta._universe:
+                    continue
                 raw_sig = signals_as_dict[sym].get(
                     timestamp, float('nan'))
                 if pd.isna(raw_sig):

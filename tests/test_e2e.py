@@ -2618,3 +2618,230 @@ class TestRebalancingEnhancements:
         assert isinstance(result, BacktestResult)
         # The callable should have been called on each bar
         assert call_count[0] > 0
+
+
+# ===================================================================
+# Dynamic Universe (v1.9.2)
+# ===================================================================
+
+
+class TestDynamicUniverse:
+
+    def _make_data(self, n=30):
+        return {
+            "A": make_ohlcv(n, start_price=100),
+            "B": make_ohlcv(n, start_price=200),
+            "C": make_ohlcv(n, start_price=300),
+        }
+
+    def _make_signals(self, data, buy=2, sell=20):
+        signals = {}
+        for sym, df in data.items():
+            s = pd.Series(np.nan, index=df.index, dtype=float)
+            s.iloc[buy] = 1
+            s.iloc[sell] = 0
+            signals[sym] = s
+        return signals
+
+    def test_initial_universe_limits_trading(self):
+        """Pass 3-symbol data with initial_universe=2 symbols.
+        Only those 2 should generate trades.
+        """
+        data = self._make_data()
+        signals = self._make_signals(data)
+
+        engine = BacktestEngine(
+            mode='event_driven', fee_model=ZeroFeeModel(),
+            initial_capital=300_000,
+            capital_allocator=EqualWeightAllocator(),
+            initial_universe=["A", "B"],
+            include_benchmark=False,
+        )
+        engine.set_signals(signals)
+        result = engine.run(data)
+
+        traded_symbols = {t.symbol for t in result.trades}
+        assert "A" in traded_symbols
+        assert "B" in traded_symbols
+        assert "C" not in traded_symbols
+
+    def test_add_to_universe(self):
+        """Start with 1 symbol, agent adds another mid-backtest.
+        B gets a buy signal AFTER being added, so it should trade.
+        """
+        data = self._make_data(40)
+        signals = {}
+        for sym, df in data.items():
+            s = pd.Series(np.nan, index=df.index, dtype=float)
+            s.iloc[2] = 1   # buy early
+            s.iloc[20] = 1  # buy again after B is added at bar 15
+            s.iloc[35] = 0  # close
+            signals[sym] = s
+
+        class AddAgent(BacktestHook):
+            def on_pre_signal(self, ctx):
+                if ctx.meta and ctx.bar_index == 15:
+                    ctx.meta.add_to_universe("B")
+
+        engine = BacktestEngine(
+            mode='event_driven', fee_model=ZeroFeeModel(),
+            initial_capital=300_000,
+            capital_allocator=EqualWeightAllocator(),
+            initial_universe=["A"],
+            hooks=[AddAgent()],
+            include_benchmark=False,
+        )
+        engine.set_signals(signals)
+        result = engine.run(data)
+
+        traded_symbols = {t.symbol for t in result.trades}
+        assert "A" in traded_symbols
+        # B should trade after being added at bar 15 (buy signal at bar 20)
+        assert "B" in traded_symbols
+        assert "C" not in traded_symbols
+
+    def test_remove_from_universe_closes_position(self):
+        """Agent removes a symbol with open position — position is closed."""
+        data = self._make_data(40)
+        # Buy all at bar 2, never close via signals
+        signals = {}
+        for sym, df in data.items():
+            s = pd.Series(np.nan, index=df.index, dtype=float)
+            s.iloc[2] = 1
+            signals[sym] = s
+
+        class RemoveAgent(BacktestHook):
+            def on_pre_signal(self, ctx):
+                if ctx.meta and ctx.bar_index == 20:
+                    ctx.meta.remove_from_universe("B")
+
+        engine = BacktestEngine(
+            mode='event_driven', fee_model=ZeroFeeModel(),
+            initial_capital=300_000,
+            capital_allocator=EqualWeightAllocator(),
+            hooks=[RemoveAgent()],
+            include_benchmark=False,
+        )
+        engine.set_signals(signals)
+        result = engine.run(data)
+
+        # B should have a completed trade (round-trip: open + close from
+        # universe_removal). Trade objects are round-trips, so 1 trade
+        # means it was opened and then closed.
+        b_trades = [t for t in result.trades if t.symbol == "B"]
+        assert len(b_trades) >= 1
+        # The trade should be closed (has exit_time)
+        assert b_trades[0].exit_time is not None
+        # Verify the close order was submitted with universe_removal reason
+        b_orders = result.orders[result.orders['symbol'] == 'B']
+        removal_orders = b_orders[b_orders['reason'] == 'universe_removal']
+        assert len(removal_orders) >= 1
+
+    def test_set_universe_rotation(self):
+        """Agent rotates universe every N bars.
+        Verify correct symbols traded in each period.
+        """
+        data = self._make_data(40)
+        # Buy signals at multiple points so newly-added symbols can enter
+        signals = {}
+        for sym, df in data.items():
+            s = pd.Series(np.nan, index=df.index, dtype=float)
+            s.iloc[2] = 1   # initial buy
+            s.iloc[15] = 1  # buy after first rotation at bar 10
+            s.iloc[30] = 1  # buy after second rotation at bar 25
+            signals[sym] = s
+
+        class RotateAgent(BacktestHook):
+            def on_pre_signal(self, ctx):
+                if ctx.meta is None:
+                    return
+                if ctx.bar_index == 10:
+                    ctx.meta.set_universe(["B", "C"])
+                elif ctx.bar_index == 25:
+                    ctx.meta.set_universe(["A"])
+
+        engine = BacktestEngine(
+            mode='event_driven', fee_model=ZeroFeeModel(),
+            initial_capital=300_000,
+            capital_allocator=EqualWeightAllocator(),
+            initial_universe=["A", "B"],
+            hooks=[RotateAgent()],
+            include_benchmark=False,
+        )
+        engine.set_signals(signals)
+        result = engine.run(data)
+
+        traded_symbols = {t.symbol for t in result.trades}
+        # A traded initially, removed at bar 10, re-added at bar 25
+        # B traded initially, kept at bar 10, removed at bar 25
+        # C added at bar 10 (buys at bar 15), removed at bar 25
+        assert "A" in traded_symbols
+        assert "B" in traded_symbols
+        assert "C" in traded_symbols
+
+    def test_default_none_backward_compat(self):
+        """No initial_universe -> all symbols trade (same as before)."""
+        data = self._make_data()
+        signals = self._make_signals(data)
+
+        engine = BacktestEngine(
+            mode='event_driven', fee_model=ZeroFeeModel(),
+            initial_capital=300_000,
+            capital_allocator=EqualWeightAllocator(),
+            include_benchmark=False,
+        )
+        engine.set_signals(signals)
+        result = engine.run(data)
+
+        traded_symbols = {t.symbol for t in result.trades}
+        assert traded_symbols == {"A", "B", "C"}
+
+    def test_initial_universe_without_hooks(self):
+        """initial_universe set but no hooks. Pure strategy backtest
+        with restricted universe should work.
+        """
+        data = self._make_data()
+        signals = self._make_signals(data)
+
+        engine = BacktestEngine(
+            mode='event_driven', fee_model=ZeroFeeModel(),
+            initial_capital=300_000,
+            capital_allocator=EqualWeightAllocator(),
+            initial_universe=["A"],
+            include_benchmark=False,
+        )
+        engine.set_signals(signals)
+        result = engine.run(data)
+
+        traded_symbols = {t.symbol for t in result.trades}
+        assert traded_symbols == {"A"}
+
+    def test_remove_from_universe_no_position(self):
+        """Remove symbol with no position -> no close order, just filtered out."""
+        data = self._make_data(40)
+        # Only buy A, not B or C
+        signals = {}
+        for sym, df in data.items():
+            s = pd.Series(np.nan, index=df.index, dtype=float)
+            if sym == "A":
+                s.iloc[2] = 1
+            signals[sym] = s
+
+        class RemoveNoPos(BacktestHook):
+            def on_pre_signal(self, ctx):
+                if ctx.meta and ctx.bar_index == 10:
+                    ctx.meta.remove_from_universe("B")
+
+        engine = BacktestEngine(
+            mode='event_driven', fee_model=ZeroFeeModel(),
+            initial_capital=300_000,
+            capital_allocator=EqualWeightAllocator(),
+            hooks=[RemoveNoPos()],
+            include_benchmark=False,
+        )
+        engine.set_signals(signals)
+        result = engine.run(data)
+
+        # B never had a position, removing should not produce any B trades
+        b_trades = [t for t in result.trades if t.symbol == "B"]
+        assert len(b_trades) == 0

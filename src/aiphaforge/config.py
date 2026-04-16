@@ -76,6 +76,8 @@ class BacktestConfig:
     risk_rules: Any = None  # CompositeRiskManager
     # Trailing stop (v1.9)
     trailing_stop_rule: Optional[BaseExitRule] = None
+    # Dynamic universe (v1.9.2)
+    initial_universe: Optional[List[str]] = None
 
 
 @dataclass
