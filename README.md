@@ -64,6 +64,12 @@ AIphaForge also works perfectly well as a general-purpose backtest framework for
 - **Multiple comparison correction**: `multiple_comparison_correction()` — Bonferroni, Benjamini-Hochberg, or Model Confidence Set (optional `arch` dependency)
 - **Path generation**: `generate_paths()` — block bootstrap or parametric normal synthetic OHLCV data
 
+### Market Impact & Capacity
+- **Market impact models**: `LinearImpactModel`, `SquareRootImpactModel` (Almgren-Chriss with permanent impact), `PowerLawImpactModel` — pluggable via `BaseImpactModel` ABC
+- **Strategy capacity estimation**: `estimate_capacity()` scales trade sizes, computes impact drag, uses bisection to find max capital before Sharpe degrades
+- **Volatility & liquidity tools**: Parkinson high-low volatility, Corwin-Schultz spread estimator, rolling ADV — all from OHLCV data, no order book needed
+- **Calibration presets**: `suggested_impact_params()` for US large/small cap, China A-shares, crypto spot/futures
+
 ### Costs & Fees
 - **Multi-market presets**: US stocks, China A-shares, crypto spot, crypto futures — `get_fee_model("china")`
 - **Slippage models**: Fixed, volume-based, volatility-based
