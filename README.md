@@ -41,6 +41,7 @@ AIphaForge also works perfectly well as a general-purpose backtest framework for
 - **Multi-timeframe**: `secondary_data` for daily trend analysis while executing on minute bars
 - **Scheduled rebalancing**: `ScheduleHook` for periodic callbacks (daily/weekly/monthly/quarterly/N-bar)
 - **Rebalancing hooks**: `DriftRebalanceHook` (threshold-based), `BandRebalanceHook` (per-asset band), `CostAwareRebalanceHook` (turnover vs. cost) — all support static or dynamic weights
+- **Portfolio optimization**: `OptimizedRebalanceHook` with pluggable optimizers — Equal Weight, Inverse Volatility, Mean-Variance, Risk Parity, Minimum Variance. Integrates with dynamic universe selection
 
 ### Technical Indicators & Strategies
 - **25 indicators**: SMA, EMA, WMA, DEMA, TEMA, MACD, ADX, Parabolic SAR, Supertrend, Ichimoku, RSI, ROC, Stochastic, CCI, Williams %R, MFI, StochRSI, Bollinger Bands, ATR, Keltner, Donchian, VWAP, OBV, A/D Line, CMF
