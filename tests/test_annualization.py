@@ -282,3 +282,37 @@ def test_multi_asset_benchmark_uses_first_symbol_trading_days():
 
     # Portfolio sharpe should still differ (portfolio td differs)
     assert res_baseline.sharpe_ratio != res_mixed.sharpe_ratio
+
+
+def test_benchmark_uses_alphabetically_first_symbol():
+    """Document the API convention: multi-asset runs sort symbols
+    alphabetically, so the benchmark is always the buy-and-hold of
+    symbols[0] by **alphabetical order**, not user-insertion order.
+
+    Locking this so: (a) benchmark trading_days is deterministic, and
+    (b) users reading the code later know which asset is the implicit
+    benchmark without having to trace _run_multi.
+    """
+    # Insertion order ZZZ, AAA — but engine sorts → AAA is first
+    data = {"ZZZ_crypto": make_ohlcv(252), "AAA_stock": make_ohlcv(252)}
+    engine = BacktestEngine(
+        mode="vectorized", fee_model=ZeroFeeModel(),
+        trading_days={"AAA_stock": 252, "ZZZ_crypto": 365},
+        portfolio_trading_days=252,
+    )
+    engine.set_strategy(MACrossover(short=10, long=30))
+    res = engine.run(data)
+    # AAA_stock is alphabetically first → its td (252) governs benchmark
+    assert res.per_asset_trading_days["AAA_stock"] == 252
+    assert res.per_asset_trading_days["ZZZ_crypto"] == 365
+    # Benchmark sharpe should equal what you'd get using 252 (AAA's td),
+    # not 365 — verified by rerunning with all-252:
+    eng_all252 = BacktestEngine(
+        mode="vectorized", fee_model=ZeroFeeModel(),
+        trading_days={"AAA_stock": 252, "ZZZ_crypto": 252},
+        portfolio_trading_days=252,
+    )
+    eng_all252.set_strategy(MACrossover(short=10, long=30))
+    res_all252 = eng_all252.run(data)
+    assert res.benchmark_metrics["sharpe_ratio"] == pytest.approx(
+        res_all252.benchmark_metrics["sharpe_ratio"], rel=1e-9)

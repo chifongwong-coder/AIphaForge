@@ -379,8 +379,9 @@ def deflated_sharpe_ratio(
     # higher-moment corrections; simplifies to 1/sqrt(T-1) under normality.
     skew = float(stats.skew(rets, bias=False))
     kurt_pearson = float(stats.kurtosis(rets, fisher=False, bias=False))
+    # n >= 4 guaranteed by the early-exit above, so (n-1) >= 3
     var_sr_per = (1.0 - skew * sr_per
-                  + (kurt_pearson - 1.0) / 4.0 * sr_per ** 2) / max(n - 1, 1)
+                  + (kurt_pearson - 1.0) / 4.0 * sr_per ** 2) / (n - 1)
     if not np.isfinite(var_sr_per) or var_sr_per <= 0:
         return DSRResult(
             observed_sharpe=sr_obs_ann,
