@@ -76,6 +76,18 @@ class TestProbabilisticSharpeRatio:
         res = probabilistic_sharpe_ratio(rets)
         assert math.isnan(res.psr)
 
+    def test_near_constant_returns_all_nan(self):
+        """Prior bug: near-constant input (std ~ 1e-19) slipped past the
+        ``std <= 0`` guard and leaked a huge observed_sharpe (2e16)
+        alongside psr=NaN. Every numeric field must be NaN when the
+        statistic is undefined."""
+        const_like = pd.Series([0.001] * 100)  # std = 0 exactly
+        res = probabilistic_sharpe_ratio(const_like)
+        assert math.isnan(res.psr)
+        assert math.isnan(res.observed_sharpe)
+        assert math.isnan(res.skewness)
+        assert math.isnan(res.kurtosis)
+
     def test_fat_tailed_psr_not_above_normal_at_matched_sr(self):
         np.random.seed(1)
         n = 750
@@ -157,6 +169,59 @@ class TestDeflatedSharpeRatio:
         d100 = deflated_sharpe_ratio(rets, n_trials=100)
         d1000 = deflated_sharpe_ratio(rets, n_trials=1000)
         assert d10.dsr >= d100.dsr >= d1000.dsr
+
+    def test_sr_zero_matches_bailey_2014_formula(self):
+        """Lock sr_zero against the textbook Bailey-LopezdePrado 2014 eq.6+7.
+
+        A prior bug multiplied sd_SR by std(returns), causing sr_zero to be
+        ~100× too small and DSR to lose all deflation power (monotonicity
+        alone couldn't catch it). This test locks the absolute value.
+        """
+        np.random.seed(0)
+        T, td, N = 252, 252, 1000
+        rets = pd.Series(np.random.normal(0.001, 0.01, T))
+
+        # Manual Bailey 2014 calc (using full skew/kurt expression)
+        sr_per = float(rets.mean() / rets.std())
+        skew = float(stats.skew(rets, bias=False))
+        kurt_pearson = float(stats.kurtosis(rets, fisher=False, bias=False))
+        var_sr_per = (1 - skew * sr_per
+                      + (kurt_pearson - 1) / 4 * sr_per ** 2) / (T - 1)
+        sd_sr_ann = np.sqrt(var_sr_per) * np.sqrt(td)
+        gamma = 0.5772156649
+        factor = (
+            (1 - gamma) * stats.norm.ppf(1 - 1 / N)
+            + gamma * stats.norm.ppf(1 - 1 / (N * np.e))
+        )
+        sr_zero_expected = sd_sr_ann * factor
+
+        d = deflated_sharpe_ratio(rets, n_trials=N, trading_days=td)
+        assert d.expected_max_null_sharpe == pytest.approx(sr_zero_expected, rel=1e-9)
+        # And the DSR == PSR(obs, benchmark=sr_zero_expected)
+        from aiphaforge import probabilistic_sharpe_ratio
+        expected_dsr = probabilistic_sharpe_ratio(
+            rets, benchmark_sharpe=sr_zero_expected, trading_days=td).psr
+        assert d.dsr == pytest.approx(expected_dsr, rel=1e-9)
+
+    def test_dsr_deflates_meaningfully_vs_psr_at_zero(self):
+        """At N=1000 trials on normal returns, DSR should be materially
+        below PSR(SR*=0) — if they agree, deflation is broken."""
+        np.random.seed(0)
+        rets = pd.Series(np.random.normal(0.001, 0.01, 252))
+        from aiphaforge import probabilistic_sharpe_ratio
+        psr_zero = probabilistic_sharpe_ratio(rets, benchmark_sharpe=0.0).psr
+        dsr_n1000 = deflated_sharpe_ratio(rets, n_trials=1000).dsr
+        # Deflation should cost at least 30 percentage points (was 0.4pp pre-fix)
+        assert psr_zero - dsr_n1000 > 0.30, \
+            f"DSR ({dsr_n1000:.4f}) too close to PSR@0 ({psr_zero:.4f}) — deflation broken"
+
+    def test_dsr_n1_gives_no_deflation(self):
+        """1 trial = no deflation, so DSR should match PSR(SR* ≈ 0) at limit."""
+        np.random.seed(0)
+        rets = pd.Series(np.random.normal(0.001, 0.01, 252))
+        d = deflated_sharpe_ratio(rets, n_trials=1)
+        # Φ⁻¹(0) = -∞ → sr_zero = -∞ → PSR(SR > -∞) = 1
+        assert d.dsr == pytest.approx(1.0, abs=1e-6)
 
     def test_returns_dsr_result(self):
         np.random.seed(0)

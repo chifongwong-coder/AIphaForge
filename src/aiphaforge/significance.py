@@ -288,7 +288,10 @@ def probabilistic_sharpe_ratio(
     if n < 4:
         return _nan_result()
     std = float(rets.std())
-    if std <= 0:
+    # Guard against ~constant series where std is finite but vanishing
+    # (floating-point noise), which makes sr_per blow up and the
+    # downstream skew / kurtosis degenerate.
+    if not np.isfinite(std) or std < 1e-12:
         return _nan_result()
 
     sr_per = float(rets.mean() / std)
@@ -298,11 +301,18 @@ def probabilistic_sharpe_ratio(
     kurt_pearson = float(stats.kurtosis(rets, fisher=False, bias=False))
 
     denom = 1.0 - skew * sr_per + ((kurt_pearson - 1.0) / 4.0) * (sr_per ** 2)
-    if denom <= 0:
+    if not np.isfinite(denom) or denom <= 0:
+        # Degenerate tail / skew; PSR is undefined. Preserve the valid
+        # per-period Sharpe as observed_sharpe (annualised) so UI can
+        # still show it, but *only* when it is finite.
+        obs = sr_per * sqrt_td if np.isfinite(sr_per) else float("nan")
         return PSRResult(
-            observed_sharpe=sr_per * sqrt_td,
+            observed_sharpe=obs,
             benchmark_sharpe=benchmark_sharpe,
-            psr=float("nan"), skewness=skew, kurtosis=kurt_pearson, n_obs=n,
+            psr=float("nan"),
+            skewness=skew if np.isfinite(skew) else float("nan"),
+            kurtosis=kurt_pearson if np.isfinite(kurt_pearson) else float("nan"),
+            n_obs=n,
         )
 
     z = (sr_per - benchmark_per) * np.sqrt(n - 1) / np.sqrt(denom)
@@ -354,32 +364,45 @@ def deflated_sharpe_ratio(
         )
 
     std = float(rets.std())
-    if std <= 0:
+    if not np.isfinite(std) or std < 1e-12:
         return DSRResult(
             observed_sharpe=float("nan"),
             expected_max_null_sharpe=float("nan"),
             dsr=float("nan"), n_trials=int(n_trials),
         )
 
-    sr_obs = float(rets.mean() / std) * sqrt_td
+    sr_per = float(rets.mean() / std)
+    sr_obs_ann = sr_per * sqrt_td
 
-    var_sr = float(np.var(rets) * td) / max(n - 1, 1)
-    sd_sr = np.sqrt(max(var_sr, 1e-12))
+    # Bailey & Lopez de Prado 2014 eq. 6: standard deviation of the Sharpe
+    # *estimator* itself (NOT of the returns). Per-period formula includes
+    # higher-moment corrections; simplifies to 1/sqrt(T-1) under normality.
+    skew = float(stats.skew(rets, bias=False))
+    kurt_pearson = float(stats.kurtosis(rets, fisher=False, bias=False))
+    var_sr_per = (1.0 - skew * sr_per
+                  + (kurt_pearson - 1.0) / 4.0 * sr_per ** 2) / max(n - 1, 1)
+    if not np.isfinite(var_sr_per) or var_sr_per <= 0:
+        return DSRResult(
+            observed_sharpe=sr_obs_ann,
+            expected_max_null_sharpe=float("nan"),
+            dsr=float("nan"), n_trials=int(n_trials),
+        )
+    sd_sr_per = np.sqrt(var_sr_per)
+    sd_sr_ann = sd_sr_per * sqrt_td
 
-    # Bailey & Lopez de Prado 2014 eq. 7
+    # Bailey & Lopez de Prado 2014 eq. 7: expected max Sharpe under N trials
     gamma = 0.5772156649  # Euler-Mascheroni
     e = math.e
-    sr_zero_per = sd_sr * (
+    sr_zero_ann = sd_sr_ann * (
         (1.0 - gamma) * stats.norm.ppf(1.0 - 1.0 / n_trials)
         + gamma * stats.norm.ppf(1.0 - 1.0 / (n_trials * e))
     )
-    sr_zero_ann = sr_zero_per  # already in per-bar units of std(returns)*sqrt(td)
 
     psr_result = probabilistic_sharpe_ratio(
         rets, benchmark_sharpe=sr_zero_ann, trading_days=td)
 
     return DSRResult(
-        observed_sharpe=sr_obs,
+        observed_sharpe=sr_obs_ann,
         expected_max_null_sharpe=sr_zero_ann,
         dsr=psr_result.psr,
         n_trials=int(n_trials),

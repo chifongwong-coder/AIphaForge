@@ -955,12 +955,21 @@ class BacktestEngine:
         self,
         returns: pd.Series,
         equity: pd.Series,
-        trades: List[Trade]
+        trades: List[Trade],
+        *,
+        trading_days: Optional[int] = None,
     ) -> Dict[str, float]:
         """Calculate performance metrics.
 
         Delegates to shared utility functions so that the engine and
         PerformanceAnalyzer use the same calculations.
+
+        Parameters:
+            trading_days: Annualisation factor. Defaults to
+                ``self._portfolio_trading_days`` — override when computing
+                metrics for a single-asset benchmark inside a multi-asset
+                run so the benchmark uses its own annualisation rather
+                than the (possibly dict-max) portfolio value.
         """
         metrics: Dict[str, float] = {}
 
@@ -975,7 +984,7 @@ class BacktestEngine:
         metrics['total_return'] = total_return
 
         n_days = len(returns)
-        td = self._portfolio_trading_days
+        td = trading_days if trading_days is not None else self._portfolio_trading_days
         metrics['annualized_return'] = (
             annualize_return(total_return, n_days, td) if n_days > 0 else 0.0
         )
@@ -1069,8 +1078,18 @@ class BacktestEngine:
             bname = "Buy & Hold"
 
         bh_returns = benchmark_equity.pct_change().fillna(0)
+        # Benchmark annualisation: use the first symbol's trading_days
+        # when we have a per-symbol map (otherwise the buy-and-hold of
+        # AAPL inside an AAPL+BTC portfolio would get annualised with
+        # 365 instead of 252, inflating benchmark Sharpe by √(365/252)).
+        benchmark_td = self._portfolio_trading_days
+        if config is not None and config.symbols and self._resolved_per_asset_td:
+            first_sym = config.symbols[0]
+            benchmark_td = self._resolved_per_asset_td.get(
+                first_sym, self._portfolio_trading_days)
         benchmark_metrics = self._calculate_metrics(
-            bh_returns, benchmark_equity, trades=[]
+            bh_returns, benchmark_equity, trades=[],
+            trading_days=benchmark_td,
         )
         return benchmark_equity, benchmark_metrics, bname
 

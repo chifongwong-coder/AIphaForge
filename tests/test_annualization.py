@@ -239,3 +239,46 @@ def test_multi_asset_mixed_dict_with_override_silent():
         res = engine.run(_multi_data())
     assert not [w for w in caught if "Mixed per-symbol" in str(w.message)]
     assert res.trading_days == 252
+
+
+def test_multi_asset_benchmark_uses_first_symbol_trading_days():
+    """Bug #3 regression: in a mixed AAPL(252) + BTC(365) portfolio
+    without a portfolio_trading_days override, the portfolio sharpe
+    uses 365 (auto max) but the benchmark is a buy-and-hold of the
+    first symbol (AAPL) — so its sharpe must stay annualised by 252.
+
+    Before the fix, benchmark sharpe was wrongly scaled by √(365/252)
+    because _calculate_metrics used self._portfolio_trading_days for
+    every call, including the benchmark.
+    """
+    data = _multi_data()
+
+    # Forced portfolio=252 baseline
+    eng_baseline = BacktestEngine(
+        mode="vectorized", fee_model=ZeroFeeModel(),
+        trading_days={"AAPL": 252, "BTC-USD": 252},
+        portfolio_trading_days=252,
+    )
+    eng_baseline.set_strategy(MACrossover(short=10, long=30))
+    res_baseline = eng_baseline.run(data)
+
+    # Mixed dict, auto portfolio=max=365
+    eng_mixed = BacktestEngine(
+        mode="vectorized", fee_model=ZeroFeeModel(),
+        trading_days={"AAPL": 252, "BTC-USD": 365},
+    )
+    eng_mixed.set_strategy(MACrossover(short=10, long=30))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # ignore the Mixed-dict warning
+        res_mixed = eng_mixed.run(data)
+
+    # Benchmark is buy-and-hold of first symbol (AAPL) → td=252 in both
+    bench_baseline = res_baseline.benchmark_metrics["sharpe_ratio"]
+    bench_mixed = res_mixed.benchmark_metrics["sharpe_ratio"]
+    assert bench_mixed == pytest.approx(bench_baseline, rel=1e-9), (
+        f"Benchmark sharpe differs: baseline={bench_baseline:.6f}, "
+        f"mixed={bench_mixed:.6f} (Bug #3 — benchmark got wrong td)"
+    )
+
+    # Portfolio sharpe should still differ (portfolio td differs)
+    assert res_baseline.sharpe_ratio != res_mixed.sharpe_ratio
