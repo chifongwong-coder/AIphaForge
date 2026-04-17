@@ -107,19 +107,20 @@ def _normalize_trading_days(
     if not used_values:
         return int(default), per_symbol
     if len(used_values) == 1:
-        # All equal — silent
+        # All equal — silent, unambiguous
         return int(next(iter(used_values))), per_symbol
-    chosen = max(used_values)
+
+    # Mixed values with no explicit portfolio choice: refuse rather than
+    # silently pick one. A mixed-asset (e.g. stocks+crypto) portfolio has
+    # no objectively correct single annualisation, and earlier attempts
+    # to auto-infer (max, min) all misled users who trusted the default.
     sorted_vals = sorted(used_values)
-    warnings.warn(
-        f"Mixed per-symbol trading_days "
-        f"(e.g. {sorted_vals[0]} and {sorted_vals[-1]}); "
-        f"portfolio metrics annualised with {chosen}. "
-        f"Pass portfolio_trading_days explicitly to suppress.",
-        UserWarning,
-        stacklevel=2,
+    raise ValueError(
+        f"Ambiguous trading_days: active symbols have mixed values "
+        f"{sorted_vals}. Portfolio-level metrics need a single "
+        f"annualisation factor; pass portfolio_trading_days= explicitly "
+        f"(e.g. 252 for a stock-dominated book, 365 for crypto)."
     )
-    return chosen, per_symbol
 
 
 def validate_ohlcv(

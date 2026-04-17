@@ -68,8 +68,12 @@ AIphaForge also works perfectly well as a general-purpose backtest framework for
 
 ### Per-Symbol Annualization (v1.9.5)
 - `BacktestEngine(trading_days=...)` accepts a scalar (252 / 365 / etc.) or a per-symbol dict
-- Mixed-asset portfolios (e.g. AAPL + BTC-USD) annualise per-asset metrics correctly; portfolio-level uses an explicit `portfolio_trading_days` or auto-infers with a warning
+- Mixed-asset portfolios (e.g. AAPL + BTC-USD) annualise per-asset metrics correctly; portfolio-level requires an explicit `portfolio_trading_days` (no silent auto-infer — a single scalar cannot be objectively chosen for stocks+crypto)
 - `BacktestResult.per_asset_metrics` is now populated on every multi-asset run (previously declared but never set)
+
+### v1.9.5 compatibility notes
+- Default `trading_days=252` reproduces v1.9.4 numbers exactly.
+- **Pickle compatibility across versions is not guaranteed.** `BacktestResult` gained new fields (`trading_days`, `per_asset_trading_days`); pickles created with v1.9.4 should be regenerated rather than loaded into v1.9.5. If you need long-term persistence, use `result.to_dict()` + JSON.
 
 ### Market Impact & Capacity
 - **Market impact models**: `LinearImpactModel`, `SquareRootImpactModel` (Almgren-Chriss with permanent impact), `PowerLawImpactModel` — pluggable via `BaseImpactModel` ABC

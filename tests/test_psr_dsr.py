@@ -215,13 +215,25 @@ class TestDeflatedSharpeRatio:
         assert psr_zero - dsr_n1000 > 0.30, \
             f"DSR ({dsr_n1000:.4f}) too close to PSR@0 ({psr_zero:.4f}) — deflation broken"
 
-    def test_dsr_n1_gives_no_deflation(self):
-        """1 trial = no deflation, so DSR should match PSR(SR* ≈ 0) at limit."""
+    def test_dsr_n1_is_undefined(self):
+        """1 trial = no multiple-comparison problem; Bailey 2014 eq.7 is
+        undefined at N=1 (stats.norm.ppf(0) = -∞). The engine returns
+        NaN rather than silently falling through to PSR(SR>-∞)=1.0 —
+        the earlier version of this test wrongly locked the 1.0 as a
+        feature, missing the ppf(0) degeneracy entirely."""
         np.random.seed(0)
         rets = pd.Series(np.random.normal(0.001, 0.01, 252))
         d = deflated_sharpe_ratio(rets, n_trials=1)
-        # Φ⁻¹(0) = -∞ → sr_zero = -∞ → PSR(SR > -∞) = 1
-        assert d.dsr == pytest.approx(1.0, abs=1e-6)
+        assert math.isnan(d.dsr)
+        assert math.isnan(d.expected_max_null_sharpe)
+
+    def test_dsr_n2_is_defined(self):
+        """N=2 is the smallest meaningful deflation case; must be a valid number."""
+        np.random.seed(0)
+        rets = pd.Series(np.random.normal(0.001, 0.01, 252))
+        d = deflated_sharpe_ratio(rets, n_trials=2)
+        assert not math.isnan(d.dsr)
+        assert 0.0 <= d.dsr <= 1.0
 
     def test_returns_dsr_result(self):
         np.random.seed(0)

@@ -70,14 +70,13 @@ class TestNormalizeTradingDays:
         assert port == 252
         assert not [w for w in caught if "Mixed" in str(w.message)]
 
-    def test_dict_mixed_emits_warning_and_uses_max(self):
+    def test_dict_mixed_without_override_raises(self):
+        """A mixed-asset portfolio (stocks+crypto) has no objective
+        single annualisation; auto-inference would silently mislead.
+        The engine refuses and requires explicit portfolio_trading_days."""
         td = {"AAPL": 252, "BTC-USD": 365}
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            port, per = _normalize_trading_days(td, ["AAPL", "BTC-USD"])
-        assert port == 365
-        assert per == {"AAPL": 252, "BTC-USD": 365}
-        assert len([w for w in caught if "Mixed per-symbol" in str(w.message)]) == 1
+        with pytest.raises(ValueError, match="Ambiguous trading_days"):
+            _normalize_trading_days(td, ["AAPL", "BTC-USD"])
 
     def test_dict_override_silent(self):
         td = {"AAPL": 252, "BTC-USD": 365}
@@ -160,6 +159,26 @@ def test_invalid_trading_days_value_raises():
         BacktestEngine(portfolio_trading_days=0)
 
 
+def test_trading_days_bool_rejected():
+    """bool is a subclass of int in Python — without an explicit check,
+    BacktestEngine(trading_days=True) would silently become 1."""
+    with pytest.raises(TypeError, match="not bool"):
+        BacktestEngine(trading_days=True)
+    with pytest.raises(TypeError, match="not bool"):
+        BacktestEngine(trading_days=False)
+    # In dict values too
+    with pytest.raises(ValueError, match="AAPL"):
+        BacktestEngine(trading_days={"AAPL": True})
+    with pytest.raises(TypeError, match="not bool"):
+        BacktestEngine(portfolio_trading_days=True)
+
+
+def test_trading_days_empty_dict_rejected():
+    """An empty dict is almost certainly a caller bug (forgot to populate)."""
+    with pytest.raises(ValueError, match="empty"):
+        BacktestEngine(trading_days={})
+
+
 # ---------------------------------------------------------------------------
 # Engine — multi-asset + per_asset_metrics populated
 # ---------------------------------------------------------------------------
@@ -214,17 +233,16 @@ def test_multi_asset_per_asset_metrics_use_per_symbol_trading_days():
     assert res_b.per_asset_metrics["BTC-USD"]["trading_days"] == 365
 
 
-def test_multi_asset_mixed_dict_without_override_warns():
+def test_multi_asset_mixed_dict_without_override_raises():
+    """Mixed per-asset td at run time without portfolio_trading_days
+    is a user error — refuse rather than auto-infer."""
     engine = BacktestEngine(
         mode="vectorized", fee_model=ZeroFeeModel(),
         trading_days={"AAPL": 252, "BTC-USD": 365},
     )
     engine.set_strategy(MACrossover(short=10, long=30))
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        res = engine.run(_multi_data())
-    assert len([w for w in caught if "Mixed per-symbol" in str(w.message)]) == 1
-    assert res.trading_days == 365
+    with pytest.raises(ValueError, match="Ambiguous trading_days"):
+        engine.run(_multi_data())
 
 
 def test_multi_asset_mixed_dict_with_override_silent():
@@ -262,15 +280,16 @@ def test_multi_asset_benchmark_uses_first_symbol_trading_days():
     eng_baseline.set_strategy(MACrossover(short=10, long=30))
     res_baseline = eng_baseline.run(data)
 
-    # Mixed dict, auto portfolio=max=365
+    # Mixed dict with explicit portfolio=365 (Fix B: mixed without
+    # override now raises, so user must choose). Benchmark is still
+    # AAPL buy-and-hold → should use AAPL's td (252), not portfolio's 365.
     eng_mixed = BacktestEngine(
         mode="vectorized", fee_model=ZeroFeeModel(),
         trading_days={"AAPL": 252, "BTC-USD": 365},
+        portfolio_trading_days=365,
     )
     eng_mixed.set_strategy(MACrossover(short=10, long=30))
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")  # ignore the Mixed-dict warning
-        res_mixed = eng_mixed.run(data)
+    res_mixed = eng_mixed.run(data)
 
     # Benchmark is buy-and-hold of first symbol (AAPL) → td=252 in both
     bench_baseline = res_baseline.benchmark_metrics["sharpe_ratio"]

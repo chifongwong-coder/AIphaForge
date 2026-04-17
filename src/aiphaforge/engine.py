@@ -220,7 +220,12 @@ class BacktestEngine:
         self.impact_adv_lookback = impact_adv_lookback
         self.impact_vol_lookback = impact_vol_lookback
 
-        # Annualisation (v1.9.5)
+        # Annualisation (v1.9.5).
+        # bool is a subclass of int in Python; reject it first so
+        # BacktestEngine(trading_days=True) doesn't silently become 1.
+        if isinstance(trading_days, bool):
+            raise TypeError(
+                "trading_days must be int or Dict[str, int], not bool")
         if not isinstance(trading_days, (int, dict)):
             raise TypeError(
                 f"trading_days must be int or Dict[str, int], "
@@ -229,14 +234,21 @@ class BacktestEngine:
         if isinstance(trading_days, int) and trading_days < 1:
             raise ValueError(f"trading_days must be >= 1, got {trading_days}")
         if isinstance(trading_days, dict):
+            if not trading_days:
+                raise ValueError(
+                    "trading_days dict is empty; pass a scalar int or "
+                    "populate the dict with {symbol: int}")
             for k, v in trading_days.items():
-                if not isinstance(v, int) or v < 1:
+                if isinstance(v, bool) or not isinstance(v, int) or v < 1:
                     raise ValueError(
                         f"trading_days[{k!r}] must be int >= 1, got {v!r}")
-        if portfolio_trading_days is not None and portfolio_trading_days < 1:
-            raise ValueError(
-                f"portfolio_trading_days must be >= 1, "
-                f"got {portfolio_trading_days}")
+        if portfolio_trading_days is not None:
+            if isinstance(portfolio_trading_days, bool):
+                raise TypeError("portfolio_trading_days must be int, not bool")
+            if portfolio_trading_days < 1:
+                raise ValueError(
+                    f"portfolio_trading_days must be >= 1, "
+                    f"got {portfolio_trading_days}")
         self.trading_days: Union[int, Dict[str, int]] = trading_days
         self.portfolio_trading_days_override: Optional[int] = portfolio_trading_days
 

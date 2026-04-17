@@ -356,7 +356,11 @@ def deflated_sharpe_ratio(
     n = len(rets)
     sqrt_td = np.sqrt(td)
 
-    if n < 4 or n_trials < 1:
+    # n_trials < 2 is mathematically undefined: Bailey 2014 eq.7 has
+    # stats.norm.ppf(1 - 1/N), which at N=1 is ppf(0) = -∞ and would
+    # trivially return PSR = 1.0 (always "significant"). For 1 trial
+    # there is no multiple-comparison problem; call PSR directly.
+    if n < 4 or n_trials < 2:
         return DSRResult(
             observed_sharpe=float("nan"),
             expected_max_null_sharpe=float("nan"),
