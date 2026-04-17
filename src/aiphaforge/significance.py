@@ -278,17 +278,18 @@ def probabilistic_sharpe_ratio(
     n = len(rets)
     sqrt_td = np.sqrt(td)
 
-    nan_result = lambda: PSRResult(
-        observed_sharpe=float("nan"), benchmark_sharpe=benchmark_sharpe,
-        psr=float("nan"), skewness=float("nan"),
-        kurtosis=float("nan"), n_obs=n,
-    )
+    def _nan_result():
+        return PSRResult(
+            observed_sharpe=float("nan"), benchmark_sharpe=benchmark_sharpe,
+            psr=float("nan"), skewness=float("nan"),
+            kurtosis=float("nan"), n_obs=n,
+        )
 
     if n < 4:
-        return nan_result()
+        return _nan_result()
     std = float(rets.std())
     if std <= 0:
-        return nan_result()
+        return _nan_result()
 
     sr_per = float(rets.mean() / std)
     benchmark_per = benchmark_sharpe / sqrt_td
@@ -338,6 +339,7 @@ def deflated_sharpe_ratio(
             - returns std == 0.
     """
     import math
+
     from scipy import stats
 
     rets, td = _resolve_returns_and_td(source, trading_days)

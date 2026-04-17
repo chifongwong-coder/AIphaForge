@@ -5,7 +5,6 @@ from __future__ import annotations
 import warnings
 
 import numpy as np
-import pandas as pd
 import pytest
 
 from aiphaforge import BacktestEngine
@@ -17,7 +16,6 @@ from aiphaforge.utils import (
     _resolve_trading_days,
 )
 from tests.conftest import make_ohlcv
-
 
 # ---------------------------------------------------------------------------
 # utils helpers
