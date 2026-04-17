@@ -61,9 +61,15 @@ AIphaForge also works perfectly well as a general-purpose backtest framework for
 ### Statistical Significance Testing
 - **Bootstrap CI**: `bootstrap_ci()` / `bootstrap_metrics()` — stationary block bootstrap (Politis-Romano) for Sharpe, drawdown, and custom metrics
 - **Permutation test**: `permutation_test()` — shuffle signal timing to test alpha significance (Phipson-Smyth corrected p-values)
+- **PSR / DSR (v1.9.5)**: `probabilistic_sharpe_ratio()` and `deflated_sharpe_ratio()` — Bailey & López de Prado significance tests with Pearson kurtosis adjustment
 - **Monte Carlo simulation**: `monte_carlo_test()` — generate synthetic market paths, run strategy/agent on each to test robustness
 - **Multiple comparison correction**: `multiple_comparison_correction()` — Bonferroni, Benjamini-Hochberg, or Model Confidence Set (optional `arch` dependency)
 - **Path generation**: `generate_paths()` — block bootstrap or parametric normal synthetic OHLCV data
+
+### Per-Symbol Annualization (v1.9.5)
+- `BacktestEngine(trading_days=...)` accepts a scalar (252 / 365 / etc.) or a per-symbol dict
+- Mixed-asset portfolios (e.g. AAPL + BTC-USD) annualise per-asset metrics correctly; portfolio-level uses an explicit `portfolio_trading_days` or auto-infers with a warning
+- `BacktestResult.per_asset_metrics` is now populated on every multi-asset run (previously declared but never set)
 
 ### Market Impact & Capacity
 - **Market impact models**: `LinearImpactModel`, `SquareRootImpactModel` (Almgren-Chriss with permanent impact), `PowerLawImpactModel` — pluggable via `BaseImpactModel` ABC

@@ -42,12 +42,44 @@ class PerformanceAnalyzer:
         >>> report = analyzer.generate_report()
     """
 
-    def __init__(self, result: BacktestResult, downside_method: str = "full"):
+    def __init__(
+        self,
+        result: BacktestResult,
+        downside_method: str = "full",
+        trading_days: Optional[int] = None,
+        per_asset_trading_days: Optional[Dict[str, int]] = None,
+    ):
+        """Build a PerformanceAnalyzer for a finished backtest.
+
+        Parameters:
+            result: BacktestResult to analyse.
+            downside_method: "full" or "negative_only" — passed to
+                Sortino computation.
+            trading_days: Annualisation factor for portfolio-level
+                metrics. Resolution: explicit kwarg → ``result.trading_days``
+                → ``TRADING_DAYS_STOCK`` (252).
+            per_asset_trading_days: Per-symbol annualisation factors for
+                ``per_asset_analysis()``. Resolution: explicit kwarg →
+                ``result.per_asset_trading_days`` → empty (each asset
+                falls back to ``self.trading_days``).
+        """
         self.result = result
         self.equity = result.equity_curve
         self.returns = calculate_returns(self.equity) if len(self.equity) > 1 else pd.Series()
         self.trades = result.trades
         self._downside_method = downside_method
+
+        if trading_days is not None:
+            self.trading_days = int(trading_days)
+        else:
+            self.trading_days = int(getattr(result, "trading_days", TRADING_DAYS_STOCK))
+
+        if per_asset_trading_days is not None:
+            self.per_asset_trading_days = dict(per_asset_trading_days)
+        else:
+            self.per_asset_trading_days = dict(
+                getattr(result, "per_asset_trading_days", {}) or {}
+            )
 
         # Cached results
         self._metrics_cache = {}
@@ -72,7 +104,7 @@ class PerformanceAnalyzer:
         if n_days == 0:
             return 0.0
         total_ret = self.total_return
-        return annualize_return(total_ret, n_days, TRADING_DAYS_STOCK)
+        return annualize_return(total_ret, n_days, self.trading_days)
 
     @property
     def cagr(self) -> float:
@@ -103,7 +135,7 @@ class PerformanceAnalyzer:
         """Annualized volatility."""
         if len(self.returns) < 2:
             return 0.0
-        return annualize(self.returns.std(), TRADING_DAYS_STOCK, is_volatility=True)
+        return annualize(self.returns.std(), self.trading_days, is_volatility=True)
 
     @property
     def downside_volatility(self) -> float:
@@ -120,7 +152,7 @@ class PerformanceAnalyzer:
             daily_downside = np.sqrt((clipped ** 2).mean())
         if daily_downside == 0 or np.isnan(daily_downside):
             return 0.0
-        return annualize(daily_downside, TRADING_DAYS_STOCK, is_volatility=True)
+        return annualize(daily_downside, self.trading_days, is_volatility=True)
 
     @property
     def max_drawdown(self) -> float:
@@ -169,13 +201,13 @@ class PerformanceAnalyzer:
     @property
     def sharpe_ratio(self) -> float:
         """Sharpe ratio (assuming zero risk-free rate)."""
-        return calc_sharpe(self.returns, trading_days=TRADING_DAYS_STOCK)
+        return calc_sharpe(self.returns, trading_days=self.trading_days)
 
     @property
     def sortino_ratio(self) -> float:
         return calc_sortino(
             self.returns,
-            trading_days=TRADING_DAYS_STOCK,
+            trading_days=self.trading_days,
             downside_method=self._downside_method,
         )
 
@@ -212,7 +244,7 @@ class PerformanceAnalyzer:
         if excess.std() == 0:
             return 0.0
 
-        return annualize(excess.mean() / excess.std(), TRADING_DAYS_STOCK, is_volatility=True)
+        return annualize(excess.mean() / excess.std(), self.trading_days, is_volatility=True)
 
     # ========== Trade Statistics ==========
 
@@ -479,16 +511,18 @@ class PerformanceAnalyzer:
 
         results: Dict[str, Dict[str, Any]] = {}
         for sym, pnl_series in pnl_dict.items():
+            sym_td = self.per_asset_trading_days.get(sym, self.trading_days)
             if len(pnl_series) == 0:
                 results[sym] = {
                     'total_pnl': 0.0, 'sharpe_ratio': 0.0,
                     'max_drawdown': 0.0, 'volatility': 0.0,
+                    'trading_days': sym_td,
                 }
                 continue
             cumulative = pnl_series.cumsum()
             total_pnl = float(cumulative.iloc[-1])
-            vol = float(pnl_series.std() * np.sqrt(TRADING_DAYS_STOCK))
-            sr = calc_sharpe(pnl_series, trading_days=TRADING_DAYS_STOCK)
+            vol = float(pnl_series.std() * np.sqrt(sym_td))
+            sr = calc_sharpe(pnl_series, trading_days=sym_td)
             # Drawdown from cumulative PnL curve
             peak = cumulative.expanding().max()
             dd = (cumulative - peak)
@@ -498,6 +532,7 @@ class PerformanceAnalyzer:
                 'sharpe_ratio': sr,
                 'max_drawdown': mdd,
                 'volatility': vol,
+                'trading_days': sym_td,
             }
         return results
 

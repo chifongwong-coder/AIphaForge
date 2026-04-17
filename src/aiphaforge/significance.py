@@ -37,7 +37,7 @@ Example::
 import copy
 import warnings
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Sequence, Union
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -167,6 +167,221 @@ _HIGHER_IS_BETTER = {
 _LOWER_IS_BETTER = {
     "max_drawdown",
 }
+
+
+# ---------------------------------------------------------------------------
+# PSR / DSR (v1.9.5)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PSRResult:
+    """Probabilistic Sharpe Ratio result.
+
+    Attributes:
+        observed_sharpe: Annualised Sharpe of the input series.
+        benchmark_sharpe: Annualised Sharpe threshold (SR*).
+        psr: Probability that the true Sharpe exceeds benchmark_sharpe,
+            given the observed series. Range [0, 1] or NaN on
+            degenerate input.
+        skewness: Sample skewness of returns (Fisher).
+        kurtosis: Pearson (non-excess) kurtosis of returns; 3 for
+            standard normal.
+        n_obs: Number of observations.
+    """
+    observed_sharpe: float
+    benchmark_sharpe: float
+    psr: float
+    skewness: float
+    kurtosis: float
+    n_obs: int
+
+
+@dataclass
+class DSRResult:
+    """Deflated Sharpe Ratio result.
+
+    Attributes:
+        observed_sharpe: Annualised Sharpe of the input series.
+        expected_max_null_sharpe: E[max SR] under the null when
+            ``n_trials`` independent strategies are tested
+            (Bailey & Lopez de Prado 2014, eq. 7), annualised.
+        dsr: Probability the observed Sharpe exceeds the expected max
+            null. Range [0, 1] or NaN on degenerate input.
+        n_trials: Number of strategy trials supplied.
+    """
+    observed_sharpe: float
+    expected_max_null_sharpe: float
+    dsr: float
+    n_trials: int
+
+
+def _resolve_returns_and_td(
+    source: Union[BacktestResult, pd.Series],
+    trading_days: Optional[int],
+) -> Tuple[pd.Series, int]:
+    """Resolution: explicit kwarg → result.trading_days → 252."""
+    if isinstance(source, BacktestResult):
+        rets = source.equity_curve.pct_change().dropna()
+        td = trading_days if trading_days is not None else int(
+            getattr(source, "trading_days", 252))
+    elif isinstance(source, pd.Series):
+        rets = source.dropna()
+        td = trading_days if trading_days is not None else 252
+    else:
+        raise TypeError(
+            f"source must be BacktestResult or pd.Series, "
+            f"got {type(source).__name__}")
+    return rets, int(td)
+
+
+def probabilistic_sharpe_ratio(
+    source: Union[BacktestResult, pd.Series],
+    *,
+    benchmark_sharpe: float = 0.0,
+    trading_days: Optional[int] = None,
+) -> PSRResult:
+    """Bailey & Lopez de Prado 2012, eq. 14.
+
+    PSR(SR*) = Φ((SR_obs − SR*) · √(T−1) /
+                  √(1 − γ₃·SR_obs + (γ₄−1)/4·SR_obs²))
+
+    where SR_obs and SR* are *per-period* (non-annualised) Sharpe ratios,
+    γ₃ is sample skewness, γ₄ is **Pearson** kurtosis (3 for normal).
+    The function takes ``benchmark_sharpe`` as an *annualised* value and
+    converts internally.
+
+    Parameters:
+        source: A BacktestResult (uses its equity_curve.pct_change()),
+            or a pd.Series of per-period returns.
+        benchmark_sharpe: Annualised benchmark Sharpe threshold (SR*).
+        trading_days: Annualisation factor. Resolution order:
+            1. If passed (not None), use it.
+            2. Else if source is BacktestResult, use ``source.trading_days``.
+            3. Else 252.
+
+    Returns:
+        PSRResult. ``psr`` is NaN when:
+            - n < 4 observations, or
+            - returns std == 0, or
+            - the variance denominator becomes non-positive (rare,
+              extreme skew/kurt combos).
+
+    Example:
+        >>> from aiphaforge.significance import probabilistic_sharpe_ratio
+        >>> r = probabilistic_sharpe_ratio(result, benchmark_sharpe=1.0)
+        >>> if r.psr > 0.95:
+        ...     print(f"Sharpe {r.observed_sharpe:.2f} robust at 95% level")
+    """
+    from scipy import stats  # lazy import — scipy is an optional dep elsewhere
+
+    rets, td = _resolve_returns_and_td(source, trading_days)
+    n = len(rets)
+    sqrt_td = np.sqrt(td)
+
+    nan_result = lambda: PSRResult(
+        observed_sharpe=float("nan"), benchmark_sharpe=benchmark_sharpe,
+        psr=float("nan"), skewness=float("nan"),
+        kurtosis=float("nan"), n_obs=n,
+    )
+
+    if n < 4:
+        return nan_result()
+    std = float(rets.std())
+    if std <= 0:
+        return nan_result()
+
+    sr_per = float(rets.mean() / std)
+    benchmark_per = benchmark_sharpe / sqrt_td
+
+    skew = float(stats.skew(rets, bias=False))
+    kurt_pearson = float(stats.kurtosis(rets, fisher=False, bias=False))
+
+    denom = 1.0 - skew * sr_per + ((kurt_pearson - 1.0) / 4.0) * (sr_per ** 2)
+    if denom <= 0:
+        return PSRResult(
+            observed_sharpe=sr_per * sqrt_td,
+            benchmark_sharpe=benchmark_sharpe,
+            psr=float("nan"), skewness=skew, kurtosis=kurt_pearson, n_obs=n,
+        )
+
+    z = (sr_per - benchmark_per) * np.sqrt(n - 1) / np.sqrt(denom)
+    psr = float(stats.norm.cdf(z))
+    return PSRResult(
+        observed_sharpe=sr_per * sqrt_td,
+        benchmark_sharpe=benchmark_sharpe,
+        psr=psr, skewness=skew, kurtosis=kurt_pearson, n_obs=n,
+    )
+
+
+def deflated_sharpe_ratio(
+    source: Union[BacktestResult, pd.Series],
+    *,
+    n_trials: int,
+    trading_days: Optional[int] = None,
+) -> DSRResult:
+    """Bailey, Borwein, López de Prado & Zhu 2014.
+
+    Estimates E[max Sharpe] under the null when ``n_trials`` strategies
+    are tested, then computes PSR against that elevated bar. Same
+    ``trading_days`` resolution order as
+    :func:`probabilistic_sharpe_ratio`.
+
+    Parameters:
+        source: A BacktestResult or pd.Series of per-period returns.
+        n_trials: Number of strategy variants tested before selection.
+        trading_days: Annualisation factor (see resolution order above).
+
+    Returns:
+        DSRResult. ``dsr`` is NaN when:
+            - n < 4 observations, or
+            - n_trials < 1, or
+            - returns std == 0.
+    """
+    import math
+    from scipy import stats
+
+    rets, td = _resolve_returns_and_td(source, trading_days)
+    n = len(rets)
+    sqrt_td = np.sqrt(td)
+
+    if n < 4 or n_trials < 1:
+        return DSRResult(
+            observed_sharpe=float("nan"),
+            expected_max_null_sharpe=float("nan"),
+            dsr=float("nan"), n_trials=int(n_trials),
+        )
+
+    std = float(rets.std())
+    if std <= 0:
+        return DSRResult(
+            observed_sharpe=float("nan"),
+            expected_max_null_sharpe=float("nan"),
+            dsr=float("nan"), n_trials=int(n_trials),
+        )
+
+    sr_obs = float(rets.mean() / std) * sqrt_td
+
+    var_sr = float(np.var(rets) * td) / max(n - 1, 1)
+    sd_sr = np.sqrt(max(var_sr, 1e-12))
+
+    # Bailey & Lopez de Prado 2014 eq. 7
+    gamma = 0.5772156649  # Euler-Mascheroni
+    e = math.e
+    sr_zero_per = sd_sr * (
+        (1.0 - gamma) * stats.norm.ppf(1.0 - 1.0 / n_trials)
+        + gamma * stats.norm.ppf(1.0 - 1.0 / (n_trials * e))
+    )
+    sr_zero_ann = sr_zero_per  # already in per-bar units of std(returns)*sqrt(td)
+
+    psr_result = probabilistic_sharpe_ratio(
+        rets, benchmark_sharpe=sr_zero_ann, trading_days=td)
+
+    return DSRResult(
+        observed_sharpe=sr_obs,
+        expected_max_null_sharpe=sr_zero_ann,
+        dsr=psr_result.psr,
+        n_trials=int(n_trials),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -313,7 +528,7 @@ def bootstrap_metrics(
     confidence: float = 0.95,
     block_size: Optional[int] = None,
     random_state: Optional[int] = None,
-    trading_days: int = 252,
+    trading_days: Optional[int] = None,
 ) -> Dict[str, BootstrapResult]:
     """Compute confidence intervals for multiple metrics via block bootstrap.
 
@@ -360,6 +575,10 @@ def bootstrap_metrics(
         raise ValueError(
             f"equity_curve too short ({len(result.equity_curve)} bars, "
             f"{len(returns)} returns). Need at least 3 bars.")
+
+    # Resolve trading_days: explicit kwarg → result.trading_days → 252
+    if trading_days is None:
+        trading_days = int(getattr(result, "trading_days", 252))
 
     # Auto block_size
     if block_size is None:
@@ -426,7 +645,7 @@ def bootstrap_ci(
     confidence: float = 0.95,
     block_size: Optional[int] = None,
     random_state: Optional[int] = None,
-    trading_days: int = 252,
+    trading_days: Optional[int] = None,
 ) -> BootstrapResult:
     """Single-metric convenience wrapper around :func:`bootstrap_metrics`.
 

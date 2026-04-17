@@ -160,6 +160,9 @@ class BacktestResult:
     per_asset_metrics: Optional[Dict[str, Dict]] = None
     symbols: List[str] = field(default_factory=list)
     turnover_history: Optional[List[float]] = None
+    # Annualisation (v1.9.5)
+    trading_days: int = 252
+    per_asset_trading_days: Dict[str, int] = field(default_factory=dict)
 
     def __post_init__(self):
         if self.final_capital == 0.0 and len(self.equity_curve) > 0:
@@ -250,7 +253,10 @@ class BacktestResult:
             'strategy_name': self.strategy_name,
             'parameters': self.parameters,
             'metrics': self.metrics,
+            'trading_days': self.trading_days,
         }
+        if self.per_asset_trading_days:
+            d['per_asset_trading_days'] = dict(self.per_asset_trading_days)
         if self.benchmark_metrics is not None:
             d['benchmark_metrics'] = self.benchmark_metrics
         return d
