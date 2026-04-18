@@ -24,8 +24,18 @@ class Trade:
         exit_time: Exit timestamp.
         entry_price: Entry price.
         exit_price: Exit price.
-        size: Trade quantity.
-        pnl: Net profit/loss.
+        size: Trade quantity (shares / contracts). For vectorized-mode
+            trades this is reconstructed as
+            ``entry_equity * position_size / entry_price``.
+        pnl: Profit/loss in account currency. In **vectorized** mode this
+            is a *linear* per-trade approximation
+            ``direction * shares * (exit_price - entry_price)``; fees are
+            not double-deducted because they are already embedded in the
+            geometric ``equity_curve``. As a result, ``sum(trade.pnl)``
+            and ``equity_curve.iloc[-1] - initial_capital`` diverge by
+            ``O(σ²·T·notional)`` whenever there are reversals or
+            fractional positions — this is a mathematical property of
+            geometric vs. linear PnL, not a bug.
         pnl_pct: P&L percentage.
         commission: Commission paid.
         slippage_cost: Slippage cost.
