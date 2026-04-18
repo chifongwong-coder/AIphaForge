@@ -83,6 +83,7 @@ from .hooks import (
     CostAwareRebalanceHook,
     DriftRebalanceHook,
     HookContext,
+    LifecycleContext,
     OptimizedRebalanceHook,
     ScheduleHook,
     SecondaryTimeframe,
@@ -213,6 +214,7 @@ __all__ = [
 
     # Hooks
     'HookContext',
+    'LifecycleContext',
     'BacktestHook',
     'SecondaryTimeframe',
     'ScheduleHook',

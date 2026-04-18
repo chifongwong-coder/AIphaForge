@@ -14,7 +14,13 @@ import pandas as pd
 
 from .broker import Broker
 from .config import BacktestConfig, resolve_config
-from .hooks import HookContext, SecondaryTimeframe
+from .hooks import (
+    HookContext,
+    LifecycleContext,
+    SecondaryTimeframe,
+    call_hook_lifecycle_end,
+    call_hook_lifecycle_start,
+)
 from .meta import MetaContext
 from .portfolio import Portfolio
 from .utils import build_secondary_lookup, build_unified_timeline, calculate_returns
@@ -149,10 +155,22 @@ def run_event_driven(
             'bar_realized': {sym: 0.0 for sym in symbols},
         }
 
-    # --- Notify hooks: backtest start (per symbol) ---
-    for sym in sorted(symbols):
+    # --- Notify hooks: backtest start (once per backtest, symmetric with end) ---
+    sorted_symbols = sorted(symbols)
+    if config.hooks:
+        primary_sym = sorted_symbols[0]
+        primary_data = data_dict[primary_sym]
+        start_ctx = LifecycleContext(
+            phase="start",
+            timestamp=primary_data.index[0],
+            symbols=sorted_symbols,
+            config=config,
+            data_dict=data_dict,
+            primary_symbol=primary_sym,
+            primary_data=primary_data,
+        )
         for hook in config.hooks:
-            hook.on_backtest_start(data_dict[sym], sym, config=config)
+            call_hook_lifecycle_start(hook, start_ctx)
 
     # --- Build exit rules list ---
     exit_rules = [r for r in [config.stop_loss_rule,
@@ -612,9 +630,21 @@ def run_event_driven(
                 and portfolio.total_equity < 0):
             break
 
-    # --- Post-loop: notify hooks ---
-    for hook in config.hooks:
-        hook.on_backtest_end()
+    # --- Post-loop: notify hooks (once per backtest, symmetric with start) ---
+    if config.hooks:
+        primary_sym = sorted_symbols[0]
+        primary_data = data_dict[primary_sym]
+        end_ctx = LifecycleContext(
+            phase="end",
+            timestamp=primary_data.index[-1],
+            symbols=sorted_symbols,
+            config=config,
+            data_dict=data_dict,
+            primary_symbol=primary_sym,
+            primary_data=primary_data,
+        )
+        for hook in config.hooks:
+            call_hook_lifecycle_end(hook, end_ctx)
 
     # --- Build results ---
     equity_curve = portfolio.get_equity_curve()

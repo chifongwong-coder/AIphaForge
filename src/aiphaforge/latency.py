@@ -19,7 +19,13 @@ import warnings
 from collections import deque
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
-from .hooks import BacktestHook, HookContext
+from .hooks import (
+    BacktestHook,
+    HookContext,
+    LifecycleContext,
+    call_hook_lifecycle_end,
+    call_hook_lifecycle_start,
+)
 from .orders import Order
 
 # ---------------------------------------------------------------------------
@@ -210,19 +216,14 @@ class LatencyHook(BacktestHook):
     # Lifecycle callbacks
     # ------------------------------------------------------------------
 
-    def on_backtest_start(
-        self,
-        data: Any,
-        symbol: str,
-        *,
-        config: Any = None,
-    ) -> None:
+    def on_backtest_start(self, ctx: LifecycleContext) -> None:
         """Validate execution mode and forward to the inner hook."""
         self._order_queue.clear()
         self._meta_queue.clear()
         self._warned_signal_conflict = False
         self._warned_custom_clamp = False
 
+        config = ctx.config
         if config is None:
             raise ValueError(
                 "LatencyHook requires EVENT_DRIVEN mode. "
@@ -249,7 +250,8 @@ class LatencyHook(BacktestHook):
             )
             self._warned_signal_conflict = True
 
-        self.inner_hook.on_backtest_start(data, symbol, config=config)
+        # Forward to the inner hook, adapting to its signature.
+        call_hook_lifecycle_start(self.inner_hook, ctx)
 
     def on_pre_signal(self, context: HookContext) -> None:
         """Intercept the inner hook's orders and manage the delay queue."""
@@ -332,7 +334,7 @@ class LatencyHook(BacktestHook):
         """Forward to the inner hook (no proxying needed)."""
         self.inner_hook.on_bar(context)
 
-    def on_backtest_end(self) -> None:
+    def on_backtest_end(self, ctx: LifecycleContext) -> None:
         """Warn about pending queue items, then forward to the inner hook."""
         n_orders = len(self._order_queue)
         n_meta = len(self._meta_queue)
@@ -347,7 +349,7 @@ class LatencyHook(BacktestHook):
                 f"(backtest ended before delay elapsed).")
         self._order_queue.clear()
         self._meta_queue.clear()
-        self.inner_hook.on_backtest_end()
+        call_hook_lifecycle_end(self.inner_hook, ctx)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -577,16 +579,10 @@ class SymbolRoutingLatencyHook(LatencyHook):
                     f"Invalid override for symbol {sym!r}: {exc}"
                 ) from exc
 
-    def on_backtest_start(
-        self,
-        data: Any,
-        symbol: str,
-        *,
-        config: Any = None,
-    ) -> None:
+    def on_backtest_start(self, ctx: LifecycleContext) -> None:
         """Reset execution delay warning flag, then forward to base."""
         self._warned_exec_custom_clamp = False
-        super().on_backtest_start(data, symbol, config=config)
+        super().on_backtest_start(ctx)
 
     def _calculate_delay(self, bar_index: int, ctx: HookContext) -> int:
         """Compute total delay = decision delay + execution delay.
