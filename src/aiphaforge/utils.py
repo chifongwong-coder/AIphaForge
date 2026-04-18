@@ -5,13 +5,122 @@ Common constants and helper functions for quantitative finance calculations.
 """
 
 import warnings
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import pandas as pd
 
 # Standard number of trading days per year for stock markets
 TRADING_DAYS_STOCK: int = 252
+
+
+def _resolve_trading_days(
+    trading_days: Union[int, Dict[str, int]],
+    symbol: str,
+    *,
+    default: int = TRADING_DAYS_STOCK,
+    warn_missing: bool = False,
+    _warned: Optional[Set[str]] = None,
+) -> int:
+    """Resolve a per-symbol annualisation factor from a scalar or dict.
+
+    Parameters:
+        trading_days: Either a single integer (used for every symbol) or
+            a {symbol: int} mapping.
+        symbol: Symbol whose factor we want.
+        default: Value to return when ``trading_days`` is a dict and
+            ``symbol`` is not a key. Defaults to TRADING_DAYS_STOCK (252).
+        warn_missing: If True, emit a one-time UserWarning per missing
+            symbol. Combined with ``_warned`` to dedupe across calls in
+            the same run.
+        _warned: Optional set of symbols we have already warned about,
+            mutated in place. Pass an external set to avoid duplicate
+            warnings inside one backtest run.
+
+    Returns:
+        Annualisation factor (int).
+    """
+    if isinstance(trading_days, int):
+        return trading_days
+    if symbol in trading_days:
+        return int(trading_days[symbol])
+    if warn_missing and (_warned is None or symbol not in _warned):
+        warnings.warn(
+            f"trading_days dict missing entry for {symbol!r}; "
+            f"falling back to {default}.",
+            UserWarning,
+            stacklevel=2,
+        )
+        if _warned is not None:
+            _warned.add(symbol)
+    return int(default)
+
+
+def _normalize_trading_days(
+    trading_days: Union[int, Dict[str, int]],
+    active_symbols: Iterable[str],
+    *,
+    portfolio_override: Optional[int] = None,
+    default: int = TRADING_DAYS_STOCK,
+) -> Tuple[int, Dict[str, int]]:
+    """Normalise scalar-or-dict trading_days to (portfolio_int, per_symbol_dict).
+
+    Resolves the portfolio-level annualisation factor from the dict if
+    ``portfolio_override`` is None, emitting a UserWarning when the
+    active subset is mixed.
+
+    Parameters:
+        trading_days: Scalar int or {symbol: int} dict from the user.
+        active_symbols: Symbols actually used in this backtest run; only
+            their values participate in auto-inference.
+        portfolio_override: If not None, used directly for the portfolio
+            level (no warning). Typically the user's
+            ``portfolio_trading_days`` argument.
+        default: Fallback for symbols not in the dict.
+
+    Returns:
+        Tuple ``(portfolio_trading_days, per_symbol_map)``.
+        ``per_symbol_map`` always maps every active symbol to an int.
+    """
+    active = list(active_symbols)
+
+    if isinstance(trading_days, int):
+        per_symbol = {sym: int(trading_days) for sym in active}
+        portfolio = portfolio_override if portfolio_override is not None else int(trading_days)
+        return portfolio, per_symbol
+
+    # Dict case
+    warned: Set[str] = set()
+    per_symbol = {
+        sym: _resolve_trading_days(
+            trading_days, sym, default=default,
+            warn_missing=True, _warned=warned,
+        )
+        for sym in active
+    }
+
+    if portfolio_override is not None:
+        return int(portfolio_override), per_symbol
+
+    # Auto-infer from values of symbols actually used in this run
+    used_values = {per_symbol[sym] for sym in active}
+    if not used_values:
+        return int(default), per_symbol
+    if len(used_values) == 1:
+        # All equal — silent, unambiguous
+        return int(next(iter(used_values))), per_symbol
+
+    # Mixed values with no explicit portfolio choice: refuse rather than
+    # silently pick one. A mixed-asset (e.g. stocks+crypto) portfolio has
+    # no objectively correct single annualisation, and earlier attempts
+    # to auto-infer (max, min) all misled users who trusted the default.
+    sorted_vals = sorted(used_values)
+    raise ValueError(
+        f"Ambiguous trading_days: active symbols have mixed values "
+        f"{sorted_vals}. Portfolio-level metrics need a single "
+        f"annualisation factor; pass portfolio_trading_days= explicitly "
+        f"(e.g. 252 for a stock-dominated book, 365 for crypto)."
+    )
 
 
 def validate_ohlcv(

@@ -61,9 +61,19 @@ AIphaForge also works perfectly well as a general-purpose backtest framework for
 ### Statistical Significance Testing
 - **Bootstrap CI**: `bootstrap_ci()` / `bootstrap_metrics()` — stationary block bootstrap (Politis-Romano) for Sharpe, drawdown, and custom metrics
 - **Permutation test**: `permutation_test()` — shuffle signal timing to test alpha significance (Phipson-Smyth corrected p-values)
+- **PSR / DSR (v1.9.5)**: `probabilistic_sharpe_ratio()` and `deflated_sharpe_ratio()` — Bailey & López de Prado significance tests with Pearson kurtosis adjustment
 - **Monte Carlo simulation**: `monte_carlo_test()` — generate synthetic market paths, run strategy/agent on each to test robustness
 - **Multiple comparison correction**: `multiple_comparison_correction()` — Bonferroni, Benjamini-Hochberg, or Model Confidence Set (optional `arch` dependency)
 - **Path generation**: `generate_paths()` — block bootstrap or parametric normal synthetic OHLCV data
+
+### Per-Symbol Annualization (v1.9.5)
+- `BacktestEngine(trading_days=...)` accepts a scalar (252 / 365 / etc.) or a per-symbol dict
+- Mixed-asset portfolios (e.g. AAPL + BTC-USD) annualise per-asset metrics correctly; portfolio-level requires an explicit `portfolio_trading_days` (no silent auto-infer — a single scalar cannot be objectively chosen for stocks+crypto)
+- `BacktestResult.per_asset_metrics` is now populated on every multi-asset run (previously declared but never set)
+
+### v1.9.5 compatibility notes
+- Default `trading_days=252` reproduces v1.9.4 numbers exactly.
+- **Pickle compatibility across versions is not guaranteed.** `BacktestResult` gained new fields (`trading_days`, `per_asset_trading_days`); pickles created with v1.9.4 should be regenerated rather than loaded into v1.9.5. If you need long-term persistence, use `result.to_dict()` + JSON.
 
 ### Market Impact & Capacity
 - **Market impact models**: `LinearImpactModel`, `SquareRootImpactModel` (Almgren-Chriss with permanent impact), `PowerLawImpactModel` — pluggable via `BaseImpactModel` ABC

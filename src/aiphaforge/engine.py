@@ -27,6 +27,7 @@ from .results import BacktestResult, Trade
 # Import utility functions
 from .utils import (
     TRADING_DAYS_STOCK,
+    _normalize_trading_days,
     annualize_return,
     calculate_trade_metrics,
     compute_buy_and_hold,
@@ -132,6 +133,8 @@ class BacktestEngine:
         impact_model=None,
         impact_adv_lookback: int = 20,
         impact_vol_lookback: int = 20,
+        trading_days: Union[int, Dict[str, int]] = TRADING_DAYS_STOCK,
+        portfolio_trading_days: Optional[int] = None,
     ):
         # Fee model
         if isinstance(fee_model, str):
@@ -216,6 +219,45 @@ class BacktestEngine:
         self.impact_model = impact_model
         self.impact_adv_lookback = impact_adv_lookback
         self.impact_vol_lookback = impact_vol_lookback
+
+        # Annualisation (v1.9.5).
+        # bool is a subclass of int in Python; reject it first so
+        # BacktestEngine(trading_days=True) doesn't silently become 1.
+        if isinstance(trading_days, bool):
+            raise TypeError(
+                "trading_days must be int or Dict[str, int], not bool")
+        if not isinstance(trading_days, (int, dict)):
+            raise TypeError(
+                f"trading_days must be int or Dict[str, int], "
+                f"got {type(trading_days).__name__}"
+            )
+        if isinstance(trading_days, int) and trading_days < 1:
+            raise ValueError(f"trading_days must be >= 1, got {trading_days}")
+        if isinstance(trading_days, dict):
+            if not trading_days:
+                raise ValueError(
+                    "trading_days dict is empty; pass a scalar int or "
+                    "populate the dict with {symbol: int}")
+            for k, v in trading_days.items():
+                if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+                    raise ValueError(
+                        f"trading_days[{k!r}] must be int >= 1, got {v!r}")
+        if portfolio_trading_days is not None:
+            if isinstance(portfolio_trading_days, bool):
+                raise TypeError("portfolio_trading_days must be int, not bool")
+            if portfolio_trading_days < 1:
+                raise ValueError(
+                    f"portfolio_trading_days must be >= 1, "
+                    f"got {portfolio_trading_days}")
+        self.trading_days: Union[int, Dict[str, int]] = trading_days
+        self.portfolio_trading_days_override: Optional[int] = portfolio_trading_days
+
+        # Resolved at run time in run() once active symbols are known:
+        self._portfolio_trading_days: int = (
+            portfolio_trading_days if portfolio_trading_days is not None
+            else (trading_days if isinstance(trading_days, int) else TRADING_DAYS_STOCK)
+        )
+        self._resolved_per_asset_td: Dict[str, int] = {}
         self.asset_lot_sizes: Dict = asset_lot_sizes or {}
         for sym, ls in self.asset_lot_sizes.items():
             if not isinstance(ls, int) or ls < 1:
@@ -388,6 +430,13 @@ class BacktestEngine:
 
         # --- Multi-asset path ---
         if is_multi:
+            # Resolve annualisation before delegating so _run_multi can
+            # read self._portfolio_trading_days / _resolved_per_asset_td.
+            self._portfolio_trading_days, self._resolved_per_asset_td = \
+                _normalize_trading_days(
+                    self.trading_days, sorted(data.keys()),
+                    portfolio_override=self.portfolio_trading_days_override,
+                )
             return self._run_multi(
                 data, benchmark=benchmark,
                 benchmark_type=benchmark_type, weights=weights,
@@ -402,6 +451,13 @@ class BacktestEngine:
 
         # Reset per-run state
         self._agent_bar_count = 0
+
+        # Resolve annualisation for this run (single-asset)
+        self._portfolio_trading_days, self._resolved_per_asset_td = \
+            _normalize_trading_days(
+                self.trading_days, [symbol],
+                portfolio_override=self.portfolio_trading_days_override,
+            )
 
         # Generate signals
         signals = self._get_signals(data)
@@ -562,6 +618,18 @@ class BacktestEngine:
             for t in result.trades:
                 per_asset_trades.setdefault(t.symbol, []).append(t)
             result.per_asset_trades = per_asset_trades
+
+        # Populate per_asset_metrics (v1.9.5 — fix of pre-existing gap).
+        # _build_result already set result.trading_days and
+        # per_asset_trading_days from self._resolved_per_asset_td.
+        if result.per_asset_pnl:
+            from .performance import PerformanceAnalyzer
+            analyzer = PerformanceAnalyzer(
+                result,
+                trading_days=self._portfolio_trading_days,
+                per_asset_trading_days=self._resolved_per_asset_td,
+            )
+            result.per_asset_metrics = analyzer.per_asset_analysis()
 
         return result
 
@@ -886,6 +954,11 @@ class BacktestEngine:
         if 'meta_audit' in raw and raw['meta_audit']:
             result.metadata['meta_audit'] = raw['meta_audit']
 
+        # Annualisation (v1.9.5). Multi-asset path overrides per_asset_trading_days
+        # and populates per_asset_metrics after _build_result returns.
+        result.trading_days = self._portfolio_trading_days
+        result.per_asset_trading_days = dict(self._resolved_per_asset_td)
+
         return result
 
     # ========== Performance Calculation ==========
@@ -894,12 +967,21 @@ class BacktestEngine:
         self,
         returns: pd.Series,
         equity: pd.Series,
-        trades: List[Trade]
+        trades: List[Trade],
+        *,
+        trading_days: Optional[int] = None,
     ) -> Dict[str, float]:
         """Calculate performance metrics.
 
         Delegates to shared utility functions so that the engine and
         PerformanceAnalyzer use the same calculations.
+
+        Parameters:
+            trading_days: Annualisation factor. Defaults to
+                ``self._portfolio_trading_days`` — override when computing
+                metrics for a single-asset benchmark inside a multi-asset
+                run so the benchmark uses its own annualisation rather
+                than the (possibly dict-max) portfolio value.
         """
         metrics: Dict[str, float] = {}
 
@@ -914,13 +996,14 @@ class BacktestEngine:
         metrics['total_return'] = total_return
 
         n_days = len(returns)
+        td = trading_days if trading_days is not None else self._portfolio_trading_days
         metrics['annualized_return'] = (
-            annualize_return(total_return, n_days, TRADING_DAYS_STOCK) if n_days > 0 else 0.0
+            annualize_return(total_return, n_days, td) if n_days > 0 else 0.0
         )
 
         # --- Risk metrics ---
-        metrics['sharpe_ratio'] = calc_sharpe(returns, trading_days=TRADING_DAYS_STOCK)
-        metrics['sortino_ratio'] = calc_sortino(returns, trading_days=TRADING_DAYS_STOCK)
+        metrics['sharpe_ratio'] = calc_sharpe(returns, trading_days=td)
+        metrics['sortino_ratio'] = calc_sortino(returns, trading_days=td)
         metrics['max_drawdown'] = calc_max_drawdown(equity)
         metrics['calmar_ratio'] = (
             metrics['annualized_return'] / metrics['max_drawdown']
@@ -931,7 +1014,7 @@ class BacktestEngine:
         metrics.update(calculate_trade_metrics(trades))
 
         # --- Simple inline metrics ---
-        metrics['volatility'] = float(returns.std() * np.sqrt(TRADING_DAYS_STOCK))
+        metrics['volatility'] = float(returns.std() * np.sqrt(td))
         metrics['mean_daily_return'] = float(returns.mean())
         metrics['win_days'] = int((returns > 1e-8).sum())
         metrics['lose_days'] = int((returns < -1e-8).sum())
@@ -1007,8 +1090,18 @@ class BacktestEngine:
             bname = "Buy & Hold"
 
         bh_returns = benchmark_equity.pct_change().fillna(0)
+        # Benchmark annualisation: use the first symbol's trading_days
+        # when we have a per-symbol map (otherwise the buy-and-hold of
+        # AAPL inside an AAPL+BTC portfolio would get annualised with
+        # 365 instead of 252, inflating benchmark Sharpe by √(365/252)).
+        benchmark_td = self._portfolio_trading_days
+        if config is not None and config.symbols and self._resolved_per_asset_td:
+            first_sym = config.symbols[0]
+            benchmark_td = self._resolved_per_asset_td.get(
+                first_sym, self._portfolio_trading_days)
         benchmark_metrics = self._calculate_metrics(
-            bh_returns, benchmark_equity, trades=[]
+            bh_returns, benchmark_equity, trades=[],
+            trading_days=benchmark_td,
         )
         return benchmark_equity, benchmark_metrics, bname
 

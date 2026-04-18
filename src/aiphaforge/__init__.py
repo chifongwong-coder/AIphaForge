@@ -135,15 +135,19 @@ from .risk import (
 from .significance import (
     BootstrapResult,
     CorrectionResult,
+    DSRResult,
     MonteCarloResult,
     PermutationResult,
+    PSRResult,
     bootstrap_ci,
     bootstrap_metrics,
     build_returns_matrix,
+    deflated_sharpe_ratio,
     generate_paths,
     monte_carlo_test,
     multiple_comparison_correction,
     permutation_test,
+    probabilistic_sharpe_ratio,
 )
 from .strategies import (
     ConditionalSwitch,
@@ -281,6 +285,12 @@ __all__ = [
     'monte_carlo_test',
     'multiple_comparison_correction',
     'build_returns_matrix',
+
+    # PSR / DSR (v1.9.5)
+    'PSRResult',
+    'DSRResult',
+    'probabilistic_sharpe_ratio',
+    'deflated_sharpe_ratio',
 
     # Market impact (v1.9.4)
     'BaseImpactModel',
