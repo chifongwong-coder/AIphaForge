@@ -178,6 +178,11 @@ class BacktestHook(ABC):
     pre-v1.9.6 signature ``(data, symbol, *, config=None)`` continue to
     work via a runtime-detected adapter that emits a one-time
     ``DeprecationWarning`` per subclass.
+
+    In **vectorized mode** only the lifecycle callbacks fire — there is
+    no broker, portfolio, or per-bar context, so ``on_pre_signal`` and
+    ``on_bar`` are skipped. Hooks that need bar-level callbacks must
+    select ``mode='event_driven'``.
     """
 
     def on_backtest_start(self, ctx: LifecycleContext) -> None:

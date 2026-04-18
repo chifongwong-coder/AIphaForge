@@ -174,6 +174,36 @@ def test_legacy_deprecation_warning_emitted_once_per_subclass():
     assert len(second_dep) == 0  # already warned for this class
 
 
+def test_vectorized_lifecycle_fires_once_single_asset():
+    hook = _RecordingHook()
+    data = _make_data()
+    signals = pd.Series(np.nan, index=data.index, dtype=float)
+    signals.iloc[5] = 1.0
+    eng = BacktestEngine(mode="vectorized", hooks=[hook])
+    eng.set_signals(signals)
+    eng.run(data)
+
+    assert len(hook.start_calls) == 1
+    assert len(hook.end_calls) == 1
+
+
+def test_vectorized_lifecycle_fires_once_multi_asset():
+    hook = _RecordingHook()
+    data_a = _make_data(seed=1)
+    data_b = _make_data(seed=2)
+    signals_a = pd.Series(np.nan, index=data_a.index, dtype=float)
+    signals_b = pd.Series(np.nan, index=data_b.index, dtype=float)
+    signals_a.iloc[5] = 1.0
+    signals_b.iloc[5] = 1.0
+    eng = BacktestEngine(mode="vectorized", hooks=[hook])
+    eng.set_signals({"AAA": signals_a, "BBB": signals_b})
+    eng.run({"AAA": data_a, "BBB": data_b})
+
+    assert len(hook.start_calls) == 1
+    assert len(hook.end_calls) == 1
+    assert hook.start_calls[0].symbols == ["AAA", "BBB"]
+
+
 @pytest.mark.parametrize("phase", ["start", "end"])
 def test_lifecycle_context_provides_data_dict(phase):
     hook = _RecordingHook()
