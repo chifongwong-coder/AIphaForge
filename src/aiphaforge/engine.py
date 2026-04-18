@@ -170,7 +170,14 @@ class BacktestEngine:
         # Fill model
         self.fill_model = fill_model
 
-        # Risk manager (optional)
+        # Risk manager (optional). risk_manager= and risk_rules= cover
+        # the same need via two interfaces; passing both is ambiguous.
+        if risk_manager is not None and risk_rules is not None:
+            raise ValueError(
+                "Pass either risk_manager= or risk_rules=, not both. "
+                "Prefer risk_rules= for new code; risk_manager= remains "
+                "for users with a custom BaseRiskManager subclass."
+            )
         self.risk_manager = risk_manager
         if risk_manager:
             risk_manager.initialize(initial_capital)
