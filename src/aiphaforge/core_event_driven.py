@@ -172,6 +172,15 @@ def run_event_driven(
         for hook in config.hooks:
             call_hook_lifecycle_start(hook, start_ctx)
 
+    # --- Per-symbol last-cost-timestamp (Q2: time-aware borrowing cost).
+    # Initialised to the first bar each symbol has data on; the periodic
+    # cost loop computes bar_seconds = (timestamp - last_cost_ts[sym]).
+    last_cost_timestamp: Dict[str, pd.Timestamp] = {}
+    for sym in symbols:
+        df = data_dict[sym]
+        if len(df) > 0:
+            last_cost_timestamp[sym] = df.index[0]
+
     # --- Build exit rules list ---
     exit_rules = [r for r in [config.stop_loss_rule,
                                config.take_profit_rule,
@@ -609,14 +618,24 @@ def run_event_driven(
         if config.periodic_cost_model is not None:
             for sym in symbols:
                 pos = portfolio.positions.get(sym)
-                if pos and not pos.is_flat:
-                    mc = resolve_config(
-                        config.margin_config,
-                        config.asset_margin_configs, sym)
-                    cost = config.periodic_cost_model.calculate_cost(
-                        pos, prices[sym], timestamp, mc)
-                    if cost > 0:
-                        portfolio.deduct_cost(cost)
+                if not (pos and not pos.is_flat):
+                    # Position is flat — don't accrue and don't advance the
+                    # timestamp. When the position reopens, bar_seconds will
+                    # correctly span the flat stretch (= time since last
+                    # non-flat bar), which is the desired no-charge-while-
+                    # flat semantics.
+                    continue
+                mc = resolve_config(
+                    config.margin_config,
+                    config.asset_margin_configs, sym)
+                last_ts = last_cost_timestamp.get(sym, timestamp)
+                delta = (timestamp - last_ts).total_seconds()
+                cost = config.periodic_cost_model.calculate_cost(
+                    pos, prices[sym], timestamp, mc,
+                    bar_seconds=max(0.0, delta))
+                if cost > 0:
+                    portfolio.deduct_cost(cost)
+                last_cost_timestamp[sym] = timestamp
 
         # 7. Record equity + per-asset PnL
         portfolio._record_equity(timestamp)

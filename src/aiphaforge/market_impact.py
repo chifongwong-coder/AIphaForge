@@ -88,7 +88,7 @@ class LinearImpactModel(BaseImpactModel):
         volatility: float,
         **kwargs: Any,
     ) -> float:
-        if adv <= 0:
+        if adv <= 0 or order_size <= 0:
             return 0.0
         self._check_participation(order_size, adv)
         return self.eta * (order_size / adv)
@@ -125,7 +125,7 @@ class SquareRootImpactModel(BaseImpactModel):
         volatility: float,
         **kwargs: Any,
     ) -> float:
-        if adv <= 0:
+        if adv <= 0 or order_size <= 0:
             return 0.0
         self._check_participation(order_size, adv)
         participation = order_size / adv
@@ -154,7 +154,7 @@ class PowerLawImpactModel(BaseImpactModel):
         volatility: float,
         **kwargs: Any,
     ) -> float:
-        if adv <= 0:
+        if adv <= 0 or order_size <= 0:
             return 0.0
         self._check_participation(order_size, adv)
         participation = order_size / adv
