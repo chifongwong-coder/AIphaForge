@@ -195,11 +195,22 @@ def validate_ohlcv(
         if n_nan > 0:
             _report(f"OHLCV: {n_nan} rows with NaN in price columns")
 
-    # Negative prices
+    # Non-finite prices (inf / -inf). NaN is reported separately above.
     if price_cols:
-        n_neg = int((data[price_cols] < 0).any(axis=1).sum())
-        if n_neg > 0:
-            _report(f"OHLCV: {n_neg} rows with negative prices")
+        non_finite_mask = ~np.isfinite(data[price_cols].to_numpy(dtype=float))
+        # Exclude NaN entries (already reported); just count inf/-inf rows.
+        nan_mask = data[price_cols].isna().to_numpy()
+        infinite_only = non_finite_mask & ~nan_mask
+        n_inf = int(infinite_only.any(axis=1).sum())
+        if n_inf > 0:
+            _report(f"OHLCV: {n_inf} rows with non-finite (inf) prices")
+
+    # Non-positive prices (price <= 0 is invalid for OHLC). Volume can be 0
+    # and is intentionally not checked here.
+    if price_cols:
+        n_nonpos = int((data[price_cols] <= 0).any(axis=1).sum())
+        if n_nonpos > 0:
+            _report(f"OHLCV: {n_nonpos} rows with non-positive prices")
 
     # Duplicate timestamps
     if isinstance(data.index, pd.DatetimeIndex):
