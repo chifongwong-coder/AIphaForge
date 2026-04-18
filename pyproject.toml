@@ -38,6 +38,7 @@ dev = [
     "pytest-cov>=4.0",
     "ruff>=0.1.0",
     "mypy>=1.0",
+    "tomli>=2.0; python_version < '3.11'",
 ]
 plot = ["matplotlib>=3.5"]
 data = ["yfinance>=0.2"]
