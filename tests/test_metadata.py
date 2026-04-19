@@ -37,3 +37,29 @@ def test_version_is_current_release():
     assert aiphaforge.__version__ == EXPECTED_VERSION, (
         f"Expected v{EXPECTED_VERSION}; found {aiphaforge.__version__}"
     )
+
+
+def test_single_asset_result_has_symbols_populated():
+    """v1.9.7: BacktestResult.symbols populated for single-asset runs.
+
+    Pre-fix it was empty for single-asset (only multi-asset set it),
+    which silently broke estimate_capacity and any other consumer.
+    """
+    import numpy as np
+    import pandas as pd
+    from aiphaforge import BacktestEngine
+    from aiphaforge.fees import ZeroFeeModel
+
+    n = 30
+    data = pd.DataFrame(
+        {"open": [100.0] * n, "high": [101.0] * n, "low": [99.0] * n,
+         "close": [100.0] * n, "volume": [1e6] * n},
+        index=pd.bdate_range("2024-01-01", periods=n),
+    )
+    signals = pd.Series(np.nan, index=data.index, dtype=float)
+    signals.iloc[5] = 1.0
+    eng = BacktestEngine(mode="event_driven", fee_model=ZeroFeeModel(),
+                         include_benchmark=False)
+    eng.set_signals(signals)
+    res = eng.run(data, symbol="AAPL")
+    assert res.symbols == ["AAPL"]

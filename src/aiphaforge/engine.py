@@ -1073,6 +1073,15 @@ class BacktestEngine:
         result.trading_days = self._portfolio_trading_days
         result.per_asset_trading_days = dict(self._resolved_per_asset_td)
 
+        # v1.9.7: populate result.symbols. Pre-fix this was empty for
+        # single-asset runs (only multi-asset set it via _run_multi),
+        # which silently broke any consumer that read result.symbols
+        # (e.g. market_impact.estimate_capacity). config.symbols is set
+        # in _build_config from the caller's symbols list, so it's
+        # reliable for both single- and multi-asset paths.
+        if config is not None and config.symbols:
+            result.symbols = list(config.symbols)
+
         return result
 
     # ========== Performance Calculation ==========
