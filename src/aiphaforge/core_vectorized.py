@@ -52,11 +52,17 @@ def run_vectorized(
         strategy_returns, positions, data, config.fee_model, config.initial_capital,
     )
 
-    # Apply stop loss via module
+    # Apply stop loss via module. v1.9.7 commit 7b: ask for the trigger
+    # mask so extract_trades_vectorized can emit stop_loss Trade entries
+    # at the correct exit price (was invisible to per-trade attribution).
+    stop_loss_info = None
     if config.stop_loss_rule is not None:
-        net_returns = config.stop_loss_rule.apply_vectorized(
-            net_returns, positions, data,
+        net_returns, _trigger_mask, _entry_prices, _threshold = (
+            config.stop_loss_rule.apply_vectorized(
+                net_returns, positions, data, return_mask=True,
+            )
         )
+        stop_loss_info = (_trigger_mask, _entry_prices, _threshold)
 
     # Apply risk rules (v1.1)
     if config.risk_rules:
@@ -69,11 +75,17 @@ def run_vectorized(
             config.initial_capital,
         )
         # Re-apply stop-loss on recomputed returns (risk rules may have
-        # modified positions, changing which stop-loss triggers fire)
+        # modified positions, changing which stop-loss triggers fire).
+        # v1.9.7 R2: when both calls fire, the SECOND mask wins because
+        # the second call sees the post-risk-rules positions; the first
+        # mask is stale.
         if config.stop_loss_rule is not None:
-            net_returns = config.stop_loss_rule.apply_vectorized(
-                net_returns, positions, data,
+            net_returns, _trigger_mask, _entry_prices, _threshold = (
+                config.stop_loss_rule.apply_vectorized(
+                    net_returns, positions, data, return_mask=True,
+                )
             )
+            stop_loss_info = (_trigger_mask, _entry_prices, _threshold)
 
     # Fill NaN values (first row from pct_change and shift)
     net_returns = net_returns.fillna(0)
@@ -106,6 +118,7 @@ def run_vectorized(
     trades = extract_trades_vectorized(
         trade_data, trade_positions, trade_signals, trade_equity,
         config.fee_model, config.initial_capital, symbol=symbol,
+        stop_loss_info=stop_loss_info,
     )
 
     # Build positions DataFrame

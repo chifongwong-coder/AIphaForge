@@ -497,6 +497,7 @@ def extract_trades_vectorized(
     fee_model: Any,
     initial_capital: float,
     symbol: str = "default",
+    stop_loss_info: Optional[tuple] = None,
 ) -> List[Any]:
     """Extract trade records from vectorized backtest results.
 
@@ -511,12 +512,31 @@ def extract_trades_vectorized(
         fee_model: Fee model instance (used to estimate trade costs).
         initial_capital: Starting capital.
         symbol: Instrument symbol.
+        stop_loss_info: Optional ``(trigger_mask, entry_prices, threshold)``
+            tuple from ``PercentageStopLoss.apply_vectorized(..., return_mask=True)``.
+            When provided, the function uses a segment-based reconstruction
+            that emits ``Trade(reason='stop_loss')`` entries with the
+            correct stop exit price; reversal segments are preserved.
+            When None (default), falls through to the legacy in-loop
+            implementation that v1.9.6 shipped (preserves numerical
+            contract for the no-stop-loss case).
 
     Returns:
         List of Trade objects.
     """
     # Import here to avoid circular dependency
     from .results import Trade
+
+    # v1.9.7 commit 7b: segment-based path when stop_loss is wired.
+    if stop_loss_info is not None:
+        trigger_mask, entry_prices, threshold = stop_loss_info
+        if trigger_mask is not None and trigger_mask.any():
+            return _extract_trades_with_stop_loss(
+                data, positions, equity, initial_capital, symbol,
+                trigger_mask, entry_prices, threshold,
+            )
+        # else: stop_loss was wired but never triggered → fall through
+        # to legacy path (identical behavior).
 
     trades: List[Any] = []
 
@@ -611,6 +631,125 @@ def extract_trades_vectorized(
                 else:
                     entry_time = None
 
+    return trades
+
+
+def _extract_trades_with_stop_loss(
+    data: pd.DataFrame,
+    positions: pd.Series,
+    equity: pd.Series,
+    initial_capital: float,
+    symbol: str,
+    trigger_mask: pd.Series,
+    entry_prices: pd.Series,
+    threshold: float,
+) -> List[Any]:
+    """Segment-based trade reconstruction that emits stop_loss exits.
+
+    Pre-computes (entry, close, direction, size, close_kind) tuples by
+    walking pos_diff once, then truncates each segment by the first
+    in-segment stop trigger. Reversal segments preserve the next
+    segment's open bar (the stop only truncates THIS segment's close).
+    Stop_loss exit price uses the formula from
+    ``PercentageStopLoss.apply_vectorized``: ``entry_price * (1 -
+    threshold * direction)``.
+
+    See plan v3 R1 for why this is segment-based rather than retrofit
+    into the in-loop state machine of ``extract_trades_vectorized``.
+    """
+    import numpy as np
+
+    from .results import Trade
+
+    trades: List[Any] = []
+
+    # ---- Pre-compute segments by walking pos_diff -----------------
+    pos_diff = positions.diff()
+    entries = pos_diff[pos_diff != 0].dropna()
+
+    # bar-0 priming (mirrors the v1.9.7 commit 7a fix in the legacy path)
+    segments: List[tuple] = []  # (entry_bar, direction, size, close_bar, close_kind)
+    current = None  # (entry_bar, direction, size)
+    if len(positions) > 0 and positions.iloc[0] != 0:
+        current = (positions.index[0],
+                   1 if positions.iloc[0] > 0 else -1,
+                   abs(positions.iloc[0]))
+
+    for idx, change in entries.items():
+        if current is None:
+            if change != 0:
+                current = (idx, 1 if change > 0 else -1,
+                           abs(positions.loc[idx]))
+        else:
+            new_pos = positions.loc[idx]
+            if new_pos == 0:
+                segments.append((*current, idx, "flat"))
+                current = None
+            elif np.sign(new_pos) != current[1]:
+                segments.append((*current, idx, "reversal"))
+                current = (idx, 1 if new_pos > 0 else -1,
+                           abs(new_pos))
+            # else: same direction, size change; mirror legacy
+            # close-and-reopen behavior
+            elif new_pos != current[2]:
+                segments.append((*current, idx, "flat"))
+                current = (idx, 1 if new_pos > 0 else -1,
+                           abs(new_pos))
+
+    # ---- Truncate segments by stop triggers -----------------------
+    truncated: List[tuple] = []
+    for entry_bar, direction, size_signal, close_bar, close_kind in segments:
+        # Stops fire strictly between (entry_bar, close_bar):
+        # at entry_bar there's no PnL yet (entry_prices ffill makes
+        # pos_pnl_pct = 0), at close_bar the natural close already exits.
+        seg_mask = trigger_mask[(trigger_mask.index > entry_bar)
+                                & (trigger_mask.index < close_bar)
+                                & trigger_mask]
+        if not seg_mask.empty:
+            stop_bar = seg_mask.index[0]
+            truncated.append(
+                (entry_bar, direction, size_signal, stop_bar, "stop_loss"))
+        else:
+            truncated.append(
+                (entry_bar, direction, size_signal, close_bar, close_kind))
+
+    # ---- Emit Trade objects ---------------------------------------
+    trade_id = 0
+    for entry_bar, direction, size_signal, close_bar, close_kind in truncated:
+        entry_price = data.loc[entry_bar, 'close']
+        entry_equity = (
+            equity.loc[entry_bar] if entry_bar in equity.index
+            else initial_capital
+        )
+        if entry_price <= 0 or entry_equity <= 0:
+            continue
+        shares = entry_equity * size_signal / entry_price
+        if shares <= 0:
+            continue
+
+        if close_kind == "stop_loss":
+            # Match apply_vectorized:112 exactly
+            exit_price = entry_price * (1 - threshold * direction)
+            reason = "stop_loss"
+        else:  # "flat" or "reversal"
+            exit_price = data.loc[close_bar, 'close']
+            reason = "signal"
+
+        pnl = direction * (exit_price - entry_price) * shares
+        trade_id += 1
+        trades.append(Trade(
+            trade_id=f"VT{trade_id:04d}",
+            symbol=symbol,
+            direction=direction,
+            entry_time=entry_bar,
+            exit_time=close_bar,
+            entry_price=entry_price,
+            exit_price=exit_price,
+            size=shares,
+            pnl=pnl,
+            pnl_pct=(exit_price / entry_price - 1) * direction,
+            reason=reason,
+        ))
     return trades
 
 

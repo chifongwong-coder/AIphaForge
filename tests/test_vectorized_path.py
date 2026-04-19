@@ -280,6 +280,67 @@ class TestDiscrepancyContract:
             f"sum(trade.pnl) = ${sum_pnl:.4f} vs equity_change = "
             f"${eq_change:.4f}, diff = ${sum_pnl - eq_change:.4f}")
 
+    def test_vectorized_stop_loss_emits_trade_entries(self):
+        """v1.9.7 commit 7b: vectorized stop-loss exits visible in trades.
+
+        Pre-fix: stop_loss was folded into apply_vectorized's
+        net_returns clip but never produced a Trade boundary because
+        positions wasn't modified. Equity was correct, but trades list
+        missed the stop_loss exits.
+        """
+        # Build a clear stop scenario: long at bar 1, prices fall sharply.
+        n = 10
+        prices = [100.0, 100.0, 99.0, 97.0, 95.0, 92.0, 90.0,
+                  92.0, 95.0, 96.0]
+        data = pd.DataFrame(
+            {"open": prices, "high": [p * 1.005 for p in prices],
+             "low": [p * 0.995 for p in prices], "close": prices,
+             "volume": [1e6] * n},
+            index=pd.bdate_range("2024-01-01", periods=n),
+        )
+        signals = pd.Series(np.nan, index=data.index, dtype=float)
+        signals.iloc[1] = 1.0   # long entry
+        signals.iloc[8] = 0.0   # natural close
+
+        eng = BacktestEngine(
+            mode="vectorized", fee_model=ZeroFeeModel(),
+            include_benchmark=False, stop_loss=0.05,  # 5% threshold
+        )
+        eng.set_signals(signals)
+        res = eng.run(data)
+
+        # Stop should fire (price drops > 5% from entry of 100 by bar 4-5).
+        stop_trades = [t for t in res.trades if t.reason == "stop_loss"]
+        assert len(stop_trades) >= 1, (
+            f"Expected at least 1 stop_loss trade; got "
+            f"{[(t.reason, t.entry_price, t.exit_price) for t in res.trades]}")
+
+        # Stop trade exit price = entry_price * (1 - threshold)
+        # = 100 * 0.95 = 95.0
+        st = stop_trades[0]
+        assert abs(st.exit_price - 95.0) < 1e-6, (
+            f"Expected stop exit price 95.0, got {st.exit_price}")
+
+    def test_vectorized_no_stop_loss_falls_back_to_legacy_path(self):
+        """v1.9.7 commit 7b: when no stop_loss_rule, behavior is
+        byte-identical to v1.9.6 (legacy in-loop path).
+        """
+        data = _make_data(50)
+        signals = pd.Series(np.nan, index=data.index, dtype=float)
+        signals.iloc[1] = 1.0
+        signals.iloc[40] = 0.0
+
+        eng = BacktestEngine(
+            mode="vectorized", fee_model=ZeroFeeModel(),
+            include_benchmark=False,
+        )  # no stop_loss
+        eng.set_signals(signals)
+        res = eng.run(data)
+
+        # Single signal trade, no stop_loss in trades
+        assert len(res.trades) == 1
+        assert res.trades[0].reason == "signal"
+
     def test_multi_trade_reversal_bounded_by_sigma2_t_notional(self):
         """Multi-trade with reversals: gap is bounded by 0.5 * σ² * T * notional."""
         n_bars = 100
