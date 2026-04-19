@@ -234,6 +234,52 @@ class TestDiscrepancyContract:
             f"linear={linear}, geo={geo}"
         )
 
+    def test_bar_zero_signal_produces_correct_initial_trade(self):
+        """v1.9.7 N1 fix: a non-zero signal at bar 0 must produce a
+        trade entered at bar 0.
+
+        Pre-fix: pos_diff.iloc[0] is always NaN (pandas semantics);
+        the dropna() discarded the bar-0 entry, and the next non-zero
+        diff (which actually closed the bar-0 position) was
+        misinterpreted as opening a fresh trade in the WRONG direction.
+
+        Reproducer: signals = [1, 1, 0, 0, 1, 1, 0]
+        Pre-fix output: 1 phantom short + 1 long, sum_pnl off by ~$4000
+        Post-fix output: 2 long trades, sum_pnl matches equity exactly.
+        """
+        n = 7
+        prices = [100.0 + i for i in range(n)]
+        data = pd.DataFrame(
+            {"open": prices, "high": [p * 1.01 for p in prices],
+             "low": [p * 0.99 for p in prices], "close": prices,
+             "volume": [1e6] * n},
+            index=pd.bdate_range("2024-01-01", periods=n),
+        )
+        signals = pd.Series([1, 1, 0, 0, 1, 1, 0], index=data.index,
+                            dtype=float)
+
+        eng = BacktestEngine(
+            mode="vectorized", fee_model=ZeroFeeModel(),
+            include_benchmark=False,
+        )
+        eng.set_signals(signals)
+        res = eng.run(data)
+
+        assert len(res.trades) == 2
+        assert all(t.direction == 1 for t in res.trades), (
+            f"Expected 2 long trades; got directions "
+            f"{[t.direction for t in res.trades]}")
+        assert res.trades[0].entry_time == data.index[0], (
+            "First trade must enter at bar 0")
+
+        sum_pnl = sum(t.pnl for t in res.trades)
+        eq_change = res.final_capital - 100_000.0
+        # On flat data with no fees / no reversals, the linear PnL and
+        # geometric equity change should match within float epsilon.
+        assert abs(sum_pnl - eq_change) < 1e-6, (
+            f"sum(trade.pnl) = ${sum_pnl:.4f} vs equity_change = "
+            f"${eq_change:.4f}, diff = ${sum_pnl - eq_change:.4f}")
+
     def test_multi_trade_reversal_bounded_by_sigma2_t_notional(self):
         """Multi-trade with reversals: gap is bounded by 0.5 * σ² * T * notional."""
         n_bars = 100

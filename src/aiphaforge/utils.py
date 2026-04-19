@@ -520,7 +520,13 @@ def extract_trades_vectorized(
 
     trades: List[Any] = []
 
-    # Find position change points
+    # Find position change points.
+    # NOTE: pos_diff.iloc[0] is always NaN (pandas .diff() semantics).
+    # Without bar-0 priming below, a non-zero positions.iloc[0] would
+    # be invisible to this loop, and the next non-zero diff (which
+    # actually CLOSES the bar-0 position) would be misinterpreted as
+    # opening a fresh position in the wrong direction. v1.9.7 fix:
+    # prime entry_time from positions.iloc[0] before walking entries.
     pos_diff = positions.diff()
     entries = pos_diff[pos_diff != 0].dropna()
 
@@ -529,6 +535,14 @@ def extract_trades_vectorized(
     entry_direction = None
     entry_size = None
     trade_id = 0
+
+    # v1.9.7 bar-0 priming: if the strategy emits a non-zero position
+    # at bar 0, treat it as an open at bar 0 with size = |positions[0]|.
+    if len(positions) > 0 and positions.iloc[0] != 0:
+        entry_time = positions.index[0]
+        entry_price = data.loc[entry_time, 'close']
+        entry_direction = 1 if positions.iloc[0] > 0 else -1
+        entry_size = abs(positions.iloc[0])
 
     for idx, change in entries.items():
         price = data.loc[idx, 'close']
