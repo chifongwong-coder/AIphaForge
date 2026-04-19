@@ -83,6 +83,7 @@ from .hooks import (
     CostAwareRebalanceHook,
     DriftRebalanceHook,
     HookContext,
+    LifecycleContext,
     OptimizedRebalanceHook,
     ScheduleHook,
     SecondaryTimeframe,
@@ -158,7 +159,7 @@ from .strategies import (
     WeightedBlend,
 )
 
-__version__ = '1.9.4'
+__version__ = '1.9.6'
 
 __all__ = [
     # Main engine
@@ -213,6 +214,7 @@ __all__ = [
 
     # Hooks
     'HookContext',
+    'LifecycleContext',
     'BacktestHook',
     'SecondaryTimeframe',
     'ScheduleHook',

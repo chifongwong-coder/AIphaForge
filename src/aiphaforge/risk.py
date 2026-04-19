@@ -145,16 +145,69 @@ class BaseRiskRule:
         return positions
 
 
-class CompositeRiskManager:
+class CompositeRiskManager(BaseRiskManager):
     """Compose multiple risk rules into one manager.
 
-    Replaces BaseRiskManager as the recommended risk management approach.
-    BaseRiskManager ABC is preserved for backward compatibility.
+    Inherits :class:`BaseRiskManager` so it is a drop-in replacement for
+    user-defined risk managers passed via ``BacktestEngine(risk_manager=...)``.
+    The recommended way to use a composite, however, is via
+    ``BacktestEngine(risk_rules=...)`` because the engine has a more
+    direct fast-path for the rule-based interface.
     """
 
     def __init__(self, rules: List[BaseRiskRule]):
         self.rules = list(rules)
         self.history: List[Dict] = []
+
+    # ------------------------------------------------------------------
+    # BaseRiskManager interface (used when passed via risk_manager=)
+    # ------------------------------------------------------------------
+
+    def initialize(self, initial_capital: float) -> None:
+        """No-op: composite rules don't track total capital."""
+        pass
+
+    def sync_from_portfolio(self, portfolio) -> None:
+        """No-op: rules read state directly from the portfolio they're given."""
+        pass
+
+    def check_and_apply_risk_rules(
+        self,
+        portfolio,
+        market_data: Dict[str, pd.DataFrame],
+    ) -> List[RiskSignal]:
+        """Adapt the BaseRiskManager interface to ``check_all``.
+
+        Builds a ``prices`` dict from the latest bar in each symbol's
+        market_data and forwards to :meth:`check_all`.
+        """
+        prices: Dict[str, float] = {}
+        timestamp = None
+        for sym, df in market_data.items():
+            if len(df) == 0:
+                continue
+            prices[sym] = float(df.iloc[-1]['close'])
+            timestamp = df.index[-1]
+        return self.check_all(portfolio, prices, timestamp)
+
+    def calculate_position_size(
+        self,
+        symbol: str,
+        signal: int,
+        current_price: float,
+        market_data: pd.DataFrame,
+    ) -> float:
+        """Default sizing: pass the signal through unchanged.
+
+        Composite *rules* are about gating / clipping risk, not
+        determining base position size. Use the engine's
+        ``position_sizer`` argument for that.
+        """
+        return float(signal)
+
+    # ------------------------------------------------------------------
+    # Composite-specific API (used when passed via risk_rules=)
+    # ------------------------------------------------------------------
 
     def reset(self) -> None:
         """Reset all rules for a new backtest run."""

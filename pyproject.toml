@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aiphaforge"
-version = "1.9.5"
+version = "1.9.6"
 description = "A high-performance backtest engine for AI agent-driven quantitative trading"
 readme = "README.md"
 license = {text = "GPL-3.0-or-later"}
@@ -38,6 +38,7 @@ dev = [
     "pytest-cov>=4.0",
     "ruff>=0.1.0",
     "mypy>=1.0",
+    "tomli>=2.0; python_version < '3.11'",
 ]
 plot = ["matplotlib>=3.5"]
 data = ["yfinance>=0.2"]

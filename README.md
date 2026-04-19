@@ -75,6 +75,18 @@ AIphaForge also works perfectly well as a general-purpose backtest framework for
 - Default `trading_days=252` reproduces v1.9.4 numbers exactly.
 - **Pickle compatibility across versions is not guaranteed.** `BacktestResult` gained new fields (`trading_days`, `per_asset_trading_days`); pickles created with v1.9.4 should be regenerated rather than loaded into v1.9.5. If you need long-term persistence, use `result.to_dict()` + JSON.
 
+### v1.9.6 — Engine stability release
+A focused round of correctness fixes covering 10 long-standing bugs found in an engine-wide audit. No new features; existing public APIs are preserved.
+
+- **Hook lifecycle (B1, B2, R5)**: `on_backtest_start` and `on_backtest_end` now both fire **once per backtest** (previously start fired per-symbol while end fired once) and receive a `LifecycleContext` with `phase`, `symbols`, `data_dict`, `primary_symbol`, and `primary_data`. Pre-v1.9.6 subclasses that use the legacy `(data, symbol, *, config)` signature still work via a backward-compat adapter that emits a one-time `DeprecationWarning` per subclass. Vectorized mode now also fires the lifecycle callbacks (previously skipped entirely).
+- **Vectorized cumprod safety (B6)**: `net_returns` is clipped at -1.0 and equity is frozen at 0 once bankruptcy is detected; pathological costs / tiny capital can no longer flip the cumprod sign and produce nonsensical positive equity.
+- **Vectorized trade reconstruction (Q1, Q3)**: `Trade.size` from a vectorized run now means **shares** (`entry_equity * position_size / entry_price`), not signal magnitude. `Trade.pnl` no longer double-deducts commission + slippage — it is now a linear path-independent approximation that matches the geometric equity curve to machine epsilon for single-trade no-fee cases. See `Trade.__doc__` for the full discrepancy contract.
+- **Risk API (B3)**: `BacktestEngine(risk_manager=CompositeRiskManager(...))` no longer crashes — `CompositeRiskManager` now inherits `BaseRiskManager`. Passing both `risk_manager=` and `risk_rules=` simultaneously raises `ValueError` instead of silently picking one.
+- **Data validation (B5)**: `validate_ohlcv(level='strict')` now rejects non-finite (`inf` / `-inf`) and non-positive (`<= 0`) prices. Volume of `0` remains valid.
+- **Time-aware borrowing cost (Q2)**: `BorrowingCostModel` now uses the engine-derived `bar_seconds`; hourly bars correctly charge `daily_rate / 24` rather than a full day's interest. `days_per_year` is exposed on the constructor (365 / 360 / 252). `FundingRateModel` ignores `bar_seconds` by design (its rate is already per-bar).
+- **Impact model guards (Q4)**: `LinearImpactModel`, `SquareRootImpactModel`, and `PowerLawImpactModel` early-return 0 when `order_size <= 0` (previously the square-root model raised on `math.sqrt(<0)`).
+- **Metadata lock (S1)**: `aiphaforge.__version__` is now CI-locked to match `pyproject.toml` via `tests/test_metadata.py`.
+
 ### Market Impact & Capacity
 - **Market impact models**: `LinearImpactModel`, `SquareRootImpactModel` (Almgren-Chriss with permanent impact), `PowerLawImpactModel` — pluggable via `BaseImpactModel` ABC
 - **Strategy capacity estimation**: `estimate_capacity()` scales trade sizes, computes impact drag, uses bisection to find max capital before Sharpe degrades

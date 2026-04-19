@@ -19,7 +19,12 @@ from .core_vectorized import run_vectorized
 from .costs import DefaultTradeCost
 from .exit_rules import PercentageStopLoss, PercentageTakeProfit
 from .fees import BaseFeeModel, SimpleFeeModel, get_fee_model
-from .hooks import BacktestHook
+from .hooks import (
+    BacktestHook,
+    LifecycleContext,
+    call_hook_lifecycle_end,
+    call_hook_lifecycle_start,
+)
 from .latency import LatencyHook
 from .position_sizing import AllInSizer, FixedSizer, FractionSizer
 from .results import BacktestResult, Trade
@@ -165,7 +170,14 @@ class BacktestEngine:
         # Fill model
         self.fill_model = fill_model
 
-        # Risk manager (optional)
+        # Risk manager (optional). risk_manager= and risk_rules= cover
+        # the same need via two interfaces; passing both is ambiguous.
+        if risk_manager is not None and risk_rules is not None:
+            raise ValueError(
+                "Pass either risk_manager= or risk_rules=, not both. "
+                "Prefer risk_rules= for new code; risk_manager= remains "
+                "for users with a custom BaseRiskManager subclass."
+            )
         self.risk_manager = risk_manager
         if risk_manager:
             risk_manager.initialize(initial_capital)
@@ -502,7 +514,13 @@ class BacktestEngine:
 
         # Dispatch to execution core
         if self.mode == ExecutionMode.VECTORIZED:
-            raw = run_vectorized(data, signals, config, symbol)
+            self._fire_vectorized_lifecycle(
+                config, {symbol: data}, [symbol], phase="start")
+            try:
+                raw = run_vectorized(data, signals, config, symbol)
+            finally:
+                self._fire_vectorized_lifecycle(
+                    config, {symbol: data}, [symbol], phase="end")
         else:
             # Wrap single-asset as dict for the unified core
             raw = run_event_driven(
@@ -590,8 +608,14 @@ class BacktestEngine:
 
         # Dispatch
         if self.mode == ExecutionMode.VECTORIZED:
-            raw = self._run_vectorized_multi(
-                data_dict, signals_dict, config, weights)
+            self._fire_vectorized_lifecycle(
+                config, data_dict, symbols, phase="start")
+            try:
+                raw = self._run_vectorized_multi(
+                    data_dict, signals_dict, config, weights)
+            finally:
+                self._fire_vectorized_lifecycle(
+                    config, data_dict, symbols, phase="end")
         else:
             raw = run_event_driven(
                 data_dict=data_dict,
@@ -732,6 +756,39 @@ class BacktestEngine:
 
         return self._merge_vectorized_results(
             per_asset, config.initial_capital)
+
+    @staticmethod
+    def _fire_vectorized_lifecycle(
+        config: BacktestConfig,
+        data_dict: Dict[str, pd.DataFrame],
+        symbols: List[str],
+        *,
+        phase: str,
+    ) -> None:
+        """Fire on_backtest_start / on_backtest_end once per vectorized run.
+
+        Vectorized mode skips on_pre_signal and on_bar (no broker /
+        portfolio is constructed), but lifecycle hooks fire so that
+        users with stateful hooks (resets, dashboards, etc.) get called.
+        """
+        if not config.hooks:
+            return
+        sorted_symbols = sorted(symbols)
+        primary_sym = sorted_symbols[0]
+        primary_data = data_dict[primary_sym]
+        ts = primary_data.index[0] if phase == "start" else primary_data.index[-1]
+        ctx = LifecycleContext(
+            phase=phase,  # type: ignore[arg-type]
+            timestamp=ts,
+            symbols=sorted_symbols,
+            config=config,
+            data_dict=data_dict,
+            primary_symbol=primary_sym,
+            primary_data=primary_data,
+        )
+        dispatch = call_hook_lifecycle_start if phase == "start" else call_hook_lifecycle_end
+        for hook in config.hooks:
+            dispatch(hook, ctx)
 
     @staticmethod
     def _merge_vectorized_results(

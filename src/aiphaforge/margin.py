@@ -10,8 +10,9 @@ single parameter: IMR=1.0 is cash-only (v0.7 behavior), IMR=0.5 is
 2x leverage, IMR=0.1 is 10x leverage.
 """
 
+import warnings
 from dataclasses import dataclass
-from typing import Any, Dict, Set
+from typing import Any, Dict, Optional, Set
 
 from .orders import OrderStatus
 
@@ -114,11 +115,20 @@ class MarginCallExitRule(BasePortfolioExitRule):
 # Periodic cost models
 # ---------------------------------------------------------------------------
 
+# Number of seconds per "day" used by the time-aware borrowing model.
+_SECONDS_PER_DAY = 86400.0
+
+
 class PeriodicCostModel:
     """Abstract base for per-bar periodic costs (borrowing, funding).
 
     Subclasses implement :meth:`calculate_cost` to return the dollar
     cost to deduct from cash for a given position on a given bar.
+
+    The optional ``bar_seconds`` keyword (added v1.9.6) communicates
+    the wall-clock duration since the last bar so subclasses can
+    compute time-proportional costs (Q2 fix). Subclasses that don't
+    need it (e.g. :class:`FundingRateModel`) ignore the argument.
     """
 
     def calculate_cost(
@@ -127,13 +137,15 @@ class PeriodicCostModel:
         price: float,
         timestamp: Any,
         margin_config: MarginConfig,
+        *,
+        bar_seconds: Optional[float] = None,
     ) -> float:
         """Return cost to deduct this bar. Positive = cost."""
         return 0.0
 
 
 class BorrowingCostModel(PeriodicCostModel):
-    """Daily interest on borrowed funds.
+    """Time-proportional interest on borrowed funds.
 
     For leveraged longs: borrowed amount is fixed at entry
     (``entry_value * (1 - IMR)``), not affected by price changes.
@@ -143,15 +155,47 @@ class BorrowingCostModel(PeriodicCostModel):
     For shorts: borrowed = current market value of shorted shares
     (real brokers charge on current value since you must return shares
     at current price).
+
+    Parameters:
+        days_per_year: Calendar used to convert the annual rate into a
+            per-second rate. ``365`` (default) for retail / continuous
+            calendars, ``360`` for USD short rebate, ``252`` for
+            A-share trading-day calendars.
+
+            Caveat: ``days_per_year`` is paired with the calendar-time
+            ``bar_seconds`` the engine derives from your data index. If
+            your data has weekend gaps but you pick ``days_per_year=252``,
+            the Mon-after-Fri bar will still consume 3 calendar days of
+            wall-clock and bill all of them at the trading-day rate. To
+            match a strict trading-day cost, either pass
+            ``days_per_year=365`` (so the calendar-day weekend is
+            absorbed) or pre-collapse weekends out of your data index.
     """
 
-    def calculate_cost(self, position, price, timestamp, margin_config):
+    # Class-level dedup so legacy users running thousands of backtests
+    # don't see the deprecation warning more than once per process.
+    _legacy_warned: bool = False
+
+    def __init__(self, days_per_year: int = 365) -> None:
+        if days_per_year <= 0:
+            raise ValueError(
+                f"days_per_year must be positive, got {days_per_year}")
+        self.days_per_year = days_per_year
+
+    def calculate_cost(
+        self,
+        position,
+        price,
+        timestamp,
+        margin_config,
+        *,
+        bar_seconds: Optional[float] = None,
+    ) -> float:
         if margin_config is None:
             return 0.0  # no margin = no borrowing
         annual_rate = margin_config.borrowing_rate
         if annual_rate <= 0:
             return 0.0
-        daily_rate = annual_rate / 365
         imr = margin_config.initial_margin_ratio
         if position.is_short:
             # Short: borrow cost on current market value of shares
@@ -160,7 +204,27 @@ class BorrowingCostModel(PeriodicCostModel):
             # Long: borrow cost on entry-time borrowed amount (fixed)
             entry_value = abs(position.size * position.avg_entry_price)
             borrowed = entry_value * (1 - imr)
-        return max(0.0, borrowed * daily_rate)
+
+        if bar_seconds is None:
+            # Legacy path: assume one calendar day per bar.
+            if not type(self)._legacy_warned:
+                warnings.warn(
+                    "BorrowingCostModel.calculate_cost called without "
+                    "bar_seconds; assuming 1 day per bar. The engine "
+                    "now passes bar_seconds automatically — direct "
+                    "callers should too. This compat fallback will be "
+                    "removed in v2.0.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+                type(self)._legacy_warned = True
+            effective_rate = annual_rate / self.days_per_year
+        else:
+            effective_rate = (
+                annual_rate * bar_seconds
+                / (self.days_per_year * _SECONDS_PER_DAY)
+            )
+        return max(0.0, borrowed * effective_rate)
 
 
 class FundingRateModel(PeriodicCostModel):
@@ -171,10 +235,24 @@ class FundingRateModel(PeriodicCostModel):
     - 8h bars (standard crypto): use raw rate (e.g. 0.0001)
     - Daily bars: multiply by 3 (3 funding periods per day)
     - 1-min bars: divide by 480 (480 minutes per 8h)
+
+    ``bar_seconds`` is intentionally **ignored**: the funding rate is
+    already a per-bar quantity by design. Multiplying by elapsed time
+    again would double-scale the result.
     """
 
     def __init__(self, funding_rate_per_bar: float = 0.0001):
         self.funding_rate_per_bar = funding_rate_per_bar
 
-    def calculate_cost(self, position, price, timestamp, margin_config):
+    def calculate_cost(
+        self,
+        position,
+        price,
+        timestamp,
+        margin_config,
+        *,
+        bar_seconds: Optional[float] = None,
+    ) -> float:
+        # bar_seconds intentionally ignored — see class docstring.
+        del bar_seconds
         return abs(position.notional_value) * self.funding_rate_per_bar

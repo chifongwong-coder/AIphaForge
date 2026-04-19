@@ -195,11 +195,22 @@ def validate_ohlcv(
         if n_nan > 0:
             _report(f"OHLCV: {n_nan} rows with NaN in price columns")
 
-    # Negative prices
+    # Non-finite prices (inf / -inf). NaN is reported separately above.
     if price_cols:
-        n_neg = int((data[price_cols] < 0).any(axis=1).sum())
-        if n_neg > 0:
-            _report(f"OHLCV: {n_neg} rows with negative prices")
+        non_finite_mask = ~np.isfinite(data[price_cols].to_numpy(dtype=float))
+        # Exclude NaN entries (already reported); just count inf/-inf rows.
+        nan_mask = data[price_cols].isna().to_numpy()
+        infinite_only = non_finite_mask & ~nan_mask
+        n_inf = int(infinite_only.any(axis=1).sum())
+        if n_inf > 0:
+            _report(f"OHLCV: {n_inf} rows with non-finite (inf) prices")
+
+    # Non-positive prices (price <= 0 is invalid for OHLC). Volume can be 0
+    # and is intentionally not checked here.
+    if price_cols:
+        n_nonpos = int((data[price_cols] <= 0).any(axis=1).sum())
+        if n_nonpos > 0:
+            _report(f"OHLCV: {n_nonpos} rows with non-positive prices")
 
     # Duplicate timestamps
     if isinstance(data.index, pd.DatetimeIndex):
@@ -509,10 +520,6 @@ def extract_trades_vectorized(
 
     trades: List[Any] = []
 
-    # Fee rates for estimated costs
-    commission_rate = fee_model.estimate_commission_rate() if fee_model else 0.001
-    slippage_rate = fee_model.slippage_pct if fee_model else 0.001
-
     # Find position change points
     pos_diff = positions.diff()
     entries = pos_diff[pos_diff != 0].dropna()
@@ -547,19 +554,25 @@ def extract_trades_vectorized(
                     if entry_time in equity.index
                     else initial_capital
                 )
+                # Skip zero-share trades (occurs when bankruptcy already
+                # zeroed the entry-time equity).
+                if entry_price <= 0 or entry_equity <= 0:
+                    entry_time = None
+                    continue
                 estimated_shares = entry_equity * entry_size / entry_price
+                if estimated_shares <= 0:
+                    entry_time = None
+                    continue
 
-                # Close position
+                # Linear PnL: shares * direction * price-change. Fees
+                # are NOT deducted here — apply_vectorized has already
+                # absorbed commission and slippage into the equity
+                # curve, so deducting again would double-count. The
+                # resulting Trade.pnl is a path-independent linear
+                # approximation; see Trade.__doc__ for the discrepancy
+                # contract vs. the geometric equity curve.
                 trade_id += 1
                 pnl = entry_direction * (price - entry_price) * estimated_shares
-
-                # Subtract estimated fees (entry + exit)
-                entry_notional = estimated_shares * entry_price
-                exit_notional = estimated_shares * price
-                estimated_fees = (
-                    (entry_notional + exit_notional) * (commission_rate + slippage_rate)
-                )
-                pnl -= estimated_fees
 
                 trades.append(Trade(
                     trade_id=f"VT{trade_id:04d}",
@@ -569,7 +582,7 @@ def extract_trades_vectorized(
                     exit_time=idx,
                     entry_price=entry_price,
                     exit_price=price,
-                    size=entry_size,
+                    size=estimated_shares,
                     pnl=pnl,
                     pnl_pct=(price / entry_price - 1) * entry_direction,
                     reason="signal",

@@ -14,7 +14,13 @@ import pandas as pd
 
 from .broker import Broker
 from .config import BacktestConfig, resolve_config
-from .hooks import HookContext, SecondaryTimeframe
+from .hooks import (
+    HookContext,
+    LifecycleContext,
+    SecondaryTimeframe,
+    call_hook_lifecycle_end,
+    call_hook_lifecycle_start,
+)
 from .meta import MetaContext
 from .portfolio import Portfolio
 from .utils import build_secondary_lookup, build_unified_timeline, calculate_returns
@@ -149,10 +155,31 @@ def run_event_driven(
             'bar_realized': {sym: 0.0 for sym in symbols},
         }
 
-    # --- Notify hooks: backtest start (per symbol) ---
-    for sym in sorted(symbols):
+    # --- Notify hooks: backtest start (once per backtest, symmetric with end) ---
+    sorted_symbols = sorted(symbols)
+    if config.hooks:
+        primary_sym = sorted_symbols[0]
+        primary_data = data_dict[primary_sym]
+        start_ctx = LifecycleContext(
+            phase="start",
+            timestamp=primary_data.index[0],
+            symbols=sorted_symbols,
+            config=config,
+            data_dict=data_dict,
+            primary_symbol=primary_sym,
+            primary_data=primary_data,
+        )
         for hook in config.hooks:
-            hook.on_backtest_start(data_dict[sym], sym, config=config)
+            call_hook_lifecycle_start(hook, start_ctx)
+
+    # --- Per-symbol last-cost-timestamp (Q2: time-aware borrowing cost).
+    # Initialised to the first bar each symbol has data on; the periodic
+    # cost loop computes bar_seconds = (timestamp - last_cost_ts[sym]).
+    last_cost_timestamp: Dict[str, pd.Timestamp] = {}
+    for sym in symbols:
+        df = data_dict[sym]
+        if len(df) > 0:
+            last_cost_timestamp[sym] = df.index[0]
 
     # --- Build exit rules list ---
     exit_rules = [r for r in [config.stop_loss_rule,
@@ -591,14 +618,25 @@ def run_event_driven(
         if config.periodic_cost_model is not None:
             for sym in symbols:
                 pos = portfolio.positions.get(sym)
-                if pos and not pos.is_flat:
-                    mc = resolve_config(
-                        config.margin_config,
-                        config.asset_margin_configs, sym)
-                    cost = config.periodic_cost_model.calculate_cost(
-                        pos, prices[sym], timestamp, mc)
-                    if cost > 0:
-                        portfolio.deduct_cost(cost)
+                if not (pos and not pos.is_flat):
+                    # Position is flat — no shares borrowed, so no cost.
+                    # We still advance the timestamp so that on reopen
+                    # the next charge bills only for the new position's
+                    # actual lifespan, not for the (zero-exposure) flat
+                    # period.
+                    last_cost_timestamp[sym] = timestamp
+                    continue
+                mc = resolve_config(
+                    config.margin_config,
+                    config.asset_margin_configs, sym)
+                last_ts = last_cost_timestamp.get(sym, timestamp)
+                delta = (timestamp - last_ts).total_seconds()
+                cost = config.periodic_cost_model.calculate_cost(
+                    pos, prices[sym], timestamp, mc,
+                    bar_seconds=max(0.0, delta))
+                if cost > 0:
+                    portfolio.deduct_cost(cost)
+                last_cost_timestamp[sym] = timestamp
 
         # 7. Record equity + per-asset PnL
         portfolio._record_equity(timestamp)
@@ -612,9 +650,21 @@ def run_event_driven(
                 and portfolio.total_equity < 0):
             break
 
-    # --- Post-loop: notify hooks ---
-    for hook in config.hooks:
-        hook.on_backtest_end()
+    # --- Post-loop: notify hooks (once per backtest, symmetric with start) ---
+    if config.hooks:
+        primary_sym = sorted_symbols[0]
+        primary_data = data_dict[primary_sym]
+        end_ctx = LifecycleContext(
+            phase="end",
+            timestamp=primary_data.index[-1],
+            symbols=sorted_symbols,
+            config=config,
+            data_dict=data_dict,
+            primary_symbol=primary_sym,
+            primary_data=primary_data,
+        )
+        for hook in config.hooks:
+            call_hook_lifecycle_end(hook, end_ctx)
 
     # --- Build results ---
     equity_curve = portfolio.get_equity_curve()

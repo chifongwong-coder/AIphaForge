@@ -78,12 +78,33 @@ def run_vectorized(
     # Fill NaN values (first row from pct_change and shift)
     net_returns = net_returns.fillna(0)
 
+    # Cap per-bar return at -100% so a fee/slippage shock cannot flip the
+    # cumprod sign and produce nonsensical positive equity (B6 root cause).
+    net_returns = net_returns.clip(lower=-1.0)
+
     # Compute equity curve
     equity_curve = config.initial_capital * (1 + net_returns).cumprod()
 
-    # Extract trade records
+    # Bankruptcy detection: once equity reaches 0 (or below from float
+    # error), freeze the curve and stop attributing returns afterwards.
+    bankrupt_mask = equity_curve <= 0
+    bankruptcy_time = None
+    if bankrupt_mask.any():
+        bankruptcy_time = bankrupt_mask.idxmax()
+        equity_curve.loc[bankruptcy_time:] = 0.0
+
+    # Extract trade records (truncate at bankruptcy if it occurred)
+    trade_data = data
+    trade_positions = positions
+    trade_signals = signals
+    trade_equity = equity_curve
+    if bankruptcy_time is not None:
+        trade_data = data.loc[:bankruptcy_time]
+        trade_positions = positions.loc[:bankruptcy_time]
+        trade_signals = signals.loc[:bankruptcy_time]
+        trade_equity = equity_curve.loc[:bankruptcy_time]
     trades = extract_trades_vectorized(
-        data, positions, signals, equity_curve,
+        trade_data, trade_positions, trade_signals, trade_equity,
         config.fee_model, config.initial_capital, symbol=symbol,
     )
 

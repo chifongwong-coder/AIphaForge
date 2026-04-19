@@ -9,10 +9,12 @@ They can be used for async triggering, real-time monitoring, logging, etc.
 
 When no hooks are registered, the engine behaves identically to the original code.
 """
+import inspect
+import warnings
 from abc import ABC
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Set, Tuple, Union
 
 import pandas as pd
 
@@ -76,6 +78,92 @@ class HookContext:
     secondary: Optional[Dict[str, SecondaryTimeframe]] = None
 
 
+@dataclass
+class LifecycleContext:
+    """Context passed to ``on_backtest_start`` / ``on_backtest_end``.
+
+    The lifecycle phase precedes any per-bar execution, so this context
+    intentionally omits ``portfolio``, ``broker``, and ``bar_data`` —
+    those are not yet meaningful. Wrapper hooks that need to forward to
+    a single-symbol inner hook can use ``primary_symbol`` and
+    ``primary_data`` (the alphabetically first symbol) for convenience.
+
+    Attributes:
+        phase: ``"start"`` or ``"end"``.
+        timestamp: First bar's timestamp for ``"start"``; last for ``"end"``.
+        symbols: All symbols in this run (sorted alphabetically).
+        config: BacktestConfig instance (typed as ``Any`` to avoid
+            circular imports).
+        data_dict: Per-symbol full OHLCV DataFrames.
+        primary_symbol: ``symbols[0]`` — convenience for single-asset
+            wrapper composition.
+        primary_data: ``data_dict[primary_symbol]``.
+    """
+    phase: Literal["start", "end"]
+    timestamp: pd.Timestamp
+    symbols: List[str]
+    config: Any
+    data_dict: Dict[str, pd.DataFrame]
+    primary_symbol: str
+    primary_data: pd.DataFrame
+
+
+# Track which (subclass, method) pairs have already emitted a
+# DeprecationWarning so we don't spam users running many backtests.
+_DEPRECATED_LIFECYCLE_NOTIFIED: Set[Tuple[type, str]] = set()
+
+
+def _emit_lifecycle_deprecation(cls: type, method_name: str) -> None:
+    key = (cls, method_name)
+    if key in _DEPRECATED_LIFECYCLE_NOTIFIED:
+        return
+    _DEPRECATED_LIFECYCLE_NOTIFIED.add(key)
+    warnings.warn(
+        f"{cls.__name__}.{method_name} uses the legacy signature. "
+        f"Migrate to the LifecycleContext-based signature: "
+        f"def {method_name}(self, ctx: LifecycleContext) -> None. "
+        f"The legacy signature will be removed in v2.0.",
+        DeprecationWarning,
+        stacklevel=3,
+    )
+
+
+def _count_positional(method: Any) -> int:
+    """Count positional (non-self) parameters of a bound method."""
+    try:
+        sig = inspect.signature(method)
+    except (TypeError, ValueError):
+        return -1
+    return sum(
+        1 for p in sig.parameters.values()
+        if p.kind in (inspect.Parameter.POSITIONAL_ONLY,
+                      inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    )
+
+
+def call_hook_lifecycle_start(hook: Any, ctx: LifecycleContext) -> None:
+    """Dispatch ``on_backtest_start`` honoring legacy ``(data, symbol)`` signatures."""
+    n_pos = _count_positional(hook.on_backtest_start)
+    if n_pos == 1:
+        hook.on_backtest_start(ctx)
+    elif n_pos >= 2:
+        _emit_lifecycle_deprecation(type(hook), "on_backtest_start")
+        hook.on_backtest_start(ctx.primary_data, ctx.primary_symbol, config=ctx.config)
+    else:
+        # Best-effort fallback (no positional args at all).
+        hook.on_backtest_start(ctx)
+
+
+def call_hook_lifecycle_end(hook: Any, ctx: LifecycleContext) -> None:
+    """Dispatch ``on_backtest_end`` honoring the legacy zero-arg signature."""
+    n_pos = _count_positional(hook.on_backtest_end)
+    if n_pos == 0:
+        _emit_lifecycle_deprecation(type(hook), "on_backtest_end")
+        hook.on_backtest_end()
+    else:
+        hook.on_backtest_end(ctx)
+
+
 class BacktestHook(ABC):
     """
     Base class for backtest hooks.
@@ -84,23 +172,24 @@ class BacktestHook(ABC):
     callbacks you need: ``on_pre_signal`` for pre-signal agent logic,
     ``on_bar`` for post-signal observation, or the lifecycle callbacks
     ``on_backtest_start`` / ``on_backtest_end``.
+
+    Lifecycle callbacks fire **once per backtest** (not per symbol) and
+    receive a :class:`LifecycleContext`. Subclasses written against the
+    pre-v1.9.6 signature ``(data, symbol, *, config=None)`` continue to
+    work via a runtime-detected adapter that emits a one-time
+    ``DeprecationWarning`` per subclass.
+
+    In **vectorized mode** only the lifecycle callbacks fire — there is
+    no broker, portfolio, or per-bar context, so ``on_pre_signal`` and
+    ``on_bar`` are skipped. Hooks that need bar-level callbacks must
+    select ``mode='event_driven'``.
     """
 
-    def on_backtest_start(
-        self,
-        data: pd.DataFrame,
-        symbol: str,
-        *,
-        config: Any = None,
-    ) -> None:
-        """
-        Called once when the backtest starts (optional override).
+    def on_backtest_start(self, ctx: LifecycleContext) -> None:
+        """Called once when the backtest starts (optional override).
 
         Parameters:
-            data: Full backtest dataset.
-            symbol: Instrument symbol.
-            config: Backtest configuration (keyword-only, optional).
-                    Passed by the engine so hooks can inspect settings.
+            ctx: :class:`LifecycleContext` describing the run.
         """
         pass
 
@@ -128,7 +217,7 @@ class BacktestHook(ABC):
         """
         return None
 
-    def on_backtest_end(self) -> None:
+    def on_backtest_end(self, ctx: LifecycleContext) -> None:
         """Called once when the backtest ends (optional override)."""
         pass
 
@@ -174,18 +263,12 @@ class ScheduleHook(BacktestHook):
         self.start_delay = start_delay
         self._last_trigger: Optional[Any] = None
 
-    def on_backtest_start(
-        self,
-        data: pd.DataFrame,
-        symbol: str,
-        *,
-        config: Any = None,
-    ) -> None:
+    def on_backtest_start(self, ctx: LifecycleContext) -> None:
         """Reset state for clean runs (important for reuse across
         multiple engine.run calls and monte_carlo_test deep-copy)."""
         self._last_trigger = None
-        if config and hasattr(config, 'mode') and config.mode == 'vectorized':
-            import warnings
+        config = ctx.config
+        if config is not None and getattr(config, 'mode', None) == 'vectorized':
             warnings.warn(
                 "ScheduleHook has no effect in vectorized mode. "
                 "Use mode='event_driven'.")
@@ -294,16 +377,10 @@ class DriftRebalanceHook(BacktestHook):
         """Return stored static weights (deep-copy safe, no lambda)."""
         return self._static_weights  # type: ignore[return-value]
 
-    def on_backtest_start(
-        self,
-        data: pd.DataFrame,
-        symbol: str,
-        *,
-        config: Any = None,
-    ) -> None:
+    def on_backtest_start(self, ctx: LifecycleContext) -> None:
         self._last_rebalance_bar = -999
-        if config and hasattr(config, 'mode') and config.mode == 'vectorized':
-            import warnings
+        config = ctx.config
+        if config is not None and getattr(config, 'mode', None) == 'vectorized':
             warnings.warn(
                 "DriftRebalanceHook has no effect in vectorized mode. "
                 "Use mode='event_driven'.")
@@ -368,14 +445,8 @@ class BandRebalanceHook(BacktestHook):
         """Return stored static weights (deep-copy safe, no lambda)."""
         return self._static_weights  # type: ignore[return-value]
 
-    def on_backtest_start(
-        self,
-        data: pd.DataFrame,
-        symbol: str,
-        *,
-        config: Any = None,
-    ) -> None:
-        self._schedule.on_backtest_start(data, symbol, config=config)
+    def on_backtest_start(self, ctx: LifecycleContext) -> None:
+        self._schedule.on_backtest_start(ctx)
 
     def on_pre_signal(self, context: HookContext) -> None:
         self._schedule.on_pre_signal(context)
@@ -439,14 +510,8 @@ class CostAwareRebalanceHook(BacktestHook):
         """Return stored static weights (deep-copy safe, no lambda)."""
         return self._static_weights  # type: ignore[return-value]
 
-    def on_backtest_start(
-        self,
-        data: pd.DataFrame,
-        symbol: str,
-        *,
-        config: Any = None,
-    ) -> None:
-        self._schedule.on_backtest_start(data, symbol, config=config)
+    def on_backtest_start(self, ctx: LifecycleContext) -> None:
+        self._schedule.on_backtest_start(ctx)
 
     def on_pre_signal(self, context: HookContext) -> None:
         self._schedule.on_pre_signal(context)
@@ -503,14 +568,8 @@ class OptimizedRebalanceHook(BacktestHook):
         self.lookback = lookback
         self._schedule = ScheduleHook(frequency, self._rebalance, start_delay)
 
-    def on_backtest_start(
-        self,
-        data: pd.DataFrame,
-        symbol: str,
-        *,
-        config: Any = None,
-    ) -> None:
-        self._schedule.on_backtest_start(data, symbol, config=config)
+    def on_backtest_start(self, ctx: LifecycleContext) -> None:
+        self._schedule.on_backtest_start(ctx)
 
     def on_pre_signal(self, context: HookContext) -> None:
         self._schedule.on_pre_signal(context)
