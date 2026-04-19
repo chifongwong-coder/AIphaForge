@@ -204,6 +204,70 @@ def test_vectorized_lifecycle_fires_once_multi_asset():
     assert hook.start_calls[0].symbols == ["AAA", "BBB"]
 
 
+def test_event_driven_end_hook_fires_on_mid_loop_exception():
+    """v1.9.7: end-hook fires even when the engine raises mid-run.
+
+    Pre-fix: post-loop end-hook was unreachable on exception, so
+    LatencyHook queues / open file handles / dashboards leaked.
+    """
+
+    class _CrashingHook(BacktestHook):
+        def __init__(self) -> None:
+            self.start_calls = 0
+            self.end_calls = 0
+
+        def on_backtest_start(self, ctx: LifecycleContext) -> None:
+            self.start_calls += 1
+
+        def on_pre_signal(self, context):
+            # Crash on bar 3 to simulate a mid-loop failure.
+            if context.bar_index == 3:
+                raise RuntimeError("simulated mid-loop failure")
+
+        def on_backtest_end(self, ctx: LifecycleContext) -> None:
+            self.end_calls += 1
+
+    hook = _CrashingHook()
+    data = _make_data()
+    signals = pd.Series(np.nan, index=data.index, dtype=float)
+    signals.iloc[1] = 1.0
+    eng = BacktestEngine(mode="event_driven", hooks=[hook])
+    eng.set_signals(signals)
+    with pytest.raises(RuntimeError, match="simulated mid-loop failure"):
+        eng.run(data)
+    assert hook.start_calls == 1
+    assert hook.end_calls == 1, (
+        "end-hook should fire even when the loop raises (try/finally)")
+
+
+def test_event_driven_end_hook_does_NOT_fire_when_start_raises():
+    """v1.9.7: if a start hook itself raises, end should NOT fire.
+
+    The started_hooks flag is only flipped after the start dispatch
+    loop completes; the finally block checks the flag.
+    """
+
+    class _CrashingStartHook(BacktestHook):
+        def __init__(self) -> None:
+            self.end_calls = 0
+
+        def on_backtest_start(self, ctx: LifecycleContext) -> None:
+            raise RuntimeError("start crash")
+
+        def on_backtest_end(self, ctx: LifecycleContext) -> None:
+            self.end_calls += 1
+
+    hook = _CrashingStartHook()
+    data = _make_data()
+    signals = pd.Series(np.nan, index=data.index, dtype=float)
+    signals.iloc[1] = 1.0
+    eng = BacktestEngine(mode="event_driven", hooks=[hook])
+    eng.set_signals(signals)
+    with pytest.raises(RuntimeError, match="start crash"):
+        eng.run(data)
+    assert hook.end_calls == 0
+
+
 @pytest.mark.parametrize("phase", ["start", "end"])
 def test_lifecycle_context_provides_data_dict(phase):
     hook = _RecordingHook()
