@@ -375,9 +375,19 @@ def estimate_capacity(
     if capital_multipliers is None:
         capital_multipliers = [1.0, 2.0, 5.0, 10.0, 20.0, 50.0]
 
-    # Normalise data to dict form
+    # Normalise data to dict form. For single-asset runs the engine
+    # leaves result.symbols == [], so we fall back to the first trade's
+    # symbol — otherwise data_dict's key would be "default" while the
+    # trades carry their real symbol, the per-symbol adv/vol lookup
+    # would miss, and every capacity bucket would silently report 0
+    # impact regardless of AUM.
     if isinstance(data, pd.DataFrame):
-        sym = result.symbols[0] if result.symbols else "default"
+        if result.symbols:
+            sym = result.symbols[0]
+        elif result.trades:
+            sym = result.trades[0].symbol
+        else:
+            sym = "default"
         data_dict: Dict[str, pd.DataFrame] = {sym: data}
     else:
         data_dict = data
