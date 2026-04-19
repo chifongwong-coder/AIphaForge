@@ -39,12 +39,18 @@ dev = [
     "ruff>=0.1.0",
     "mypy>=1.0",
     "tomli>=2.0; python_version < '3.11'",
+    # scipy is required by aiphaforge.significance (PSR/DSR) and
+    # aiphaforge.portfolio_optimizer; the dev install must include it
+    # so the public test suite (which exercises both) can run.
+    "scipy>=1.10",
 ]
 plot = ["matplotlib>=3.5"]
 data = ["yfinance>=0.2"]
 optimize = ["optuna>=3.0"]
 portfolio = ["scipy>=1.10"]
-significance = ["arch>=6.0"]
+# significance.py lazy-imports scipy for PSR/DSR; arch is only needed
+# for Model Confidence Set and similar advanced significance paths.
+significance = ["scipy>=1.10", "arch>=6.0"]
 all = ["matplotlib>=3.5", "yfinance>=0.2", "optuna>=3.0", "arch>=6.0", "scipy>=1.10"]
 
 [project.urls]
