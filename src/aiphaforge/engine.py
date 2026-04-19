@@ -7,7 +7,7 @@ Main backtest executor supporting both vectorized and event-driven modes.
 import warnings
 from datetime import time
 from enum import Enum
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -877,6 +877,56 @@ class BacktestEngine:
 
     # ========== Config and Result Building ==========
 
+    # Fields the vectorized core silently ignores. Names are the kwargs
+    # of __init__ (so we can read defaults via inspect.signature). The
+    # `position_sizing` and `position_size` pair is handled jointly.
+    _VECTORIZED_UNSUPPORTED_FIELDS: Tuple[str, ...] = (
+        "take_profit",
+        "trailing_stop_rule",
+        "impact_model",
+        "margin_config",
+        "periodic_cost_model",
+    )
+
+    def _warn_vectorized_unsupported(self) -> None:
+        """Warn when vectorized mode is given config it silently ignores.
+
+        Reads field defaults from __init__'s signature so this stays
+        in sync if someone changes the kwarg defaults later. The
+        (position_sizing, position_size) pair is treated as one
+        composite warning (a user changing one usually changes the
+        other together — no need to fire twice).
+        """
+        import inspect
+        init_defaults = {
+            name: param.default
+            for name, param in
+            inspect.signature(BacktestEngine.__init__).parameters.items()
+            if param.default is not inspect.Parameter.empty
+        }
+
+        # Composite (position_sizing, position_size) warning.
+        ps_def = init_defaults.get("position_sizing")
+        sz_def = init_defaults.get("position_size")
+        if (self.position_sizing != ps_def
+                or self.position_size != sz_def):
+            warnings.warn(
+                "vectorized mode takes positions directly from signals; "
+                f"(position_sizing={self.position_sizing}, "
+                f"position_size={self.position_size}) is ignored. "
+                "Switch to mode='event_driven' to honor sizing config."
+            )
+
+        # Per-field warnings for the rest.
+        for field in self._VECTORIZED_UNSUPPORTED_FIELDS:
+            default = init_defaults.get(field)
+            value = getattr(self, field, default)
+            if value != default:
+                warnings.warn(
+                    f"vectorized mode ignores {field}={value!r}; "
+                    "switch to mode='event_driven' to honor it."
+                )
+
     def _build_config(
         self,
         benchmark: Optional[pd.Series] = None,
@@ -891,6 +941,13 @@ class BacktestEngine:
             benchmark_type: Run-time benchmark_type override.
             symbols: List of symbols for this run.
         """
+        # v1.9.7: warn if vectorized mode + non-default unsupported config.
+        # Vectorized core only honors a subset of engine config; the rest
+        # are silently dropped today. Surface these explicitly so users
+        # don't get misleading "I set X but nothing changed" results.
+        if self.mode == ExecutionMode.VECTORIZED:
+            self._warn_vectorized_unsupported()
+
         return BacktestConfig(
             initial_capital=self.initial_capital,
             fee_model=self.fee_model,
