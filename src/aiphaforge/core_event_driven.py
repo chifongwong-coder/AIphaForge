@@ -624,8 +624,16 @@ def run_event_driven(
                     hook.on_bar(ctx)
 
             # 6.5. Periodic costs (borrowing, funding)
+            # v1.9.7: iterate `active` (symbols with a bar at this
+            # timestamp) instead of all `symbols`. For inactive symbols
+            # we have no fresh price and the timestamp shouldn't
+            # advance — when the symbol's next bar arrives, bar_seconds
+            # naturally spans the gap (numerically equivalent to the
+            # current per-tick charge, since cost is linear in
+            # bar_seconds). Saves O(N_active × N_symbols) → O(sum of
+            # active bars) calls on mixed-frequency multi-asset runs.
             if config.periodic_cost_model is not None:
-                for sym in symbols:
+                for sym in active:
                     pos = portfolio.positions.get(sym)
                     if not (pos and not pos.is_flat):
                         # Position is flat — no shares borrowed, so no cost.
