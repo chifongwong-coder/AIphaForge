@@ -1,4 +1,10 @@
-"""PSR / DSR tests — v1.9.5 additions to aiphaforge.significance."""
+"""PSR / DSR tests — v1.9.5 additions to aiphaforge.significance.
+
+Requires scipy (lazy-imported by `aiphaforge.significance` itself).
+``pip install -e ".[dev]"`` already pulls it in; the importorskip
+below makes a `pytest tests/` invocation against a bare install
+self-skip rather than crash at collection time.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +13,8 @@ import math
 import numpy as np
 import pandas as pd
 import pytest
-from scipy import stats
+
+stats = pytest.importorskip("scipy.stats")
 
 from aiphaforge import (
     BacktestEngine,
