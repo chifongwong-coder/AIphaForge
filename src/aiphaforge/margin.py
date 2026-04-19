@@ -161,6 +161,15 @@ class BorrowingCostModel(PeriodicCostModel):
             per-second rate. ``365`` (default) for retail / continuous
             calendars, ``360`` for USD short rebate, ``252`` for
             A-share trading-day calendars.
+
+            Caveat: ``days_per_year`` is paired with the calendar-time
+            ``bar_seconds`` the engine derives from your data index. If
+            your data has weekend gaps but you pick ``days_per_year=252``,
+            the Mon-after-Fri bar will still consume 3 calendar days of
+            wall-clock and bill all of them at the trading-day rate. To
+            match a strict trading-day cost, either pass
+            ``days_per_year=365`` (so the calendar-day weekend is
+            absorbed) or pre-collapse weekends out of your data index.
     """
 
     # Class-level dedup so legacy users running thousands of backtests

@@ -619,11 +619,12 @@ def run_event_driven(
             for sym in symbols:
                 pos = portfolio.positions.get(sym)
                 if not (pos and not pos.is_flat):
-                    # Position is flat — don't accrue and don't advance the
-                    # timestamp. When the position reopens, bar_seconds will
-                    # correctly span the flat stretch (= time since last
-                    # non-flat bar), which is the desired no-charge-while-
-                    # flat semantics.
+                    # Position is flat — no shares borrowed, so no cost.
+                    # We still advance the timestamp so that on reopen
+                    # the next charge bills only for the new position's
+                    # actual lifespan, not for the (zero-exposure) flat
+                    # period.
+                    last_cost_timestamp[sym] = timestamp
                     continue
                 mc = resolve_config(
                     config.margin_config,

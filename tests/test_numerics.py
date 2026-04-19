@@ -252,15 +252,17 @@ class TestEngineBarSecondsWiring:
 
 
 class TestFlatStretchSemantics:
-    """When a position is flat then reopens, the next bar's bar_seconds
-    spans the entire flat stretch.
+    """When a position goes flat and then reopens, the engine should
+    charge only for the new position's lifespan, not for the (zero-
+    exposure) flat period.
 
-    This is *intentional*: cost accrues only when there's a position to
-    borrow against, but when re-opening the engine charges for the whole
-    elapsed wall-clock time since the last non-flat bar.
+    Implementation: the flat-bar branch of the periodic-cost loop
+    advances ``last_cost_timestamp[sym]`` even though it skips the
+    actual charge. So on reopen, ``bar_seconds`` reflects only the
+    bars during which a position has actually existed.
     """
 
-    def test_reopen_after_flat_spans_full_gap(self):
+    def test_reopen_after_flat_does_not_overcharge(self):
         import numpy as np
 
         from aiphaforge import BacktestEngine
@@ -304,11 +306,13 @@ class TestFlatStretchSemantics:
         # Position is non-flat at bars 0,1 (initial long), flat 2..6,
         # then short fills on bar 7 or 8 depending on order timing.
         # The first cost call AFTER the flat stretch should record a
-        # bar_seconds spanning the gap (> 3600), not just one bar.
+        # bar_seconds for ONE bar (~3600), not span the multi-hour flat
+        # gap — flat bars carry no exposure so they accrue no charge.
         post_flat = [(ts, bs) for ts, bs in recorded
                      if ts >= idx[7] and bs is not None]
         assert post_flat, "No periodic cost recorded after flat stretch"
         first_post_flat_seconds = post_flat[0][1]
-        assert first_post_flat_seconds > 3600.0, (
+        assert first_post_flat_seconds <= 3600.0 + 1e-6, (
             f"Reopen bar_seconds={first_post_flat_seconds}; "
-            f"expected > 3600 (flat span)")
+            f"expected <= 3600 (one bar). The engine appears to be "
+            f"billing the new position for time during the flat stretch.")

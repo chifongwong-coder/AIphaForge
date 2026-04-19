@@ -35,7 +35,9 @@ class Trade:
             and ``equity_curve.iloc[-1] - initial_capital`` diverge by
             ``O(σ²·T·notional)`` whenever there are reversals or
             fractional positions — this is a mathematical property of
-            geometric vs. linear PnL, not a bug.
+            geometric vs. linear PnL, not a bug. In bankruptcy runs
+            ``sum(trade.pnl)`` may exceed the actual equity loss because
+            the linear formula does not see the equity-zero floor.
         pnl_pct: P&L percentage.
         commission: Commission paid.
         slippage_cost: Slippage cost.
