@@ -75,6 +75,9 @@ AIphaForge also works perfectly well as a general-purpose backtest framework for
 - Default `trading_days=252` reproduces v1.9.4 numbers exactly.
 - **Pickle compatibility across versions is not guaranteed.** `BacktestResult` gained new fields (`trading_days`, `per_asset_trading_days`); pickles created with v1.9.4 should be regenerated rather than loaded into v1.9.5. If you need long-term persistence, use `result.to_dict()` + JSON.
 
+### v1.9.8 — End-hook exception policy refinement
+Fixes a v1.9.7 over-broad suppression: end-hook exceptions in the **success path** were silently swallowed, hiding hook bugs. Now suppression only applies when a primary engine exception is in flight (preserving its traceback). On the success path, end-hook exceptions propagate normally so a buggy hook fails visibly.
+
 ### v1.9.7 — Vectorized honesty + edge-case cleanup
 A small follow-up to v1.9.6 closing 10 demo-discovered correctness gaps. No new public features; existing APIs preserved.
 

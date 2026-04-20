@@ -329,6 +329,49 @@ def test_event_driven_end_hook_exception_does_not_mask_primary():
         eng.run(data)
 
 
+def test_event_driven_end_hook_exception_in_success_path_propagates():
+    """v1.9.8: end-hook exception on the SUCCESS path must propagate
+    so a buggy end-hook fails visibly. Suppression only happens when
+    a primary engine exception is in flight (to preserve its
+    traceback).
+
+    Pre-v1.9.8: v1.9.7's over-broad try/except swallowed end-hook
+    exceptions ALWAYS, hiding hook bugs in the common case.
+    """
+
+    class _BuggyEndOnlyHook(BacktestHook):
+        def on_backtest_end(self, ctx: LifecycleContext) -> None:
+            raise RuntimeError("END_HOOK_BUG_VISIBLE")
+
+    data = _make_data()
+    signals = pd.Series(np.nan, index=data.index, dtype=float)
+    signals.iloc[1] = 1.0
+    signals.iloc[8] = 0.0
+    eng = BacktestEngine(mode="event_driven", hooks=[_BuggyEndOnlyHook()])
+    eng.set_signals(signals)
+    with pytest.raises(RuntimeError, match="END_HOOK_BUG_VISIBLE"):
+        eng.run(data)
+
+
+def test_vectorized_end_hook_exception_in_success_path_propagates():
+    """v1.9.8: same as above for vectorized mode."""
+
+    class _BuggyEndOnlyHook(BacktestHook):
+        def on_backtest_end(self, ctx: LifecycleContext) -> None:
+            raise RuntimeError("VEC_END_HOOK_BUG_VISIBLE")
+
+    from aiphaforge.fees import ZeroFeeModel
+    data = _make_data()
+    signals = pd.Series(np.nan, index=data.index, dtype=float)
+    signals.iloc[1] = 1.0
+    signals.iloc[8] = 0.0
+    eng = BacktestEngine(mode="vectorized", fee_model=ZeroFeeModel(),
+                         include_benchmark=False, hooks=[_BuggyEndOnlyHook()])
+    eng.set_signals(signals)
+    with pytest.raises(RuntimeError, match="VEC_END_HOOK_BUG_VISIBLE"):
+        eng.run(data)
+
+
 def test_event_driven_end_hook_does_NOT_fire_when_start_raises():
     """v1.9.7: if a start hook itself raises, end should NOT fire.
 

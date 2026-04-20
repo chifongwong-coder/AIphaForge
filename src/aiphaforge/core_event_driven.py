@@ -674,7 +674,18 @@ def run_event_driven(
         # sockets, or LatencyHook queues get cleanup). started_hooks
         # gates this so a start that raised mid-dispatch doesn't trigger
         # an unmatched end.
+        #
+        # End-hook exception policy (v1.9.8):
+        # - If a primary exception is in flight (loop raised), suppress
+        #   end-hook exceptions and emit warnings — preserves the
+        #   primary exception's traceback.
+        # - If NO primary exception, propagate end-hook exceptions
+        #   normally — buggy hooks fail loudly so the user notices.
+        # Without this distinction, success-path end-hook bugs are
+        # silently swallowed (the v1.9.7 over-broad suppression bug).
         if started_hooks:
+            import sys as _sys
+            primary_in_flight = _sys.exc_info()[1] is not None
             primary_sym = sorted_symbols[0]
             primary_data = data_dict[primary_sym]
             end_ctx = LifecycleContext(
@@ -687,23 +698,21 @@ def run_event_driven(
                 primary_data=primary_data,
             )
             for hook in config.hooks:
-                # Each end-hook is wrapped: if a hook itself raises
-                # in its end callback, we MUST NOT let that mask the
-                # primary engine exception (Python's try/finally
-                # semantics would re-raise the latest exception,
-                # losing the original RuntimeError from the loop).
-                # Emit a warning so a buggy end-hook is still
-                # visible, but don't propagate.
-                try:
+                if primary_in_flight:
+                    try:
+                        call_hook_lifecycle_end(hook, end_ctx)
+                    except Exception as exc:
+                        warnings.warn(
+                            f"on_backtest_end raised on "
+                            f"{type(hook).__name__}: {exc!r}. "
+                            f"Suppressed so the primary exception "
+                            f"propagates; original is still in "
+                            f"__context__."
+                        )
+                else:
+                    # Success path — let end-hook exceptions raise so
+                    # a buggy hook fails visibly.
                     call_hook_lifecycle_end(hook, end_ctx)
-                except Exception as exc:
-                    warnings.warn(
-                        f"on_backtest_end raised on "
-                        f"{type(hook).__name__}: {exc!r}. "
-                        f"Suppressed so any primary exception "
-                        f"propagates; original is still in "
-                        f"__context__."
-                    )
 
 
     # --- Build results ---
