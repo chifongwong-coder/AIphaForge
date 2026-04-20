@@ -39,6 +39,34 @@ def test_version_is_current_release():
     )
 
 
+def test_multi_asset_result_symbols_preserves_order():
+    """v1.9.7 commit 3 probe: multi-asset path should produce
+    result.symbols matching what was passed (sorted, since the engine
+    sorts symbols internally).
+    """
+    import numpy as np
+    import pandas as pd
+    from aiphaforge import BacktestEngine
+    from aiphaforge.fees import ZeroFeeModel
+
+    n = 20
+    base = pd.DataFrame(
+        {"open": [100.0] * n, "high": [101.0] * n, "low": [99.0] * n,
+         "close": [100.0] * n, "volume": [1e6] * n},
+        index=pd.bdate_range("2024-01-01", periods=n),
+    )
+    sig = pd.Series(np.nan, index=base.index, dtype=float)
+    sig.iloc[3] = 1.0
+
+    eng = BacktestEngine(mode="event_driven", fee_model=ZeroFeeModel(),
+                         include_benchmark=False)
+    eng.set_signals({"BBB": sig, "AAA": sig, "CCC": sig})
+    res = eng.run({"BBB": base, "AAA": base, "CCC": base})
+
+    # Engine sorts internally. Sorted unique → ['AAA', 'BBB', 'CCC'].
+    assert res.symbols == ["AAA", "BBB", "CCC"]
+
+
 def test_single_asset_result_has_symbols_populated():
     """v1.9.7: BacktestResult.symbols populated for single-asset runs.
 

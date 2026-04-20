@@ -696,19 +696,45 @@ def _extract_trades_with_stop_loss(
                 current = (idx, 1 if new_pos > 0 else -1,
                            abs(new_pos))
 
+    # If a position is still open at end-of-data, include it as a
+    # candidate segment ONLY if a stop fires within (so we can emit
+    # the stop_loss trade). Without this, an open-at-end position with
+    # an in-segment stop is silently dropped — bug surfaced by the
+    # bar-0 + stop-loss test.
+    # Open positions that don't hit a stop remain unrepresented, which
+    # matches the legacy in-loop path (no trade emitted for never-
+    # closed positions).
+    if current is not None:
+        end_bar = positions.index[-1]
+        seg_stops = trigger_mask[(trigger_mask.index > current[0])
+                                  & (trigger_mask.index <= end_bar)
+                                  & trigger_mask]
+        if not seg_stops.empty:
+            segments.append((*current, end_bar, "open"))
+
     # ---- Truncate segments by stop triggers -----------------------
     truncated: List[tuple] = []
     for entry_bar, direction, size_signal, close_bar, close_kind in segments:
-        # Stops fire strictly between (entry_bar, close_bar):
-        # at entry_bar there's no PnL yet (entry_prices ffill makes
-        # pos_pnl_pct = 0), at close_bar the natural close already exits.
-        seg_mask = trigger_mask[(trigger_mask.index > entry_bar)
-                                & (trigger_mask.index < close_bar)
-                                & trigger_mask]
+        # Stops fire strictly between (entry_bar, close_bar) for natural
+        # closes — at entry there's no PnL yet, at close the natural
+        # close already exits. For "open" segments (no natural close),
+        # include the end_bar in the search since nothing else can take
+        # precedence at that bar.
+        if close_kind == "open":
+            seg_mask = trigger_mask[(trigger_mask.index > entry_bar)
+                                    & (trigger_mask.index <= close_bar)
+                                    & trigger_mask]
+        else:
+            seg_mask = trigger_mask[(trigger_mask.index > entry_bar)
+                                    & (trigger_mask.index < close_bar)
+                                    & trigger_mask]
         if not seg_mask.empty:
             stop_bar = seg_mask.index[0]
             truncated.append(
                 (entry_bar, direction, size_signal, stop_bar, "stop_loss"))
+        elif close_kind == "open":
+            # Open at end with no stop — drop (matches legacy behavior).
+            continue
         else:
             truncated.append(
                 (entry_bar, direction, size_signal, close_bar, close_kind))

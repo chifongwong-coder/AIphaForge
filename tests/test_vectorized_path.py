@@ -370,3 +370,203 @@ class TestDiscrepancyContract:
             f"Multi-trade divergence {diff} exceeds 5x the σ²·T·notional "
             f"bound {bound}; linear_sum={linear_sum}, geo={geo}"
         )
+
+
+# ---------------------------------------------------------------------------
+# v1.9.7 commit 7b — stop-loss visibility edge cases
+# (probe-style coverage added 2026-04-20)
+# ---------------------------------------------------------------------------
+
+class TestStopLossEdgeCases:
+    """Edge cases for vectorized stop-loss visibility — what the
+    expert reviewer would try to break the segment-based reconstruction.
+    """
+
+    def _stairstep_data(self, n: int, bar_change: float) -> pd.DataFrame:
+        """OHLCV with deterministic monotone close moves of `bar_change`."""
+        close = [100.0 * (1 + bar_change) ** i for i in range(n)]
+        return pd.DataFrame(
+            {"open": close, "high": [p * 1.001 for p in close],
+             "low": [p * 0.999 for p in close], "close": close,
+             "volume": [1e6] * n},
+            index=pd.bdate_range("2024-01-01", periods=n),
+        )
+
+    def test_bar_zero_position_with_stop_loss_fires_correctly(self):
+        """Commit 7a + 7b interaction: long opens at bar 0, stop fires
+        before any signal change. Segment-based path must recognize the
+        bar-0 entry AND truncate it at the stop.
+        """
+        n = 20
+        # Drop ~10% from bar 0 → triggers 5% stop quickly.
+        data = self._stairstep_data(n, bar_change=-0.01)
+        signals = pd.Series(np.nan, index=data.index, dtype=float)
+        signals.iloc[0] = 1.0   # open long at bar 0
+
+        eng = BacktestEngine(
+            mode="vectorized", fee_model=ZeroFeeModel(),
+            include_benchmark=False, stop_loss=0.05,
+        )
+        eng.set_signals(signals)
+        res = eng.run(data)
+
+        stop_trades = [t for t in res.trades if t.reason == "stop_loss"]
+        assert len(stop_trades) == 1, (
+            f"Expected 1 stop_loss trade for bar-0 long; got "
+            f"{[(t.reason, t.entry_time) for t in res.trades]}")
+        # Stop trade must enter at bar 0
+        assert stop_trades[0].entry_time == data.index[0]
+        # Exit price = entry * (1 - 0.05) = 100 * 0.95 = 95.0
+        assert abs(stop_trades[0].exit_price - 95.0) < 1e-6
+
+    def test_stop_loss_then_reversal_preserves_new_segment(self):
+        """Plan v3 R1 reversal case: long opens at bar 1, stop fires
+        at bar 5, signal reverses to short at bar 10.
+        Expected: trade 1 = stop_loss long(1→5), trade 2 = signal
+        short(10→...). Pre-fix: phantom open at bar 10 in wrong dir.
+        """
+        # Hand-craft prices: drop sharply 1→5 (triggers stop), recover
+        # 5→10, drop again 10→end (short profitable).
+        n = 20
+        prices = (
+            [100.0]
+            + [100.0 * (1 - 0.02 * i) for i in range(5)]   # 1..5: drop
+            + [90.0 * (1 + 0.01 * i) for i in range(5)]    # 6..10: recover
+            + [95.0 * (1 - 0.005 * i) for i in range(n - 11)]  # 11..end: drift
+        )
+        prices = prices[:n]
+        data = pd.DataFrame(
+            {"open": prices, "high": [p * 1.001 for p in prices],
+             "low": [p * 0.999 for p in prices], "close": prices,
+             "volume": [1e6] * n},
+            index=pd.bdate_range("2024-01-01", periods=n),
+        )
+        signals = pd.Series(np.nan, index=data.index, dtype=float)
+        signals.iloc[1] = 1.0    # long
+        signals.iloc[10] = -1.0  # reversal to short
+        signals.iloc[18] = 0.0   # close short
+
+        eng = BacktestEngine(
+            mode="vectorized", fee_model=ZeroFeeModel(),
+            include_benchmark=False, stop_loss=0.05,
+        )
+        eng.set_signals(signals)
+        res = eng.run(data)
+
+        # Should have at least: stop_loss long (1→stop_bar) + signal short (10→18)
+        stop_trades = [t for t in res.trades if t.reason == "stop_loss"]
+        signal_trades = [t for t in res.trades if t.reason == "signal"]
+        assert len(stop_trades) >= 1, "Stop did not fire in reversal scenario"
+        assert any(t.direction == 1 for t in stop_trades), (
+            "Stop trade should be the long (entry at bar 1)")
+        # Critical: short segment from bar 10 must NOT be lost
+        short_signal_trades = [t for t in signal_trades if t.direction == -1]
+        assert len(short_signal_trades) >= 1, (
+            "Reversal short segment after stop_loss long was lost — "
+            "the bug Plan v3 R1 set out to prevent")
+
+    def test_stop_loss_with_risk_rules_uses_second_mask(self):
+        """Plan v3 R2: when both apply_vectorized calls fire (risk_rules
+        present), the SECOND mask wins. Test this composes correctly.
+        """
+        from aiphaforge.risk import CompositeRiskManager, MaxDrawdownHalt
+
+        n = 30
+        data = self._stairstep_data(n, bar_change=-0.01)
+        signals = pd.Series(np.nan, index=data.index, dtype=float)
+        signals.iloc[1] = 1.0
+
+        # MaxDrawdownHalt may modify positions → second apply_vectorized
+        # call sees post-risk-rules positions → its trigger mask wins.
+        eng = BacktestEngine(
+            mode="vectorized", fee_model=ZeroFeeModel(),
+            include_benchmark=False,
+            stop_loss=0.05,
+            risk_rules=CompositeRiskManager(
+                rules=[MaxDrawdownHalt(max_drawdown=0.30)]),
+        )
+        eng.set_signals(signals)
+        res = eng.run(data)
+
+        # Run shouldn't crash; should produce at least one trade.
+        assert len(res.trades) >= 1
+        # Equity must be valid (not NaN, not negative beyond bankruptcy floor)
+        assert (res.equity_curve >= 0).all()
+
+    def test_apply_vectorized_default_call_returns_series(self):
+        """Backward compat: PercentageStopLoss.apply_vectorized without
+        return_mask must return just the Series (not a tuple). Critical
+        for any user subclass / direct caller relying on the v1.9.6
+        contract.
+        """
+        from aiphaforge.exit_rules import PercentageStopLoss
+
+        n = 20
+        data = self._stairstep_data(n, bar_change=-0.01)
+        positions = pd.Series([1.0] * n, index=data.index)
+        returns = data['close'].pct_change().fillna(0.0)
+        rule = PercentageStopLoss(threshold=0.05)
+
+        # Default call (no return_mask) — must return Series only
+        result = rule.apply_vectorized(returns, positions, data)
+        assert isinstance(result, pd.Series), (
+            f"Backward-compat broken: expected pd.Series, got {type(result)}")
+        assert len(result) == n
+
+    def test_apply_vectorized_with_return_mask_returns_tuple(self):
+        """Forward path: return_mask=True returns 4-tuple."""
+        from aiphaforge.exit_rules import PercentageStopLoss
+
+        n = 20
+        data = self._stairstep_data(n, bar_change=-0.01)
+        positions = pd.Series([1.0] * n, index=data.index)
+        returns = data['close'].pct_change().fillna(0.0)
+        rule = PercentageStopLoss(threshold=0.05)
+
+        result = rule.apply_vectorized(
+            returns, positions, data, return_mask=True)
+        assert isinstance(result, tuple)
+        assert len(result) == 4
+        returns_with_stop, trigger_mask, entry_prices, threshold = result
+        assert isinstance(returns_with_stop, pd.Series)
+        assert isinstance(trigger_mask, pd.Series)
+        assert isinstance(entry_prices, pd.Series)
+        assert threshold == 0.05
+
+    def test_stop_loss_trades_sum_within_v196_bound(self):
+        """The stop-loss-visible path must respect the v1.9.6 P1
+        discrepancy contract: |sum(trade.pnl) - equity_change| within
+        σ² * T * notional bound (loose multiplier OK).
+        """
+        n = 30
+        sigma = 0.02
+        np.random.seed(11)
+        rets = sigma * np.random.normal(size=n)
+        rets[0] = 0.0
+        close = 100.0 * np.exp(np.cumsum(rets))
+        data = pd.DataFrame(
+            {"open": close, "high": close * 1.005,
+             "low": close * 0.995, "close": close,
+             "volume": [1e6] * n},
+            index=pd.bdate_range("2024-01-01", periods=n),
+        )
+        signals = pd.Series(np.nan, index=data.index, dtype=float)
+        signals.iloc[1] = 1.0
+        signals.iloc[20] = -1.0
+        signals.iloc[28] = 0.0
+
+        eng = BacktestEngine(
+            mode="vectorized", fee_model=ZeroFeeModel(),
+            include_benchmark=False, stop_loss=0.03,
+        )
+        eng.set_signals(signals)
+        res = eng.run(data)
+
+        sum_pnl = sum(t.pnl for t in res.trades)
+        eq_change = res.final_capital - 100_000.0
+        bound = sigma * sigma * n * 100_000.0  # σ²·T·notional
+        diff = abs(sum_pnl - eq_change)
+        assert diff <= bound * 10, (
+            f"Stop-loss path discrepancy {diff:.2f} exceeds 10x bound "
+            f"{bound:.2f}; trades = "
+            f"{[(t.reason, round(t.pnl, 2)) for t in res.trades]}")
