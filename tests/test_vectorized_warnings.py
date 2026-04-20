@@ -125,6 +125,27 @@ class TestUnsupportedFieldWarnings:
         msgs = [str(w.message) for w in warns]
         assert any("periodic_cost_model" in m for m in msgs)
 
+    def test_turnover_config_warns(self):
+        # Vectorized core does not enforce TurnoverConfig.
+        # Users who set this and switch to vectorized for "speed"
+        # would silently get an unconstrained book.
+        from aiphaforge.config import TurnoverConfig
+        warns = _vectorized_warns(
+            turnover_config=TurnoverConfig(max_turnover_per_bar=0.001))
+        msgs = [str(w.message) for w in warns]
+        assert any("turnover_config" in m for m in msgs)
+
+    def test_risk_manager_warns(self):
+        # Vectorized only honors risk_rules; risk_manager (the legacy
+        # ergonomic for users with custom BaseRiskManager subclasses)
+        # is silently dropped.
+        from aiphaforge.risk import CompositeRiskManager, MaxDrawdownHalt
+        warns = _vectorized_warns(
+            risk_manager=CompositeRiskManager(
+                rules=[MaxDrawdownHalt(max_drawdown=0.5)]))
+        msgs = [str(w.message) for w in warns]
+        assert any("risk_manager" in m for m in msgs)
+
     def test_stop_loss_does_NOT_warn(self):
         # stop_loss IS honored in vectorized mode
         # (core_vectorized.py:56-58 calls stop_loss_rule.apply_vectorized)

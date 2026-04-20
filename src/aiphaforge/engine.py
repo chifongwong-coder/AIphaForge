@@ -880,12 +880,18 @@ class BacktestEngine:
     # Fields the vectorized core silently ignores. Names are the kwargs
     # of __init__ (so we can read defaults via inspect.signature). The
     # `position_sizing` and `position_size` pair is handled jointly.
+    # Note: vectorized DOES honor stop_loss (via stop_loss_rule),
+    # risk_rules (via apply_vectorized_all), trade_cost (apply_vectorized),
+    # signal_transform, and allow_short. Everything else listed here is
+    # silently dropped — surface that to the user.
     _VECTORIZED_UNSUPPORTED_FIELDS: Tuple[str, ...] = (
         "take_profit",
         "trailing_stop_rule",
         "impact_model",
         "margin_config",
         "periodic_cost_model",
+        "turnover_config",
+        "risk_manager",
     )
 
     def _warn_vectorized_unsupported(self) -> None:
