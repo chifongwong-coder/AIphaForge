@@ -253,7 +253,7 @@ Optional dependencies:
 pip install aiphaforge[plot]          # matplotlib for visualization
 pip install aiphaforge[data]          # yfinance for data loading
 pip install aiphaforge[optimize]      # optuna for Bayesian optimization
-pip install aiphaforge[significance]  # arch for Model Confidence Set
+pip install aiphaforge[significance]  # scipy (PSR / DSR) + arch (Model Confidence Set)
 pip install aiphaforge[portfolio]     # scipy for portfolio optimization
 pip install aiphaforge[all]           # everything
 ```
