@@ -5,10 +5,37 @@ Standalone function that runs a vectorized (array-based) backtest.
 Extracted from BacktestEngine._run_vectorized to keep engine.py thin.
 """
 
+import inspect
+
 import pandas as pd
 
 from .config import BacktestConfig
 from .utils import extract_trades_vectorized
+
+
+def _apply_stop_loss(rule, returns: pd.Series, positions: pd.Series,
+                      data: pd.DataFrame):
+    """Call ``rule.apply_vectorized`` with ``return_mask=True`` if the
+    subclass supports it; otherwise fall back to the single-Series
+    legacy contract.
+
+    PercentageStopLoss (the only stop_loss_rule the engine constructs)
+    supports return_mask. External BaseExitRule subclasses passed via
+    BacktestConfig directly may not — falling back keeps them working
+    (their stop exits stay invisible to per-trade attribution, matching
+    pre-v1.9.7 behavior).
+    """
+    sig = inspect.signature(rule.apply_vectorized)
+    if "return_mask" in sig.parameters:
+        result = rule.apply_vectorized(
+            returns, positions, data, return_mask=True)
+        if isinstance(result, tuple) and len(result) == 4:
+            net, mask, prices, threshold = result
+            return net, (mask, prices, threshold)
+        # Subclass overrode the signature but didn't return the tuple.
+        return result, None
+    # Legacy subclass — single Series return, no mask available.
+    return rule.apply_vectorized(returns, positions, data), None
 
 
 def run_vectorized(
@@ -55,14 +82,14 @@ def run_vectorized(
     # Apply stop loss via module. v1.9.7 commit 7b: ask for the trigger
     # mask so extract_trades_vectorized can emit stop_loss Trade entries
     # at the correct exit price (was invisible to per-trade attribution).
+    # External BaseExitRule subclasses that don't accept return_mask
+    # are handled gracefully — _apply_stop_loss falls back to legacy
+    # single-Series return for them; their stop exits stay invisible
+    # to per-trade attribution (legacy v1.9.6 behavior preserved).
     stop_loss_info = None
     if config.stop_loss_rule is not None:
-        net_returns, _trigger_mask, _entry_prices, _threshold = (
-            config.stop_loss_rule.apply_vectorized(
-                net_returns, positions, data, return_mask=True,
-            )
-        )
-        stop_loss_info = (_trigger_mask, _entry_prices, _threshold)
+        net_returns, stop_loss_info = _apply_stop_loss(
+            config.stop_loss_rule, net_returns, positions, data)
 
     # Apply risk rules (v1.1)
     if config.risk_rules:
@@ -80,12 +107,8 @@ def run_vectorized(
         # the second call sees the post-risk-rules positions; the first
         # mask is stale.
         if config.stop_loss_rule is not None:
-            net_returns, _trigger_mask, _entry_prices, _threshold = (
-                config.stop_loss_rule.apply_vectorized(
-                    net_returns, positions, data, return_mask=True,
-                )
-            )
-            stop_loss_info = (_trigger_mask, _entry_prices, _threshold)
+            net_returns, stop_loss_info = _apply_stop_loss(
+                config.stop_loss_rule, net_returns, positions, data)
 
     # Fill NaN values (first row from pct_change and shift)
     net_returns = net_returns.fillna(0)

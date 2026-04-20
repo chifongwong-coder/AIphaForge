@@ -687,7 +687,23 @@ def run_event_driven(
                 primary_data=primary_data,
             )
             for hook in config.hooks:
-                call_hook_lifecycle_end(hook, end_ctx)
+                # Each end-hook is wrapped: if a hook itself raises
+                # in its end callback, we MUST NOT let that mask the
+                # primary engine exception (Python's try/finally
+                # semantics would re-raise the latest exception,
+                # losing the original RuntimeError from the loop).
+                # Emit a warning so a buggy end-hook is still
+                # visible, but don't propagate.
+                try:
+                    call_hook_lifecycle_end(hook, end_ctx)
+                except Exception as exc:
+                    warnings.warn(
+                        f"on_backtest_end raised on "
+                        f"{type(hook).__name__}: {exc!r}. "
+                        f"Suppressed so any primary exception "
+                        f"propagates; original is still in "
+                        f"__context__."
+                    )
 
 
     # --- Build results ---

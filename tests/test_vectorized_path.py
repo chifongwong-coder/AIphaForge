@@ -533,6 +533,55 @@ class TestStopLossEdgeCases:
         assert isinstance(entry_prices, pd.Series)
         assert threshold == 0.05
 
+    def test_legacy_stop_loss_subclass_without_return_mask_does_not_crash(self):
+        """v1.9.7 commit 7b influence map: an external BaseExitRule
+        subclass that overrides apply_vectorized WITHOUT a return_mask
+        kwarg must still work — _apply_stop_loss feature-detects and
+        falls back to the single-Series legacy contract.
+
+        Pre-defensive-fix: vectorized would have crashed with
+        TypeError: apply_vectorized() got an unexpected keyword
+        argument 'return_mask'.
+        """
+        from aiphaforge.exit_rules import BaseExitRule
+
+        class _LegacyStopRule(BaseExitRule):
+            """Pre-v1.9.7 user subclass — no return_mask support."""
+
+            def apply_vectorized(self, returns, positions, data):
+                # Trivial: do nothing, return as-is.
+                return returns
+
+        n = 30
+        prices = [100.0 + i * 0.1 for i in range(n)]
+        data = pd.DataFrame(
+            {"open": prices, "high": [p * 1.001 for p in prices],
+             "low": [p * 0.999 for p in prices], "close": prices,
+             "volume": [1e6] * n},
+            index=pd.bdate_range("2024-01-01", periods=n),
+        )
+        signals = pd.Series(np.nan, index=data.index, dtype=float)
+        signals.iloc[1] = 1.0
+        signals.iloc[20] = 0.0
+
+        # Build a config with the custom rule directly (bypasses engine
+        # which would always create PercentageStopLoss). This exercises
+        # the external-subclass path.
+        from aiphaforge import BacktestEngine
+        eng = BacktestEngine(
+            mode="vectorized", fee_model=ZeroFeeModel(),
+            include_benchmark=False,
+        )
+        eng.set_signals(signals)
+        # Inject custom rule via private attribute (test-only path)
+        eng._stop_loss_rule = _LegacyStopRule()
+
+        # Must not crash with TypeError on return_mask.
+        res = eng.run(data)
+        # Stop-loss invisibility is OK (legacy subclass doesn't
+        # produce a mask) — just no stop_loss trades in output.
+        assert all(t.reason == "signal" for t in res.trades)
+
     def test_stop_loss_trades_sum_within_v196_bound(self):
         """The stop-loss-visible path must respect the v1.9.6 P1
         discrepancy contract: |sum(trade.pnl) - equity_change| within

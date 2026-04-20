@@ -770,6 +770,12 @@ class BacktestEngine:
         Vectorized mode skips on_pre_signal and on_bar (no broker /
         portfolio is constructed), but lifecycle hooks fire so that
         users with stateful hooks (resets, dashboards, etc.) get called.
+
+        For phase='end', each hook call is wrapped in try/except so
+        a buggy end-hook cannot mask the primary engine exception
+        (Python's try/finally re-raise semantics would otherwise lose
+        the original RuntimeError from run_vectorized). Symmetric with
+        the event-driven core (core_event_driven.py finally block).
         """
         if not config.hooks:
             return
@@ -788,7 +794,18 @@ class BacktestEngine:
         )
         dispatch = call_hook_lifecycle_start if phase == "start" else call_hook_lifecycle_end
         for hook in config.hooks:
-            dispatch(hook, ctx)
+            if phase == "end":
+                try:
+                    dispatch(hook, ctx)
+                except Exception as exc:
+                    warnings.warn(
+                        f"on_backtest_end raised on "
+                        f"{type(hook).__name__}: {exc!r}. "
+                        f"Suppressed so any primary exception "
+                        f"propagates; original is still in __context__."
+                    )
+            else:
+                dispatch(hook, ctx)
 
     @staticmethod
     def _merge_vectorized_results(

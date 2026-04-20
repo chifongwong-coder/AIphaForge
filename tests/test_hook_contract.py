@@ -298,6 +298,37 @@ def test_event_driven_end_hook_fires_for_all_hooks_when_one_raises():
             f"a peer hook crashed mid-loop")
 
 
+def test_event_driven_end_hook_exception_does_not_mask_primary():
+    """v1.9.7 influence-map probe: when the loop raises AND the
+    end-hook also raises in its cleanup, the PRIMARY exception
+    must propagate (not be masked by the end-hook one).
+
+    Pre-defensive-fix: Python try/finally semantics meant the latest
+    exception (from end-hook) wins, hiding the original engine crash.
+    Users would see the wrong traceback and misdiagnose. v1.9.7
+    wraps each end-hook in try/except + warning to preserve the
+    primary exception.
+    """
+
+    class _DoubleCrashHook(BacktestHook):
+        def on_pre_signal(self, context):
+            if context.bar_index == 3:
+                raise RuntimeError("PRIMARY_LOOP_CRASH")
+
+        def on_backtest_end(self, ctx: LifecycleContext) -> None:
+            raise ValueError("END_HOOK_CRASH")
+
+    data = _make_data()
+    signals = pd.Series(np.nan, index=data.index, dtype=float)
+    signals.iloc[1] = 1.0
+    eng = BacktestEngine(mode="event_driven", hooks=[_DoubleCrashHook()])
+    eng.set_signals(signals)
+
+    # Caller must see the PRIMARY exception, not the end-hook one.
+    with pytest.raises(RuntimeError, match="PRIMARY_LOOP_CRASH"):
+        eng.run(data)
+
+
 def test_event_driven_end_hook_does_NOT_fire_when_start_raises():
     """v1.9.7: if a start hook itself raises, end should NOT fire.
 
