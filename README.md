@@ -12,10 +12,13 @@ AIphaForge is purpose-built for backtesting trading strategies controlled by AI 
 
 AIphaForge also works perfectly well as a general-purpose backtest framework for traditional rule-based and ML strategies.
 
+**Latest release: v1.9.8** — end-hook exception policy refinement. v1.9.6 (stability), v1.9.7 (vectorized honesty + edge-case cleanup), and v1.9.8 ship **20+ correctness fixes** found through engine-wide audits and multi-round review. See the release-notes sections below.
+
 ## Features
 
 ### Core Engine
 - **Dual execution modes**: Vectorized (fast, for parameter sweeps) and Event-Driven (precise, bar-by-bar simulation)
+- **Honest mode boundary (v1.9.7)**: when `mode='vectorized'` is given config the vectorized core silently ignores (`take_profit`, `trailing_stop_rule`, `impact_model`, `margin_config`, `periodic_cost_model`, `turnover_config`, `risk_manager`, custom `position_sizing`/`position_size`), the engine emits a one-shot `UserWarning` per offending field. Default vectorized usage emits zero warnings. Switch to `mode='event_driven'` to honor any of these.
 - **Unified multi-asset**: Single-asset and multi-asset backtests share one code path. Pass a `pd.DataFrame` or a `Dict[str, pd.DataFrame]`
 - **Realistic order simulation**: Market, limit, stop, stop-limit, and **trailing stop** orders with configurable fill and slippage models
 - **Time-in-force support**: GTC, IOC, FOK, and DAY order expiration with session-aware DAY semantics
@@ -35,6 +38,7 @@ AIphaForge also works perfectly well as a general-purpose backtest framework for
 
 ### AI Agent Integration
 - **Hook framework**: `on_pre_signal` / `on_bar` callbacks with full broker and portfolio access
+- **Lifecycle hooks (v1.9.6+)**: `on_backtest_start` / `on_backtest_end` fire exactly once per backtest with a `LifecycleContext`. As of **v1.9.7**, the end-hook fires even when the engine raises mid-loop (try/finally), so hooks holding open file handles, sockets, or pending `LatencyHook` queues get cleanup on a crash. **v1.9.8** narrows the suppression: end-hook exceptions on the success path propagate normally so a buggy hook fails visibly; only when a primary engine exception is in flight is the end-hook exception suppressed (with a warning) to preserve the original traceback.
 - **MetaController**: Agent dynamically adjusts strategy, risk, sizing, and target weights mid-backtest via `ctx.meta`
 - **Strategy composition tree**: `WeightedBlend`, `SelectBest`, `PriorityCascade`, `VoteEnsemble`, `ConditionalSwitch` — composable strategy nodes that work with MetaController
 - **Latency simulation**: `LatencyHook` models LLM inference delay with decision/execution delay separation — decision latency applies to both orders and MetaController operations, per-symbol execution latency is additive
@@ -53,6 +57,7 @@ AIphaForge also works perfectly well as a general-purpose backtest framework for
 - **Composable risk rules**: `CompositeRiskManager` with `MaxDrawdownHalt`, `ExposureLimit`, `DailyLossLimit`, `ConcentrationLimit`
 - **Trailing stop loss**: `TrailingStopLoss` exit rule tracks price highs/lows and exits on pullback
 - **Agent-controlled risk**: MetaController adjusts stop-loss, take-profit, sizing, and signals per bar
+- **Stop-loss trade attribution (v1.9.7)**: vectorized stop-loss exits now emit per-trade records (`Trade(reason='stop_loss')` with the correct exit price), no longer folded silently into the equity curve
 
 ### Parameter Optimization
 - **Grid search**: `optimize()` with walk-forward validation
@@ -70,10 +75,30 @@ AIphaForge also works perfectly well as a general-purpose backtest framework for
 - `BacktestEngine(trading_days=...)` accepts a scalar (252 / 365 / etc.) or a per-symbol dict
 - Mixed-asset portfolios (e.g. AAPL + BTC-USD) annualise per-asset metrics correctly; portfolio-level requires an explicit `portfolio_trading_days` (no silent auto-infer — a single scalar cannot be objectively chosen for stocks+crypto)
 - `BacktestResult.per_asset_metrics` is now populated on every multi-asset run (previously declared but never set)
+- *Compatibility*: default `trading_days=252` reproduces v1.9.4 numbers exactly. Pickle compatibility across versions is **not** guaranteed — `BacktestResult` gained `trading_days` / `per_asset_trading_days` fields in v1.9.5 and `symbols` is now reliably populated for single-asset runs in v1.9.7. Use `result.to_dict()` + JSON for long-term persistence.
 
-### v1.9.5 compatibility notes
-- Default `trading_days=252` reproduces v1.9.4 numbers exactly.
-- **Pickle compatibility across versions is not guaranteed.** `BacktestResult` gained new fields (`trading_days`, `per_asset_trading_days`); pickles created with v1.9.4 should be regenerated rather than loaded into v1.9.5. If you need long-term persistence, use `result.to_dict()` + JSON.
+### Market Impact & Capacity
+- **Market impact models**: `LinearImpactModel`, `SquareRootImpactModel` (Almgren-Chriss with permanent impact), `PowerLawImpactModel` — pluggable via `BaseImpactModel` ABC
+- **Strategy capacity estimation**: `estimate_capacity()` scales trade sizes, computes impact drag, uses bisection to find max capital before Sharpe degrades
+- **Volatility & liquidity tools**: Parkinson high-low volatility, Corwin-Schultz spread estimator, rolling ADV — all from OHLCV data, no order book needed
+- **Calibration presets**: `suggested_impact_params()` for US large/small cap, China A-shares, crypto spot/futures
+
+### Costs & Fees
+- **Multi-market presets**: US stocks, China A-shares, crypto spot, crypto futures — `get_fee_model("china")`
+- **Slippage models**: Fixed, volume-based, volatility-based
+- **Lot sizes**: Per-asset minimum trade units (e.g., A-share 100-share lots)
+- **Corporate actions**: `CorporateActionHook` for dividends and stock splits
+
+### Performance Analysis
+- 30+ metrics: Sharpe, Sortino, Calmar, max drawdown, VaR, CVaR, profit factor, and more
+- Monthly/yearly return breakdowns, multi-strategy comparison
+- Custom benchmark comparison (or automatic buy-and-hold)
+- Per-asset analysis with correlation matrix
+
+## Release Notes
+
+Most recent first. Each release shipped through multi-round review;
+see commit history for detail.
 
 ### v1.9.8 — End-hook exception policy refinement
 Fixes a v1.9.7 over-broad suppression: end-hook exceptions in the **success path** were silently swallowed, hiding hook bugs. Now suppression only applies when a primary engine exception is in flight (preserving its traceback). On the success path, end-hook exceptions propagate normally so a buggy hook fails visibly.
@@ -99,24 +124,6 @@ A focused round of correctness fixes covering 10 long-standing bugs found in an 
 - **Time-aware borrowing cost (Q2)**: `BorrowingCostModel` now uses the engine-derived `bar_seconds`; hourly bars correctly charge `daily_rate / 24` rather than a full day's interest. `days_per_year` is exposed on the constructor (365 / 360 / 252). `FundingRateModel` ignores `bar_seconds` by design (its rate is already per-bar).
 - **Impact model guards (Q4)**: `LinearImpactModel`, `SquareRootImpactModel`, and `PowerLawImpactModel` early-return 0 when `order_size <= 0` (previously the square-root model raised on `math.sqrt(<0)`).
 - **Metadata lock (S1)**: `aiphaforge.__version__` is now CI-locked to match `pyproject.toml` via `tests/test_metadata.py`.
-
-### Market Impact & Capacity
-- **Market impact models**: `LinearImpactModel`, `SquareRootImpactModel` (Almgren-Chriss with permanent impact), `PowerLawImpactModel` — pluggable via `BaseImpactModel` ABC
-- **Strategy capacity estimation**: `estimate_capacity()` scales trade sizes, computes impact drag, uses bisection to find max capital before Sharpe degrades
-- **Volatility & liquidity tools**: Parkinson high-low volatility, Corwin-Schultz spread estimator, rolling ADV — all from OHLCV data, no order book needed
-- **Calibration presets**: `suggested_impact_params()` for US large/small cap, China A-shares, crypto spot/futures
-
-### Costs & Fees
-- **Multi-market presets**: US stocks, China A-shares, crypto spot, crypto futures — `get_fee_model("china")`
-- **Slippage models**: Fixed, volume-based, volatility-based
-- **Lot sizes**: Per-asset minimum trade units (e.g., A-share 100-share lots)
-- **Corporate actions**: `CorporateActionHook` for dividends and stock splits
-
-### Performance Analysis
-- 30+ metrics: Sharpe, Sortino, Calmar, max drawdown, VaR, CVaR, profit factor, and more
-- Monthly/yearly return breakdowns, multi-strategy comparison
-- Custom benchmark comparison (or automatic buy-and-hold)
-- Per-asset analysis with correlation matrix
 
 ## Quick Start
 
