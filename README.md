@@ -12,6 +12,20 @@ AIphaForge is purpose-built for backtesting trading strategies controlled by AI 
 
 AIphaForge also works perfectly well as a general-purpose backtest framework for traditional rule-based and ML strategies.
 
+```python
+from aiphaforge import BacktestEngine
+
+# A backtest in five lines — single-asset or multi-asset, same API.
+engine = BacktestEngine(initial_capital=100_000, fee_model="us", stop_loss=0.05)
+engine.set_signals(signals)        # pd.Series in [-1, 1]; 0=flat, NaN=hold
+result = engine.run(data)           # pd.DataFrame OR Dict[str, pd.DataFrame]
+print(result.summary())             # Sharpe, drawdown, win rate, …
+```
+
+More patterns (AI agent with MetaController, portfolio rebalancing,
+bootstrap CIs, market-impact capacity, Bayesian optimization) live
+under [Quick Start](#quick-start).
+
 ## Features
 
 ### Core Engine
