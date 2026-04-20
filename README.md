@@ -15,13 +15,12 @@ AIphaForge also works perfectly well as a general-purpose backtest framework for
 ## Features
 
 ### Core Engine
-- **Dual execution modes**: Vectorized (fast, for parameter sweeps) and Event-Driven (precise, bar-by-bar simulation)
-- **Mode-aware config**: vectorized mode warns when given config it doesn't enforce (`take_profit`, `trailing_stop_rule`, `impact_model`, `margin_config`, `periodic_cost_model`, `turnover_config`, `risk_manager`, custom `position_sizing`). Switch to `mode='event_driven'` to honor them.
-- **Unified multi-asset**: Single-asset and multi-asset backtests share one code path. Pass a `pd.DataFrame` or a `Dict[str, pd.DataFrame]`
-- **Realistic order simulation**: Market, limit, stop, stop-limit, and **trailing stop** orders with configurable fill and slippage models
-- **Time-in-force support**: GTC, IOC, FOK, and DAY order expiration with session-aware DAY semantics
-- **Continuous signals**: Fractional signals in [-1, 1] (z-scores, alpha values). `0 = flat`, `NaN = hold`, with optional `signal_transform` for custom mapping
-- **Target-weight rebalancing**: `set_target_weights()` for institutional portfolio management workflows
+- **Dual execution modes**: Vectorized (fast, for parameter sweeps) and Event-Driven (precise, bar-by-bar simulation) — the engine warns when vectorized mode is given config it doesn't enforce, so what runs matches what you wrote
+- **Unified multi-asset**: single-asset and multi-asset share one code path. Pass a `pd.DataFrame` or a `Dict[str, pd.DataFrame]`
+- **Realistic order simulation**: market, limit, stop, stop-limit, and trailing stop orders with configurable fill and slippage models
+- **Time-in-force support**: GTC, IOC, FOK, and DAY with session-aware DAY semantics
+- **Continuous signals**: fractional signals in [-1, 1]; `0 = flat`, `NaN = hold`, with optional `signal_transform`
+- **Target-weight rebalancing**: `set_target_weights()` for institutional portfolio workflows
 
 ### Multi-Asset
 - **Shared capital pool** (event-driven) or **weighted split** (vectorized)
@@ -35,8 +34,7 @@ AIphaForge also works perfectly well as a general-purpose backtest framework for
 - **Periodic costs**: `BorrowingCostModel` (entry-based for longs, market-value for shorts), `FundingRateModel` (perpetual futures)
 
 ### AI Agent Integration
-- **Hook framework**: `on_pre_signal` / `on_bar` callbacks with full broker and portfolio access
-- **Lifecycle hooks**: `on_backtest_start` / `on_backtest_end` fire exactly once per backtest with a `LifecycleContext`. End-hook fires even when the engine raises mid-loop so hooks get cleanup; end-hook exceptions never mask the primary engine exception.
+- **Hook framework**: `on_pre_signal` / `on_bar` / `on_backtest_start` / `on_backtest_end` callbacks with a `LifecycleContext`, full broker and portfolio access, and exception-safe cleanup (end-hooks fire even on engine error)
 - **MetaController**: Agent dynamically adjusts strategy, risk, sizing, and target weights mid-backtest via `ctx.meta`
 - **Strategy composition tree**: `WeightedBlend`, `SelectBest`, `PriorityCascade`, `VoteEnsemble`, `ConditionalSwitch` — composable strategy nodes that work with MetaController
 - **Latency simulation**: `LatencyHook` models LLM inference delay with decision/execution delay separation — decision latency applies to both orders and MetaController operations, per-symbol execution latency is additive
@@ -52,10 +50,9 @@ AIphaForge also works perfectly well as a general-purpose backtest framework for
 - **One-line backtest**: `MACrossover(short=10, long=30).backtest(data, fee_model='china')`
 
 ### Risk Management
+- **Exit rules**: percentage stop-loss, take-profit, and trailing stop. All produce per-trade records (with `reason='stop_loss'` / `'take_profit'` / `'trailing_stop_exit'`) in both execution modes
 - **Composable risk rules**: `CompositeRiskManager` with `MaxDrawdownHalt`, `ExposureLimit`, `DailyLossLimit`, `ConcentrationLimit`
-- **Trailing stop loss**: `TrailingStopLoss` exit rule tracks price highs/lows and exits on pullback
 - **Agent-controlled risk**: MetaController adjusts stop-loss, take-profit, sizing, and signals per bar
-- **Stop-loss trade attribution**: vectorized stop-loss exits emit per-trade records (`Trade(reason='stop_loss')` with the correct exit price)
 
 ### Parameter Optimization
 - **Grid search**: `optimize()` with walk-forward validation
@@ -68,12 +65,6 @@ AIphaForge also works perfectly well as a general-purpose backtest framework for
 - **Monte Carlo simulation**: `monte_carlo_test()` — generate synthetic market paths, run strategy/agent on each to test robustness
 - **Multiple comparison correction**: `multiple_comparison_correction()` — Bonferroni, Benjamini-Hochberg, or Model Confidence Set (optional `arch` dependency)
 - **Path generation**: `generate_paths()` — block bootstrap or parametric normal synthetic OHLCV data
-
-### Per-Symbol Annualization
-- `BacktestEngine(trading_days=...)` accepts a scalar (252 / 365 / etc.) or a per-symbol dict
-- Mixed-asset portfolios (e.g. AAPL + BTC-USD) annualise per-asset metrics correctly; portfolio-level requires an explicit `portfolio_trading_days` (no silent auto-infer — a single scalar cannot be objectively chosen for stocks+crypto)
-- `BacktestResult.per_asset_metrics` is populated on every multi-asset run
-- *Compatibility*: pickle compatibility across versions is **not** guaranteed. Use `result.to_dict()` + JSON for long-term persistence.
 
 ### Market Impact & Capacity
 - **Market impact models**: `LinearImpactModel`, `SquareRootImpactModel` (Almgren-Chriss with permanent impact), `PowerLawImpactModel` — pluggable via `BaseImpactModel` ABC
@@ -88,10 +79,11 @@ AIphaForge also works perfectly well as a general-purpose backtest framework for
 - **Corporate actions**: `CorporateActionHook` for dividends and stock splits
 
 ### Performance Analysis
-- 30+ metrics: Sharpe, Sortino, Calmar, max drawdown, VaR, CVaR, profit factor, and more
-- Monthly/yearly return breakdowns, multi-strategy comparison
-- Custom benchmark comparison (or automatic buy-and-hold)
-- Per-asset analysis with correlation matrix
+- **30+ metrics**: Sharpe, Sortino, Calmar, max drawdown, VaR, CVaR, profit factor, win rate, and more
+- **Per-symbol annualization**: `trading_days=` accepts a scalar (252 / 365) or a per-symbol dict; mixed-asset portfolios (e.g. AAPL + BTC-USD) annualise per-asset metrics correctly
+- **Per-asset attribution**: `BacktestResult.per_asset_metrics` on every multi-asset run, with correlation matrix
+- **Breakdowns**: monthly / yearly return tables, multi-strategy comparison
+- **Benchmark overlay**: custom series or automatic buy-and-hold
 
 ## Quick Start
 
