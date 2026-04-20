@@ -793,15 +793,23 @@ class BacktestEngine:
             primary_data=primary_data,
         )
         dispatch = call_hook_lifecycle_start if phase == "start" else call_hook_lifecycle_end
+        # End-hook exception policy (v1.9.8): suppress only when a
+        # primary exception is in flight (so we don't mask the loop's
+        # crash). On the success path, end-hook exceptions propagate
+        # normally so buggy hooks fail visibly.
+        import sys as _sys
+        primary_in_flight = (
+            phase == "end" and _sys.exc_info()[1] is not None
+        )
         for hook in config.hooks:
-            if phase == "end":
+            if phase == "end" and primary_in_flight:
                 try:
                     dispatch(hook, ctx)
                 except Exception as exc:
                     warnings.warn(
                         f"on_backtest_end raised on "
                         f"{type(hook).__name__}: {exc!r}. "
-                        f"Suppressed so any primary exception "
+                        f"Suppressed so the primary exception "
                         f"propagates; original is still in __context__."
                     )
             else:
