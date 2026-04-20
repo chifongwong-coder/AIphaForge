@@ -3,3 +3,8 @@ pytest>=7.0
 pytest-cov>=4.0
 ruff>=0.1.0
 mypy>=1.0
+tomli>=2.0; python_version < "3.11"
+# scipy is required by aiphaforge.significance (PSR/DSR) and by
+# aiphaforge.portfolio_optimizer; the public test suite exercises
+# both, so dev installs must include it.
+scipy>=1.10

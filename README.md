@@ -12,18 +12,29 @@ AIphaForge is purpose-built for backtesting trading strategies controlled by AI 
 
 AIphaForge also works perfectly well as a general-purpose backtest framework for traditional rule-based and ML strategies.
 
-**Latest release: v1.9.8** — end-hook exception policy refinement. v1.9.6 (stability), v1.9.7 (vectorized honesty + edge-case cleanup), and v1.9.8 ship **20+ correctness fixes** found through engine-wide audits and multi-round review. See the release-notes sections below.
+```python
+from aiphaforge import BacktestEngine
+
+# A backtest in five lines — single-asset or multi-asset, same API.
+engine = BacktestEngine(initial_capital=100_000, fee_model="us", stop_loss=0.05)
+engine.set_signals(signals)        # pd.Series in [-1, 1]; 0=flat, NaN=hold
+result = engine.run(data)           # pd.DataFrame OR Dict[str, pd.DataFrame]
+print(result.summary())             # Sharpe, drawdown, win rate, …
+```
+
+More patterns (AI agent with MetaController, portfolio rebalancing,
+bootstrap CIs, market-impact capacity, Bayesian optimization) live
+under [Quick Start](#quick-start).
 
 ## Features
 
 ### Core Engine
-- **Dual execution modes**: Vectorized (fast, for parameter sweeps) and Event-Driven (precise, bar-by-bar simulation)
-- **Honest mode boundary (v1.9.7)**: when `mode='vectorized'` is given config the vectorized core silently ignores (`take_profit`, `trailing_stop_rule`, `impact_model`, `margin_config`, `periodic_cost_model`, `turnover_config`, `risk_manager`, custom `position_sizing`/`position_size`), the engine emits a one-shot `UserWarning` per offending field. Default vectorized usage emits zero warnings. Switch to `mode='event_driven'` to honor any of these.
-- **Unified multi-asset**: Single-asset and multi-asset backtests share one code path. Pass a `pd.DataFrame` or a `Dict[str, pd.DataFrame]`
-- **Realistic order simulation**: Market, limit, stop, stop-limit, and **trailing stop** orders with configurable fill and slippage models
-- **Time-in-force support**: GTC, IOC, FOK, and DAY order expiration with session-aware DAY semantics
-- **Continuous signals**: Fractional signals in [-1, 1] (z-scores, alpha values). `0 = flat`, `NaN = hold`, with optional `signal_transform` for custom mapping
-- **Target-weight rebalancing**: `set_target_weights()` for institutional portfolio management workflows
+- **Dual execution modes**: Vectorized (fast, for parameter sweeps) and Event-Driven (precise, bar-by-bar simulation) — the engine warns when vectorized mode is given config it doesn't enforce, so what runs matches what you wrote
+- **Unified multi-asset**: single-asset and multi-asset share one code path. Pass a `pd.DataFrame` or a `Dict[str, pd.DataFrame]`
+- **Realistic order simulation**: market, limit, stop, stop-limit, and trailing stop orders with configurable fill and slippage models
+- **Time-in-force support**: GTC, IOC, FOK, and DAY with session-aware DAY semantics
+- **Continuous signals**: fractional signals in [-1, 1]; `0 = flat`, `NaN = hold`, with optional `signal_transform`
+- **Target-weight rebalancing**: `set_target_weights()` for institutional portfolio workflows
 
 ### Multi-Asset
 - **Shared capital pool** (event-driven) or **weighted split** (vectorized)
@@ -37,8 +48,7 @@ AIphaForge also works perfectly well as a general-purpose backtest framework for
 - **Periodic costs**: `BorrowingCostModel` (entry-based for longs, market-value for shorts), `FundingRateModel` (perpetual futures)
 
 ### AI Agent Integration
-- **Hook framework**: `on_pre_signal` / `on_bar` callbacks with full broker and portfolio access
-- **Lifecycle hooks (v1.9.6+)**: `on_backtest_start` / `on_backtest_end` fire exactly once per backtest with a `LifecycleContext`. As of **v1.9.7**, the end-hook fires even when the engine raises mid-loop (try/finally), so hooks holding open file handles, sockets, or pending `LatencyHook` queues get cleanup on a crash. **v1.9.8** narrows the suppression: end-hook exceptions on the success path propagate normally so a buggy hook fails visibly; only when a primary engine exception is in flight is the end-hook exception suppressed (with a warning) to preserve the original traceback.
+- **Hook framework**: `on_pre_signal` / `on_bar` / `on_backtest_start` / `on_backtest_end` callbacks with a `LifecycleContext`, full broker and portfolio access, and exception-safe cleanup (end-hooks fire even on engine error)
 - **MetaController**: Agent dynamically adjusts strategy, risk, sizing, and target weights mid-backtest via `ctx.meta`
 - **Strategy composition tree**: `WeightedBlend`, `SelectBest`, `PriorityCascade`, `VoteEnsemble`, `ConditionalSwitch` — composable strategy nodes that work with MetaController
 - **Latency simulation**: `LatencyHook` models LLM inference delay with decision/execution delay separation — decision latency applies to both orders and MetaController operations, per-symbol execution latency is additive
@@ -54,10 +64,9 @@ AIphaForge also works perfectly well as a general-purpose backtest framework for
 - **One-line backtest**: `MACrossover(short=10, long=30).backtest(data, fee_model='china')`
 
 ### Risk Management
+- **Exit rules**: percentage stop-loss, take-profit, and trailing stop. All produce per-trade records (with `reason='stop_loss'` / `'take_profit'` / `'trailing_stop_exit'`) in both execution modes
 - **Composable risk rules**: `CompositeRiskManager` with `MaxDrawdownHalt`, `ExposureLimit`, `DailyLossLimit`, `ConcentrationLimit`
-- **Trailing stop loss**: `TrailingStopLoss` exit rule tracks price highs/lows and exits on pullback
 - **Agent-controlled risk**: MetaController adjusts stop-loss, take-profit, sizing, and signals per bar
-- **Stop-loss trade attribution (v1.9.7)**: vectorized stop-loss exits now emit per-trade records (`Trade(reason='stop_loss')` with the correct exit price), no longer folded silently into the equity curve
 
 ### Parameter Optimization
 - **Grid search**: `optimize()` with walk-forward validation
@@ -66,16 +75,10 @@ AIphaForge also works perfectly well as a general-purpose backtest framework for
 ### Statistical Significance Testing
 - **Bootstrap CI**: `bootstrap_ci()` / `bootstrap_metrics()` — stationary block bootstrap (Politis-Romano) for Sharpe, drawdown, and custom metrics
 - **Permutation test**: `permutation_test()` — shuffle signal timing to test alpha significance (Phipson-Smyth corrected p-values)
-- **PSR / DSR (v1.9.5)**: `probabilistic_sharpe_ratio()` and `deflated_sharpe_ratio()` — Bailey & López de Prado significance tests with Pearson kurtosis adjustment
+- **PSR / DSR**: `probabilistic_sharpe_ratio()` and `deflated_sharpe_ratio()` — Bailey & López de Prado significance tests with Pearson kurtosis adjustment
 - **Monte Carlo simulation**: `monte_carlo_test()` — generate synthetic market paths, run strategy/agent on each to test robustness
 - **Multiple comparison correction**: `multiple_comparison_correction()` — Bonferroni, Benjamini-Hochberg, or Model Confidence Set (optional `arch` dependency)
 - **Path generation**: `generate_paths()` — block bootstrap or parametric normal synthetic OHLCV data
-
-### Per-Symbol Annualization (v1.9.5)
-- `BacktestEngine(trading_days=...)` accepts a scalar (252 / 365 / etc.) or a per-symbol dict
-- Mixed-asset portfolios (e.g. AAPL + BTC-USD) annualise per-asset metrics correctly; portfolio-level requires an explicit `portfolio_trading_days` (no silent auto-infer — a single scalar cannot be objectively chosen for stocks+crypto)
-- `BacktestResult.per_asset_metrics` is now populated on every multi-asset run (previously declared but never set)
-- *Compatibility*: default `trading_days=252` reproduces v1.9.4 numbers exactly. Pickle compatibility across versions is **not** guaranteed — `BacktestResult` gained `trading_days` / `per_asset_trading_days` fields in v1.9.5 and `symbols` is now reliably populated for single-asset runs in v1.9.7. Use `result.to_dict()` + JSON for long-term persistence.
 
 ### Market Impact & Capacity
 - **Market impact models**: `LinearImpactModel`, `SquareRootImpactModel` (Almgren-Chriss with permanent impact), `PowerLawImpactModel` — pluggable via `BaseImpactModel` ABC
@@ -90,40 +93,11 @@ AIphaForge also works perfectly well as a general-purpose backtest framework for
 - **Corporate actions**: `CorporateActionHook` for dividends and stock splits
 
 ### Performance Analysis
-- 30+ metrics: Sharpe, Sortino, Calmar, max drawdown, VaR, CVaR, profit factor, and more
-- Monthly/yearly return breakdowns, multi-strategy comparison
-- Custom benchmark comparison (or automatic buy-and-hold)
-- Per-asset analysis with correlation matrix
-
-## Release Notes
-
-Most recent first. Each release shipped through multi-round review;
-see commit history for detail.
-
-### v1.9.8 — End-hook exception policy refinement
-Fixes a v1.9.7 over-broad suppression: end-hook exceptions in the **success path** were silently swallowed, hiding hook bugs. Now suppression only applies when a primary engine exception is in flight (preserving its traceback). On the success path, end-hook exceptions propagate normally so a buggy hook fails visibly.
-
-### v1.9.7 — Vectorized honesty + edge-case cleanup
-A small follow-up to v1.9.6 closing 10 demo-discovered correctness gaps. No new public features; existing APIs preserved.
-
-- **Vectorized warning loop**: `BacktestEngine` now warns when `mode='vectorized'` is given config it silently ignores — `position_sizing` / `position_size` (composite warning), `take_profit`, `trailing_stop_rule`, `impact_model`, `margin_config`, `periodic_cost_model`. Default vectorized usage emits zero warnings. Switch to `mode='event_driven'` to honor any of these.
-- **Single-asset `BacktestResult.symbols` populated**: was `[]` for single-asset runs (only multi-asset set it), which silently broke any consumer that read the field. `_build_result` now sets it from `config.symbols`. Removes the v1.9.6 `market_impact.estimate_capacity` fallback workaround (kept as defense-in-depth for custom cores).
-- **Event-driven try/finally end-hook**: `on_backtest_end` now fires even when the main loop raises mid-run, matching vectorized's symmetry. Hooks holding open file handles, sockets, or pending `LatencyHook` queues no longer leak on a crash. A `started_hooks` flag gates the end-call so a start that itself raised does not trigger an unmatched end.
-- **Periodic cost loop perf**: iterate `active` symbols only (mixed-frequency multi-asset no longer pays O(timeline × N_symbols) cost-model calls). Numerically identical (cost is linear in `bar_seconds`); just fewer calls.
-- **Bar-0 signal in `extract_trades_vectorized`**: pre-existing engine bug surfaced by v1.9.7 review — `pos_diff.iloc[0]` is always NaN, so a non-zero `positions.iloc[0]` was invisible to the loop and the next non-zero diff was misinterpreted as opening a fresh trade in the wrong direction. Empirical: `signals=[1,1,0,0,1,1,0]` produced phantom short + missing long, sum_pnl off by ~$4000. Fixed by priming `entry_time` from `positions.iloc[0]`.
-- **Vectorized stop-loss visible in trades**: stop-loss exits no longer silently absent from the vectorized trade list. `PercentageStopLoss.apply_vectorized` gains a keyword-only `return_mask` parameter (default `False` — preserves single-Series contract for any user subclass). When wired, `extract_trades_vectorized` uses a segment-based reconstruction to emit `Trade(reason='stop_loss')` entries with `exit_price = entry_price * (1 - threshold * direction)` matching the engine's stop math. Reversal segments preserved. No-stop-loss path falls through to the v1.9.6 in-loop implementation byte-identically.
-
-### v1.9.6 — Engine stability release
-A focused round of correctness fixes covering 10 long-standing bugs found in an engine-wide audit. No new features; existing public APIs are preserved.
-
-- **Hook lifecycle (B1, B2, R5)**: `on_backtest_start` and `on_backtest_end` now both fire **once per backtest** (previously start fired per-symbol while end fired once) and receive a `LifecycleContext` with `phase`, `symbols`, `data_dict`, `primary_symbol`, and `primary_data`. Pre-v1.9.6 subclasses that use the legacy `(data, symbol, *, config)` signature still work via a backward-compat adapter that emits a one-time `DeprecationWarning` per subclass. Vectorized mode now also fires the lifecycle callbacks (previously skipped entirely).
-- **Vectorized cumprod safety (B6)**: `net_returns` is clipped at -1.0 and equity is frozen at 0 once bankruptcy is detected; pathological costs / tiny capital can no longer flip the cumprod sign and produce nonsensical positive equity.
-- **Vectorized trade reconstruction (Q1, Q3)**: `Trade.size` from a vectorized run now means **shares** (`entry_equity * position_size / entry_price`), not signal magnitude. `Trade.pnl` no longer double-deducts commission + slippage — it is now a linear path-independent approximation that matches the geometric equity curve to machine epsilon for single-trade no-fee cases. See `Trade.__doc__` for the full discrepancy contract.
-- **Risk API (B3)**: `BacktestEngine(risk_manager=CompositeRiskManager(...))` no longer crashes — `CompositeRiskManager` now inherits `BaseRiskManager`. Passing both `risk_manager=` and `risk_rules=` simultaneously raises `ValueError` instead of silently picking one.
-- **Data validation (B5)**: `validate_ohlcv(level='strict')` now rejects non-finite (`inf` / `-inf`) and non-positive (`<= 0`) prices. Volume of `0` remains valid.
-- **Time-aware borrowing cost (Q2)**: `BorrowingCostModel` now uses the engine-derived `bar_seconds`; hourly bars correctly charge `daily_rate / 24` rather than a full day's interest. `days_per_year` is exposed on the constructor (365 / 360 / 252). `FundingRateModel` ignores `bar_seconds` by design (its rate is already per-bar).
-- **Impact model guards (Q4)**: `LinearImpactModel`, `SquareRootImpactModel`, and `PowerLawImpactModel` early-return 0 when `order_size <= 0` (previously the square-root model raised on `math.sqrt(<0)`).
-- **Metadata lock (S1)**: `aiphaforge.__version__` is now CI-locked to match `pyproject.toml` via `tests/test_metadata.py`.
+- **30+ metrics**: Sharpe, Sortino, Calmar, max drawdown, VaR, CVaR, profit factor, win rate, and more
+- **Per-symbol annualization**: `trading_days=` accepts a scalar (252 / 365) or a per-symbol dict; mixed-asset portfolios (e.g. AAPL + BTC-USD) annualise per-asset metrics correctly
+- **Per-asset attribution**: `BacktestResult.per_asset_metrics` on every multi-asset run, with correlation matrix
+- **Breakdowns**: monthly / yearly return tables, multi-strategy comparison
+- **Benchmark overlay**: custom series or automatic buy-and-hold
 
 ## Quick Start
 
@@ -279,7 +253,7 @@ Optional dependencies:
 pip install aiphaforge[plot]          # matplotlib for visualization
 pip install aiphaforge[data]          # yfinance for data loading
 pip install aiphaforge[optimize]      # optuna for Bayesian optimization
-pip install aiphaforge[significance]  # arch for Model Confidence Set
+pip install aiphaforge[significance]  # scipy (PSR / DSR) + arch (Model Confidence Set)
 pip install aiphaforge[portfolio]     # scipy for portfolio optimization
 pip install aiphaforge[all]           # everything
 ```
