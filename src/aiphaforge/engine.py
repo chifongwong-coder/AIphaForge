@@ -7,7 +7,7 @@ Main backtest executor supporting both vectorized and event-driven modes.
 import warnings
 from datetime import time
 from enum import Enum
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -770,6 +770,12 @@ class BacktestEngine:
         Vectorized mode skips on_pre_signal and on_bar (no broker /
         portfolio is constructed), but lifecycle hooks fire so that
         users with stateful hooks (resets, dashboards, etc.) get called.
+
+        For phase='end', each hook call is wrapped in try/except so
+        a buggy end-hook cannot mask the primary engine exception
+        (Python's try/finally re-raise semantics would otherwise lose
+        the original RuntimeError from run_vectorized). Symmetric with
+        the event-driven core (core_event_driven.py finally block).
         """
         if not config.hooks:
             return
@@ -788,7 +794,18 @@ class BacktestEngine:
         )
         dispatch = call_hook_lifecycle_start if phase == "start" else call_hook_lifecycle_end
         for hook in config.hooks:
-            dispatch(hook, ctx)
+            if phase == "end":
+                try:
+                    dispatch(hook, ctx)
+                except Exception as exc:
+                    warnings.warn(
+                        f"on_backtest_end raised on "
+                        f"{type(hook).__name__}: {exc!r}. "
+                        f"Suppressed so any primary exception "
+                        f"propagates; original is still in __context__."
+                    )
+            else:
+                dispatch(hook, ctx)
 
     @staticmethod
     def _merge_vectorized_results(
@@ -877,6 +894,62 @@ class BacktestEngine:
 
     # ========== Config and Result Building ==========
 
+    # Fields the vectorized core silently ignores. Names are the kwargs
+    # of __init__ (so we can read defaults via inspect.signature). The
+    # `position_sizing` and `position_size` pair is handled jointly.
+    # Note: vectorized DOES honor stop_loss (via stop_loss_rule),
+    # risk_rules (via apply_vectorized_all), trade_cost (apply_vectorized),
+    # signal_transform, and allow_short. Everything else listed here is
+    # silently dropped — surface that to the user.
+    _VECTORIZED_UNSUPPORTED_FIELDS: Tuple[str, ...] = (
+        "take_profit",
+        "trailing_stop_rule",
+        "impact_model",
+        "margin_config",
+        "periodic_cost_model",
+        "turnover_config",
+        "risk_manager",
+    )
+
+    def _warn_vectorized_unsupported(self) -> None:
+        """Warn when vectorized mode is given config it silently ignores.
+
+        Reads field defaults from __init__'s signature so this stays
+        in sync if someone changes the kwarg defaults later. The
+        (position_sizing, position_size) pair is treated as one
+        composite warning (a user changing one usually changes the
+        other together — no need to fire twice).
+        """
+        import inspect
+        init_defaults = {
+            name: param.default
+            for name, param in
+            inspect.signature(BacktestEngine.__init__).parameters.items()
+            if param.default is not inspect.Parameter.empty
+        }
+
+        # Composite (position_sizing, position_size) warning.
+        ps_def = init_defaults.get("position_sizing")
+        sz_def = init_defaults.get("position_size")
+        if (self.position_sizing != ps_def
+                or self.position_size != sz_def):
+            warnings.warn(
+                "vectorized mode takes positions directly from signals; "
+                f"(position_sizing={self.position_sizing}, "
+                f"position_size={self.position_size}) is ignored. "
+                "Switch to mode='event_driven' to honor sizing config."
+            )
+
+        # Per-field warnings for the rest.
+        for field in self._VECTORIZED_UNSUPPORTED_FIELDS:
+            default = init_defaults.get(field)
+            value = getattr(self, field, default)
+            if value != default:
+                warnings.warn(
+                    f"vectorized mode ignores {field}={value!r}; "
+                    "switch to mode='event_driven' to honor it."
+                )
+
     def _build_config(
         self,
         benchmark: Optional[pd.Series] = None,
@@ -891,6 +964,13 @@ class BacktestEngine:
             benchmark_type: Run-time benchmark_type override.
             symbols: List of symbols for this run.
         """
+        # v1.9.7: warn if vectorized mode + non-default unsupported config.
+        # Vectorized core only honors a subset of engine config; the rest
+        # are silently dropped today. Surface these explicitly so users
+        # don't get misleading "I set X but nothing changed" results.
+        if self.mode == ExecutionMode.VECTORIZED:
+            self._warn_vectorized_unsupported()
+
         return BacktestConfig(
             initial_capital=self.initial_capital,
             fee_model=self.fee_model,
@@ -1015,6 +1095,15 @@ class BacktestEngine:
         # and populates per_asset_metrics after _build_result returns.
         result.trading_days = self._portfolio_trading_days
         result.per_asset_trading_days = dict(self._resolved_per_asset_td)
+
+        # v1.9.7: populate result.symbols. Pre-fix this was empty for
+        # single-asset runs (only multi-asset set it via _run_multi),
+        # which silently broke any consumer that read result.symbols
+        # (e.g. market_impact.estimate_capacity). config.symbols is set
+        # in _build_config from the caller's symbols list, so it's
+        # reliable for both single- and multi-asset paths.
+        if config is not None and config.symbols:
+            result.symbols = list(config.symbols)
 
         return result
 

@@ -375,12 +375,10 @@ def estimate_capacity(
     if capital_multipliers is None:
         capital_multipliers = [1.0, 2.0, 5.0, 10.0, 20.0, 50.0]
 
-    # Normalise data to dict form. For single-asset runs the engine
-    # leaves result.symbols == [], so we fall back to the first trade's
-    # symbol — otherwise data_dict's key would be "default" while the
-    # trades carry their real symbol, the per-symbol adv/vol lookup
-    # would miss, and every capacity bucket would silently report 0
-    # impact regardless of AUM.
+    # Normalise data to dict form. v1.9.7 made result.symbols reliable
+    # for single-asset runs (was the v1.9.6 capacity-fallback workaround).
+    # The result.trades[0] branch stays as defense-in-depth for any
+    # custom core that produces a result with empty symbols.
     if isinstance(data, pd.DataFrame):
         if result.symbols:
             sym = result.symbols[0]

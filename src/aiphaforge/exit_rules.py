@@ -57,7 +57,9 @@ class PercentageStopLoss(BaseExitRule):
         returns: pd.Series,
         positions: pd.Series,
         data: pd.DataFrame,
-    ) -> pd.Series:
+        *,
+        return_mask: bool = False,
+    ):
         """Per-position vectorized stop loss.
 
         When the cumulative PnL from the entry price breaches the stop-loss
@@ -66,6 +68,18 @@ class PercentageStopLoss(BaseExitRule):
           (the actual loss to reach the stop level).
         - After the trigger bar: positions are flat (returns are 0) until
           the next entry signal appears.
+
+        Parameters:
+            returns: Per-bar strategy returns to clamp.
+            positions: Position series for the same index.
+            data: OHLCV DataFrame; ``close`` is consulted for prices.
+            return_mask: If True, return a 4-tuple
+                ``(returns_with_stop, trigger_mask, entry_prices, threshold)``
+                so callers (e.g. ``extract_trades_vectorized``) can emit
+                stop_loss Trade entries with the correct exit price.
+                Default ``False`` preserves the legacy single-Series
+                return so existing user subclasses / direct callers
+                are unaffected.
         """
         close = data['close']
 
@@ -119,6 +133,8 @@ class PercentageStopLoss(BaseExitRule):
         after_trigger = stopped_out & ~trigger_bars
         returns_with_stop[after_trigger] = 0
 
+        if return_mask:
+            return returns_with_stop, trigger_bars, entry_prices, self.threshold
         return returns_with_stop
 
     def check_event_driven(

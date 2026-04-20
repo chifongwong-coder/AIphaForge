@@ -497,6 +497,7 @@ def extract_trades_vectorized(
     fee_model: Any,
     initial_capital: float,
     symbol: str = "default",
+    stop_loss_info: Optional[tuple] = None,
 ) -> List[Any]:
     """Extract trade records from vectorized backtest results.
 
@@ -511,6 +512,14 @@ def extract_trades_vectorized(
         fee_model: Fee model instance (used to estimate trade costs).
         initial_capital: Starting capital.
         symbol: Instrument symbol.
+        stop_loss_info: Optional ``(trigger_mask, entry_prices, threshold)``
+            tuple from ``PercentageStopLoss.apply_vectorized(..., return_mask=True)``.
+            When provided, the function uses a segment-based reconstruction
+            that emits ``Trade(reason='stop_loss')`` entries with the
+            correct stop exit price; reversal segments are preserved.
+            When None (default), falls through to the legacy in-loop
+            implementation that v1.9.6 shipped (preserves numerical
+            contract for the no-stop-loss case).
 
     Returns:
         List of Trade objects.
@@ -518,9 +527,26 @@ def extract_trades_vectorized(
     # Import here to avoid circular dependency
     from .results import Trade
 
+    # v1.9.7 commit 7b: segment-based path when stop_loss is wired.
+    if stop_loss_info is not None:
+        trigger_mask, entry_prices, threshold = stop_loss_info
+        if trigger_mask is not None and trigger_mask.any():
+            return _extract_trades_with_stop_loss(
+                data, positions, equity, initial_capital, symbol,
+                trigger_mask, entry_prices, threshold,
+            )
+        # else: stop_loss was wired but never triggered → fall through
+        # to legacy path (identical behavior).
+
     trades: List[Any] = []
 
-    # Find position change points
+    # Find position change points.
+    # NOTE: pos_diff.iloc[0] is always NaN (pandas .diff() semantics).
+    # Without bar-0 priming below, a non-zero positions.iloc[0] would
+    # be invisible to this loop, and the next non-zero diff (which
+    # actually CLOSES the bar-0 position) would be misinterpreted as
+    # opening a fresh position in the wrong direction. v1.9.7 fix:
+    # prime entry_time from positions.iloc[0] before walking entries.
     pos_diff = positions.diff()
     entries = pos_diff[pos_diff != 0].dropna()
 
@@ -529,6 +555,14 @@ def extract_trades_vectorized(
     entry_direction = None
     entry_size = None
     trade_id = 0
+
+    # v1.9.7 bar-0 priming: if the strategy emits a non-zero position
+    # at bar 0, treat it as an open at bar 0 with size = |positions[0]|.
+    if len(positions) > 0 and positions.iloc[0] != 0:
+        entry_time = positions.index[0]
+        entry_price = data.loc[entry_time, 'close']
+        entry_direction = 1 if positions.iloc[0] > 0 else -1
+        entry_size = abs(positions.iloc[0])
 
     for idx, change in entries.items():
         price = data.loc[idx, 'close']
@@ -597,6 +631,151 @@ def extract_trades_vectorized(
                 else:
                     entry_time = None
 
+    return trades
+
+
+def _extract_trades_with_stop_loss(
+    data: pd.DataFrame,
+    positions: pd.Series,
+    equity: pd.Series,
+    initial_capital: float,
+    symbol: str,
+    trigger_mask: pd.Series,
+    entry_prices: pd.Series,
+    threshold: float,
+) -> List[Any]:
+    """Segment-based trade reconstruction that emits stop_loss exits.
+
+    Pre-computes (entry, close, direction, size, close_kind) tuples by
+    walking pos_diff once, then truncates each segment by the first
+    in-segment stop trigger. Reversal segments preserve the next
+    segment's open bar (the stop only truncates THIS segment's close).
+    Stop_loss exit price uses the formula from
+    ``PercentageStopLoss.apply_vectorized``: ``entry_price * (1 -
+    threshold * direction)``.
+
+    See plan v3 R1 for why this is segment-based rather than retrofit
+    into the in-loop state machine of ``extract_trades_vectorized``.
+    """
+    import numpy as np
+
+    from .results import Trade
+
+    trades: List[Any] = []
+
+    # ---- Pre-compute segments by walking pos_diff -----------------
+    pos_diff = positions.diff()
+    entries = pos_diff[pos_diff != 0].dropna()
+
+    # bar-0 priming (mirrors the v1.9.7 commit 7a fix in the legacy path)
+    segments: List[tuple] = []  # (entry_bar, direction, size, close_bar, close_kind)
+    current = None  # (entry_bar, direction, size)
+    if len(positions) > 0 and positions.iloc[0] != 0:
+        current = (positions.index[0],
+                   1 if positions.iloc[0] > 0 else -1,
+                   abs(positions.iloc[0]))
+
+    for idx, change in entries.items():
+        if current is None:
+            if change != 0:
+                current = (idx, 1 if change > 0 else -1,
+                           abs(positions.loc[idx]))
+        else:
+            new_pos = positions.loc[idx]
+            if new_pos == 0:
+                segments.append((*current, idx, "flat"))
+                current = None
+            elif np.sign(new_pos) != current[1]:
+                segments.append((*current, idx, "reversal"))
+                current = (idx, 1 if new_pos > 0 else -1,
+                           abs(new_pos))
+            # else: same direction, size change; mirror legacy
+            # close-and-reopen behavior
+            elif new_pos != current[2]:
+                segments.append((*current, idx, "flat"))
+                current = (idx, 1 if new_pos > 0 else -1,
+                           abs(new_pos))
+
+    # If a position is still open at end-of-data, include it as a
+    # candidate segment ONLY if a stop fires within (so we can emit
+    # the stop_loss trade). Without this, an open-at-end position with
+    # an in-segment stop is silently dropped — bug surfaced by the
+    # bar-0 + stop-loss test.
+    # Open positions that don't hit a stop remain unrepresented, which
+    # matches the legacy in-loop path (no trade emitted for never-
+    # closed positions).
+    if current is not None:
+        end_bar = positions.index[-1]
+        seg_stops = trigger_mask[(trigger_mask.index > current[0])
+                                  & (trigger_mask.index <= end_bar)
+                                  & trigger_mask]
+        if not seg_stops.empty:
+            segments.append((*current, end_bar, "open"))
+
+    # ---- Truncate segments by stop triggers -----------------------
+    truncated: List[tuple] = []
+    for entry_bar, direction, size_signal, close_bar, close_kind in segments:
+        # Stops fire strictly between (entry_bar, close_bar) for natural
+        # closes — at entry there's no PnL yet, at close the natural
+        # close already exits. For "open" segments (no natural close),
+        # include the end_bar in the search since nothing else can take
+        # precedence at that bar.
+        if close_kind == "open":
+            seg_mask = trigger_mask[(trigger_mask.index > entry_bar)
+                                    & (trigger_mask.index <= close_bar)
+                                    & trigger_mask]
+        else:
+            seg_mask = trigger_mask[(trigger_mask.index > entry_bar)
+                                    & (trigger_mask.index < close_bar)
+                                    & trigger_mask]
+        if not seg_mask.empty:
+            stop_bar = seg_mask.index[0]
+            truncated.append(
+                (entry_bar, direction, size_signal, stop_bar, "stop_loss"))
+        elif close_kind == "open":
+            # Open at end with no stop — drop (matches legacy behavior).
+            continue
+        else:
+            truncated.append(
+                (entry_bar, direction, size_signal, close_bar, close_kind))
+
+    # ---- Emit Trade objects ---------------------------------------
+    trade_id = 0
+    for entry_bar, direction, size_signal, close_bar, close_kind in truncated:
+        entry_price = data.loc[entry_bar, 'close']
+        entry_equity = (
+            equity.loc[entry_bar] if entry_bar in equity.index
+            else initial_capital
+        )
+        if entry_price <= 0 or entry_equity <= 0:
+            continue
+        shares = entry_equity * size_signal / entry_price
+        if shares <= 0:
+            continue
+
+        if close_kind == "stop_loss":
+            # Match apply_vectorized:112 exactly
+            exit_price = entry_price * (1 - threshold * direction)
+            reason = "stop_loss"
+        else:  # "flat" or "reversal"
+            exit_price = data.loc[close_bar, 'close']
+            reason = "signal"
+
+        pnl = direction * (exit_price - entry_price) * shares
+        trade_id += 1
+        trades.append(Trade(
+            trade_id=f"VT{trade_id:04d}",
+            symbol=symbol,
+            direction=direction,
+            entry_time=entry_bar,
+            exit_time=close_bar,
+            entry_price=entry_price,
+            exit_price=exit_price,
+            size=shares,
+            pnl=pnl,
+            pnl_pct=(exit_price / entry_price - 1) * direction,
+            reason=reason,
+        ))
     return trades
 
 

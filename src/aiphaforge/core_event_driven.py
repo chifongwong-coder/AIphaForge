@@ -157,6 +157,7 @@ def run_event_driven(
 
     # --- Notify hooks: backtest start (once per backtest, symmetric with end) ---
     sorted_symbols = sorted(symbols)
+    started_hooks = False  # v1.9.7: only fire end if start succeeded
     if config.hooks:
         primary_sym = sorted_symbols[0]
         primary_data = data_dict[primary_sym]
@@ -171,500 +172,539 @@ def run_event_driven(
         )
         for hook in config.hooks:
             call_hook_lifecycle_start(hook, start_ctx)
+        started_hooks = True
 
-    # --- Per-symbol last-cost-timestamp (Q2: time-aware borrowing cost).
-    # Initialised to the first bar each symbol has data on; the periodic
-    # cost loop computes bar_seconds = (timestamp - last_cost_ts[sym]).
-    last_cost_timestamp: Dict[str, pd.Timestamp] = {}
-    for sym in symbols:
-        df = data_dict[sym]
-        if len(df) > 0:
-            last_cost_timestamp[sym] = df.index[0]
+    # v1.9.7: wrap setup + main loop + end-hook in try/finally so the
+    # end-hook fires even if the engine raises mid-run. Matches the
+    # vectorized engine's symmetry (engine.py wraps run_vectorized in
+    # try/finally). Hooks holding open file handles, sockets, or
+    # pending LatencyHook queues no longer leak on a crash.
+    try:
 
-    # --- Build exit rules list ---
-    exit_rules = [r for r in [config.stop_loss_rule,
-                               config.take_profit_rule,
-                               config.trailing_stop_rule] if r is not None]
+        # --- Per-symbol last-cost-timestamp (Q2: time-aware borrowing cost).
+        # Initialised to the first bar each symbol has data on; the periodic
+        # cost loop computes bar_seconds = (timestamp - last_cost_ts[sym]).
+        last_cost_timestamp: Dict[str, pd.Timestamp] = {}
+        for sym in symbols:
+            df = data_dict[sym]
+            if len(df) > 0:
+                last_cost_timestamp[sym] = df.index[0]
 
-    # --- Reset risk rules for this run ---
-    if config.risk_rules:
-        config.risk_rules.reset()
+        # --- Build exit rules list ---
+        exit_rules = [r for r in [config.stop_loss_rule,
+                                   config.take_profit_rule,
+                                   config.trailing_stop_rule] if r is not None]
 
-    # --- MetaContext lifecycle (v1.2) ---
-    current_strategy = strategy
-    meta: Optional[MetaContext] = (
-        MetaContext(config, strategy=current_strategy,
-                    all_symbols=symbols,
-                    initial_universe=config.initial_universe)
-        if config.hooks or config.initial_universe is not None
-        else None
-    )
+        # --- Reset risk rules for this run ---
+        if config.risk_rules:
+            config.risk_rules.reset()
 
-    # ===================================================================
-    # Main event loop
-    # ===================================================================
-    ctx = None  # HookContext, built per-bar when hooks are present
-    for idx, timestamp in enumerate(timeline):
-        active = sorted(
-            [s for s in symbols if timestamp in bar_avail[s]]
+        # --- MetaContext lifecycle (v1.2) ---
+        current_strategy = strategy
+        meta: Optional[MetaContext] = (
+            MetaContext(config, strategy=current_strategy,
+                        all_symbols=symbols,
+                        initial_universe=config.initial_universe)
+            if config.hooks or config.initial_universe is not None
+            else None
         )
 
-        # 1. Update prices (forward-fill for inactive assets)
-        prices: Dict[str, float] = {}
-        for sym in symbols:
-            if sym in active:
-                prices[sym] = float(
-                    data_dict[sym].loc[timestamp, 'close'])
-                last_known[sym] = prices[sym]
-            else:
-                prices[sym] = last_known[sym]
-        portfolio.update_prices(prices, timestamp, record=False)
+        # ===================================================================
+        # Main event loop
+        # ===================================================================
+        ctx = None  # HookContext, built per-bar when hooks are present
+        for idx, timestamp in enumerate(timeline):
+            active = sorted(
+                [s for s in symbols if timestamp in bar_avail[s]]
+            )
 
-        # 1.5 Update broker liquidity data for market impact (v1.9.4)
-        if config.impact_model is not None:
-            for sym in active:
-                idx_loc = data_dict[sym].index.get_loc(timestamp)
-                brokers[sym]._adv = float(
-                    precomputed_adv[sym].iloc[idx_loc])
-                brokers[sym]._volatility = float(
-                    precomputed_vol[sym].iloc[idx_loc])
-
-        # Reset per-bar realized PnL tracker
-        if pnl_tracker is not None:
+            # 1. Update prices (forward-fill for inactive assets)
+            prices: Dict[str, float] = {}
             for sym in symbols:
-                pnl_tracker['bar_realized'][sym] = 0.0
+                if sym in active:
+                    prices[sym] = float(
+                        data_dict[sym].loc[timestamp, 'close'])
+                    last_known[sym] = prices[sym]
+                else:
+                    prices[sym] = last_known[sym]
+            portfolio.update_prices(prices, timestamp, record=False)
 
-        # 2. Process pending orders (per active symbol)
-        for sym in active:
-            bar = data_dict[sym].loc[timestamp]
-            filled = brokers[sym].process_bar(bar, timestamp, sym)
-            for order in filled:
-                trade = portfolio.update_from_order(order, timestamp)
-                if trade and pnl_tracker is not None:
-                    pnl_tracker['bar_realized'][sym] = (
-                        pnl_tracker['bar_realized'].get(sym, 0.0)
-                        + trade.pnl + trade.commission
-                        + trade.slippage_cost
-                    )
+            # 1.5 Update broker liquidity data for market impact (v1.9.4)
+            if config.impact_model is not None:
+                for sym in active:
+                    idx_loc = data_dict[sym].index.get_loc(timestamp)
+                    brokers[sym]._adv = float(
+                        precomputed_adv[sym].iloc[idx_loc])
+                    brokers[sym]._volatility = float(
+                        precomputed_vol[sym].iloc[idx_loc])
 
-        # 2.5. Risk rules check (portfolio-level)
-        suppress_new_orders = False
-        if config.risk_rules:
-            risk_signals = config.risk_rules.check_all(
-                portfolio, prices, timestamp)
-            for sig in risk_signals:
-                if sig.severity == 'critical':
-                    if sig.action == 'reject_new':
-                        suppress_new_orders = True
-                    elif sig.action == 'close_all':
-                        # Close all positions via existing broker infrastructure.
-                        # Orders are GTC — fill at next bar's open (same as
-                        # margin call behavior). Dedup: skip if margin call
-                        # already active.
-                        if not portfolio.is_margin_call:
-                            for sym, pos in portfolio.positions.items():
-                                if pos.is_flat or sym not in brokers:
-                                    continue
-                                side = "sell" if pos.is_long else "buy"
-                                order = brokers[sym].create_market_order(
-                                    sym, side, abs(pos.size),
-                                    "risk_close", timestamp)
-                                brokers[sym].submit_order(order, timestamp)
-                        suppress_new_orders = True
+            # Reset per-bar realized PnL tracker
+            if pnl_tracker is not None:
+                for sym in symbols:
+                    pnl_tracker['bar_realized'][sym] = 0.0
 
-        # 3. Exit rules (per active symbol)
-        # Use meta-overridden rules if available (persists across bars)
-        active_exit_rules = exit_rules
-        if meta is not None and (
-            'stop_loss_rule' in meta._overrides
-            or 'take_profit_rule' in meta._overrides
-            or 'trailing_stop_rule' in meta._overrides
-        ):
-            sl = meta._overrides.get(
-                'stop_loss_rule', config.stop_loss_rule)
-            tp = meta._overrides.get(
-                'take_profit_rule', config.take_profit_rule)
-            ts = meta._overrides.get(
-                'trailing_stop_rule', config.trailing_stop_rule)
-            active_exit_rules = [r for r in [sl, tp, ts] if r is not None]
-        for sym in active:
-            bar = data_dict[sym].loc[timestamp]
-            for rule in active_exit_rules:
-                rule.check_event_driven(
-                    portfolio, brokers[sym], sym, bar, timestamp)
-
-        # 3b. Portfolio-level exit rules (margin call, etc.)
-        if config.portfolio_exit_rules:
-            for rule in config.portfolio_exit_rules:
-                rule.check_portfolio(
-                    portfolio, brokers, symbols, prices, timestamp)
-
-        # 4. Hooks: on_pre_signal
-        pending_before_hooks: Dict[str, int] = {}
-        if config.hooks:
-            if meta is not None:
-                meta._strategy = current_strategy
-
+            # 2. Process pending orders (per active symbol)
             for sym in active:
-                pending_before_hooks[sym] = len(
-                    brokers[sym].get_pending_orders(sym))
+                bar = data_dict[sym].loc[timestamp]
+                filled = brokers[sym].process_bar(bar, timestamp, sym)
+                for order in filled:
+                    trade = portfolio.update_from_order(order, timestamp)
+                    if trade and pnl_tracker is not None:
+                        pnl_tracker['bar_realized'][sym] = (
+                            pnl_tracker['bar_realized'].get(sym, 0.0)
+                            + trade.pnl + trade.commission
+                            + trade.slippage_cost
+                        )
 
-            # Build secondary context for this bar (v1.3)
-            secondary_ctx = None
-            if sec_data:
-                secondary_ctx = {}
-                for tf_name, tf_assets in sec_data.items():
-                    bar_dict: Dict[str, Any] = {}
-                    data_dict_tf: Dict[str, Any] = {}
-                    for sym, df in tf_assets.items():
-                        sec_ts = sec_lookups[tf_name][sym].loc[timestamp]
-                        if pd.isna(sec_ts):
-                            bar_dict[sym] = None
-                            data_dict_tf[sym] = df.iloc[:0]
-                        else:
-                            bar_dict[sym] = df.loc[sec_ts]
-                            data_dict_tf[sym] = df.loc[:sec_ts]
-                    secondary_ctx[tf_name] = SecondaryTimeframe(
-                        bar_data=bar_dict, data=data_dict_tf)
+            # 2.5. Risk rules check (portfolio-level)
+            suppress_new_orders = False
+            if config.risk_rules:
+                risk_signals = config.risk_rules.check_all(
+                    portfolio, prices, timestamp)
+                for sig in risk_signals:
+                    if sig.severity == 'critical':
+                        if sig.action == 'reject_new':
+                            suppress_new_orders = True
+                        elif sig.action == 'close_all':
+                            # Close all positions via existing broker infrastructure.
+                            # Orders are GTC — fill at next bar's open (same as
+                            # margin call behavior). Dedup: skip if margin call
+                            # already active.
+                            if not portfolio.is_margin_call:
+                                for sym, pos in portfolio.positions.items():
+                                    if pos.is_flat or sym not in brokers:
+                                        continue
+                                    side = "sell" if pos.is_long else "buy"
+                                    order = brokers[sym].create_market_order(
+                                        sym, side, abs(pos.size),
+                                        "risk_close", timestamp)
+                                    brokers[sym].submit_order(order, timestamp)
+                            suppress_new_orders = True
 
-            if is_single:
-                sym0 = symbols[0]
-                ctx = HookContext(
-                    bar_index=idx,
-                    timestamp=timestamp,
-                    portfolio=portfolio,
-                    bar_data=data_dict[sym0].loc[timestamp],
-                    data=data_dict[sym0].loc[:timestamp],
-                    symbol=sym0,
-                    broker=brokers[sym0],
-                    meta=meta,
-                    secondary=secondary_ctx,
-                )
-            else:
-                ctx = HookContext(
-                    bar_index=idx,
-                    timestamp=timestamp,
-                    portfolio=portfolio,
-                    active_symbols=active,
-                    all_bar_data={s: data_dict[s].loc[timestamp]
-                                  for s in active},
-                    all_data={s: data_dict[s].loc[:timestamp]
-                              for s in symbols},
-                    all_brokers=brokers,
-                    meta=meta,
-                    secondary=secondary_ctx,
-                )
-            for hook in config.hooks:
-                hook.on_pre_signal(ctx)
+            # 3. Exit rules (per active symbol)
+            # Use meta-overridden rules if available (persists across bars)
+            active_exit_rules = exit_rules
+            if meta is not None and (
+                'stop_loss_rule' in meta._overrides
+                or 'take_profit_rule' in meta._overrides
+                or 'trailing_stop_rule' in meta._overrides
+            ):
+                sl = meta._overrides.get(
+                    'stop_loss_rule', config.stop_loss_rule)
+                tp = meta._overrides.get(
+                    'take_profit_rule', config.take_profit_rule)
+                ts = meta._overrides.get(
+                    'trailing_stop_rule', config.trailing_stop_rule)
+                active_exit_rules = [r for r in [sl, tp, ts] if r is not None]
+            for sym in active:
+                bar = data_dict[sym].loc[timestamp]
+                for rule in active_exit_rules:
+                    rule.check_event_driven(
+                        portfolio, brokers[sym], sym, bar, timestamp)
 
-        # 4.1 Apply MetaContext overrides (v1.2)
-        effective_config = config
-        meta_weight_override = False
-        if meta is not None:
-            # Audit enrichment: annotate new entries with bar context
-            if len(meta._audit) > meta._audit_cursor:
-                for entry in meta._audit[meta._audit_cursor:]:
-                    entry['timestamp'] = timestamp
-                    entry['equity'] = portfolio.total_equity
-                    entry['drawdown'] = portfolio.current_drawdown
-                meta._audit_cursor = len(meta._audit)
+            # 3b. Portfolio-level exit rules (margin call, etc.)
+            if config.portfolio_exit_rules:
+                for rule in config.portfolio_exit_rules:
+                    rule.check_portfolio(
+                        portfolio, brokers, symbols, prices, timestamp)
 
-            # Apply config overrides (sizing, stop-loss, etc.)
-            effective_config = meta._apply_overrides(config)
+            # 4. Hooks: on_pre_signal
+            pending_before_hooks: Dict[str, int] = {}
+            if config.hooks:
+                if meta is not None:
+                    meta._strategy = current_strategy
 
-            # Strategy swap or param change: regenerate signals
-            if meta._needs_regeneration:
-                current_strategy = meta._strategy
+                for sym in active:
+                    pending_before_hooks[sym] = len(
+                        brokers[sym].get_pending_orders(sym))
+
+                # Build secondary context for this bar (v1.3)
+                secondary_ctx = None
+                if sec_data:
+                    secondary_ctx = {}
+                    for tf_name, tf_assets in sec_data.items():
+                        bar_dict: Dict[str, Any] = {}
+                        data_dict_tf: Dict[str, Any] = {}
+                        for sym, df in tf_assets.items():
+                            sec_ts = sec_lookups[tf_name][sym].loc[timestamp]
+                            if pd.isna(sec_ts):
+                                bar_dict[sym] = None
+                                data_dict_tf[sym] = df.iloc[:0]
+                            else:
+                                bar_dict[sym] = df.loc[sec_ts]
+                                data_dict_tf[sym] = df.loc[:sec_ts]
+                        secondary_ctx[tf_name] = SecondaryTimeframe(
+                            bar_data=bar_dict, data=data_dict_tf)
+
                 if is_single:
-                    raw = current_strategy.generate_signals(
-                        data_dict[symbols[0]])
-                    signals_as_dict = {symbols[0]: raw.to_dict()}
-                else:
-                    new_sigs = current_strategy.generate_signals(
-                        data_dict)
-                    signals_as_dict = {
-                        sym: s.to_dict()
-                        for sym, s in new_sigs.items()
-                    }
-                meta._needs_regeneration = False
-
-            # Signal suppression (OR with risk rules -- risk always wins)
-            if meta._suppress:
-                suppress_new_orders = True
-
-            # Target weights override (only if not suppressed)
-            if meta._target_weights is not None:
-                if not suppress_new_orders:
-                    meta_weight_override = True
-                else:
-                    # Suppressed: discard one-shot weights (don't defer)
-                    meta._target_weights = None
-
-        # 4b. Process immediate IOC/FOK from hooks (track for turnover)
-        step_4b_fills: Dict[str, list] = {}
-        for sym in active:
-            bar = data_dict[sym].loc[timestamp]
-            immediate = brokers[sym].process_immediate_orders(
-                bar, timestamp, sym)
-            if immediate:
-                step_4b_fills[sym] = list(immediate)
-            for order in immediate:
-                trade = portfolio.update_from_order(order, timestamp)
-                if trade and pnl_tracker is not None:
-                    pnl_tracker['bar_realized'][sym] = (
-                        pnl_tracker['bar_realized'].get(sym, 0.0)
-                        + trade.pnl + trade.commission
-                        + trade.slippage_cost
+                    sym0 = symbols[0]
+                    ctx = HookContext(
+                        bar_index=idx,
+                        timestamp=timestamp,
+                        portfolio=portfolio,
+                        bar_data=data_dict[sym0].loc[timestamp],
+                        data=data_dict[sym0].loc[:timestamp],
+                        symbol=sym0,
+                        broker=brokers[sym0],
+                        meta=meta,
+                        secondary=secondary_ctx,
                     )
+                else:
+                    ctx = HookContext(
+                        bar_index=idx,
+                        timestamp=timestamp,
+                        portfolio=portfolio,
+                        active_symbols=active,
+                        all_bar_data={s: data_dict[s].loc[timestamp]
+                                      for s in active},
+                        all_data={s: data_dict[s].loc[:timestamp]
+                                  for s in symbols},
+                        all_brokers=brokers,
+                        meta=meta,
+                        secondary=secondary_ctx,
+                    )
+                for hook in config.hooks:
+                    hook.on_pre_signal(ctx)
 
-        # 4c. Close positions for symbols removed from universe (v1.9.2)
-        if meta is not None and meta._pending_removals:
-            for sym in list(meta._pending_removals):
-                if sym in brokers:
-                    # Cancel all pending orders first (prevent orphan fills)
-                    brokers[sym].cancel_all_orders(sym)
-                    # Close open position if any
-                    pos = portfolio.get_position(sym)
-                    if pos is not None and not pos.is_flat:
-                        _submit_order(sym, -pos.size, prices[sym],
-                                      brokers[sym], timestamp,
-                                      "universe_removal")
-            meta._pending_removals.clear()
+            # 4.1 Apply MetaContext overrides (v1.2)
+            effective_config = config
+            meta_weight_override = False
+            if meta is not None:
+                # Audit enrichment: annotate new entries with bar context
+                if len(meta._audit) > meta._audit_cursor:
+                    for entry in meta._audit[meta._audit_cursor:]:
+                        entry['timestamp'] = timestamp
+                        entry['equity'] = portfolio.total_equity
+                        entry['drawdown'] = portfolio.current_drawdown
+                    meta._audit_cursor = len(meta._audit)
 
-        # 5. Signal processing
-        equity = portfolio.total_equity
-        bar_turnover = 0.0
-        exempt_orders: Dict[str, tuple] = {}
+                # Apply config overrides (sizing, stop-loss, etc.)
+                effective_config = meta._apply_overrides(config)
 
-        if meta_weight_override:
-            # Weight override replaces normal signal processing.
-            # First: process any signal=0 closes from current signals
-            # (Phase 1 exempt — closes should always execute)
+                # Strategy swap or param change: regenerate signals
+                if meta._needs_regeneration:
+                    current_strategy = meta._strategy
+                    if is_single:
+                        raw = current_strategy.generate_signals(
+                            data_dict[symbols[0]])
+                        signals_as_dict = {symbols[0]: raw.to_dict()}
+                    else:
+                        new_sigs = current_strategy.generate_signals(
+                            data_dict)
+                        signals_as_dict = {
+                            sym: s.to_dict()
+                            for sym, s in new_sigs.items()
+                        }
+                    meta._needs_regeneration = False
+
+                # Signal suppression (OR with risk rules -- risk always wins)
+                if meta._suppress:
+                    suppress_new_orders = True
+
+                # Target weights override (only if not suppressed)
+                if meta._target_weights is not None:
+                    if not suppress_new_orders:
+                        meta_weight_override = True
+                    else:
+                        # Suppressed: discard one-shot weights (don't defer)
+                        meta._target_weights = None
+
+            # 4b. Process immediate IOC/FOK from hooks (track for turnover)
+            step_4b_fills: Dict[str, list] = {}
             for sym in active:
-                if meta is not None and meta._universe is not None \
-                        and sym not in meta._universe:
-                    continue
-                raw_sig = signals_as_dict[sym].get(
-                    timestamp, float('nan'))
-                if not pd.isna(raw_sig) and abs(raw_sig) < 1e-8:
-                    sc = _compute_size_change(
-                        raw_sig, portfolio, sym,
-                        data_dict[sym].loc[timestamp],
-                        effective_config, bar_index=idx,
-                        full_data=data_dict[sym])
-                    if abs(sc) > 0.001:
-                        _submit_order(sym, sc, prices[sym],
-                                      brokers[sym], timestamp,
-                                      "signal_flat")
-            # Then: apply target weights
-            for sym, weight in meta._target_weights.items():
-                if sym in brokers:
-                    _process_weight_rebalance(
-                        sym, weight, portfolio, brokers[sym],
-                        prices.get(sym, 0), timestamp, effective_config)
-            meta._target_weights = None  # one-shot
-        else:
-            # Normal four-phase signal processing (v0.9.1)
-            # Phase A: collect signals
-            current_signals: Dict[str, float] = {}
-            for sym in active:
-                if meta is not None and meta._universe is not None \
-                        and sym not in meta._universe:
-                    continue
-                raw_sig = signals_as_dict[sym].get(
-                    timestamp, float('nan'))
-                if pd.isna(raw_sig):
-                    continue
-                if config.signal_transform is not None:
-                    raw_sig = config.signal_transform(raw_sig)
+                bar = data_dict[sym].loc[timestamp]
+                immediate = brokers[sym].process_immediate_orders(
+                    bar, timestamp, sym)
+                if immediate:
+                    step_4b_fills[sym] = list(immediate)
+                for order in immediate:
+                    trade = portfolio.update_from_order(order, timestamp)
+                    if trade and pnl_tracker is not None:
+                        pnl_tracker['bar_realized'][sym] = (
+                            pnl_tracker['bar_realized'].get(sym, 0.0)
+                            + trade.pnl + trade.commission
+                            + trade.slippage_cost
+                        )
+
+            # 4c. Close positions for symbols removed from universe (v1.9.2)
+            if meta is not None and meta._pending_removals:
+                for sym in list(meta._pending_removals):
+                    if sym in brokers:
+                        # Cancel all pending orders first (prevent orphan fills)
+                        brokers[sym].cancel_all_orders(sym)
+                        # Close open position if any
+                        pos = portfolio.get_position(sym)
+                        if pos is not None and not pos.is_flat:
+                            _submit_order(sym, -pos.size, prices[sym],
+                                          brokers[sym], timestamp,
+                                          "universe_removal")
+                meta._pending_removals.clear()
+
+            # 5. Signal processing
+            equity = portfolio.total_equity
+            bar_turnover = 0.0
+            exempt_orders: Dict[str, tuple] = {}
+
+            if meta_weight_override:
+                # Weight override replaces normal signal processing.
+                # First: process any signal=0 closes from current signals
+                # (Phase 1 exempt — closes should always execute)
+                for sym in active:
+                    if meta is not None and meta._universe is not None \
+                            and sym not in meta._universe:
+                        continue
+                    raw_sig = signals_as_dict[sym].get(
+                        timestamp, float('nan'))
+                    if not pd.isna(raw_sig) and abs(raw_sig) < 1e-8:
+                        sc = _compute_size_change(
+                            raw_sig, portfolio, sym,
+                            data_dict[sym].loc[timestamp],
+                            effective_config, bar_index=idx,
+                            full_data=data_dict[sym])
+                        if abs(sc) > 0.001:
+                            _submit_order(sym, sc, prices[sym],
+                                          brokers[sym], timestamp,
+                                          "signal_flat")
+                # Then: apply target weights
+                for sym, weight in meta._target_weights.items():
+                    if sym in brokers:
+                        _process_weight_rebalance(
+                            sym, weight, portfolio, brokers[sym],
+                            prices.get(sym, 0), timestamp, effective_config)
+                meta._target_weights = None  # one-shot
+            else:
+                # Normal four-phase signal processing (v0.9.1)
+                # Phase A: collect signals
+                current_signals: Dict[str, float] = {}
+                for sym in active:
+                    if meta is not None and meta._universe is not None \
+                            and sym not in meta._universe:
+                        continue
+                    raw_sig = signals_as_dict[sym].get(
+                        timestamp, float('nan'))
                     if pd.isna(raw_sig):
                         continue
-                current_signals[sym] = raw_sig
+                    if config.signal_transform is not None:
+                        raw_sig = config.signal_transform(raw_sig)
+                        if pd.isna(raw_sig):
+                            continue
+                    current_signals[sym] = raw_sig
 
-            # Warn if hooks submitted orders AND signals are active
-            if config.hooks and current_signals:
-                for sym, sig in current_signals.items():
-                    if sym in pending_before_hooks:
-                        pending_now = len(
-                            brokers[sym].get_pending_orders(sym))
-                        if pending_now > pending_before_hooks.get(sym, 0):
-                            warnings.warn(
-                                f"Bar {idx}: hook submitted orders for "
-                                f"'{sym}' while signal={sig}. Both will "
-                                f"execute. Set signals to NaN if hooks "
-                                f"manage orders."
-                            )
+                # Warn if hooks submitted orders AND signals are active
+                if config.hooks and current_signals:
+                    for sym, sig in current_signals.items():
+                        if sym in pending_before_hooks:
+                            pending_now = len(
+                                brokers[sym].get_pending_orders(sym))
+                            if pending_now > pending_before_hooks.get(sym, 0):
+                                warnings.warn(
+                                    f"Bar {idx}: hook submitted orders for "
+                                    f"'{sym}' while signal={sig}. Both will "
+                                    f"execute. Set signals to NaN if hooks "
+                                    f"manage orders."
+                                )
 
-            # Phase 1: exempt close orders (signal=0 / weight=0)
-            # No lot rounding, no turnover cap -- user intent is "be flat".
-            non_zero_signals: Dict[str, float] = {}
-            for sym, sig in sorted(current_signals.items()):
-                if abs(sig) < 1e-8:
-                    if effective_config.is_weight_mode:
-                        sc = _compute_weight_change(
-                            sym, sig, portfolio, prices[sym],
-                            effective_config)
-                    else:
-                        bar = data_dict[sym].loc[timestamp]
-                        sc = _compute_size_change(
-                            sig, portfolio, sym, bar, effective_config,
-                            bar_index=idx, full_data=data_dict[sym])
-                    if abs(sc) > 0.001:
-                        exempt_orders[sym] = (sc, prices[sym])
-                else:
-                    non_zero_signals[sym] = sig
-
-            for sym, (sc, price) in sorted(exempt_orders.items()):
-                _submit_order(sym, sc, price, brokers[sym], timestamp,
-                              "signal_flat")
-
-            # Phase 2-4: skip new/adjust orders when risk rules suppress
-            pending: Dict[str, tuple] = {}
-            if not suppress_new_orders:
-                # Phase 2: compute all non-zero size_changes
-                if equity > 0:  # guard: skip if bankrupt
-                    if effective_config.is_weight_mode:
-                        for sym, w in sorted(non_zero_signals.items()):
+                # Phase 1: exempt close orders (signal=0 / weight=0)
+                # No lot rounding, no turnover cap -- user intent is "be flat".
+                non_zero_signals: Dict[str, float] = {}
+                for sym, sig in sorted(current_signals.items()):
+                    if abs(sig) < 1e-8:
+                        if effective_config.is_weight_mode:
                             sc = _compute_weight_change(
-                                sym, w, portfolio, prices[sym],
+                                sym, sig, portfolio, prices[sym],
                                 effective_config)
-                            if abs(sc) > 0.001:
-                                pending[sym] = (sc, prices[sym])
-                    else:
-                        budgets: Dict[str, Optional[float]] = {}
-                        if (non_zero_signals
-                                and effective_config.capital_allocator
-                                is not None):
-                            budgets = (
-                                effective_config.capital_allocator.allocate(
-                                    non_zero_signals, prices, portfolio,
-                                    effective_config))
-                        for sym, sig in sorted(non_zero_signals.items()):
+                        else:
                             bar = data_dict[sym].loc[timestamp]
                             sc = _compute_size_change(
-                                sig, portfolio, sym, bar,
-                                effective_config,
-                                bar_index=idx,
-                                full_data=data_dict[sym],
-                                budget=budgets.get(sym))
-                            if abs(sc) > 0.001:
-                                pending[sym] = (sc, prices[sym])
+                                sig, portfolio, sym, bar, effective_config,
+                                bar_index=idx, full_data=data_dict[sym])
+                        if abs(sc) > 0.001:
+                            exempt_orders[sym] = (sc, prices[sym])
+                    else:
+                        non_zero_signals[sym] = sig
 
-                # Phase 3: turnover enforcement
-                if (effective_config.turnover_config and pending
-                        and equity > 0):
-                    max_to = (
-                        effective_config.turnover_config
-                        .max_turnover_per_bar)
+                for sym, (sc, price) in sorted(exempt_orders.items()):
+                    _submit_order(sym, sc, price, brokers[sym], timestamp,
+                                  "signal_flat")
 
-                    # Hook IOC: track for reporting, warn if > 50% cap
-                    hook_to = sum(
-                        abs(o.filled_size * o.filled_price)
-                        for fills in step_4b_fills.values()
-                        for o in fills
-                    ) / equity
-                    if hook_to > max_to * 0.5:
-                        warnings.warn(
-                            f"Hook IOC turnover ({hook_to:.1%}) exceeds "
-                            f"50% of turnover cap ({max_to:.1%}).")
+                # Phase 2-4: skip new/adjust orders when risk rules suppress
+                pending: Dict[str, tuple] = {}
+                if not suppress_new_orders:
+                    # Phase 2: compute all non-zero size_changes
+                    if equity > 0:  # guard: skip if bankrupt
+                        if effective_config.is_weight_mode:
+                            for sym, w in sorted(non_zero_signals.items()):
+                                sc = _compute_weight_change(
+                                    sym, w, portfolio, prices[sym],
+                                    effective_config)
+                                if abs(sc) > 0.001:
+                                    pending[sym] = (sc, prices[sym])
+                        else:
+                            budgets: Dict[str, Optional[float]] = {}
+                            if (non_zero_signals
+                                    and effective_config.capital_allocator
+                                    is not None):
+                                budgets = (
+                                    effective_config.capital_allocator.allocate(
+                                        non_zero_signals, prices, portfolio,
+                                        effective_config))
+                            for sym, sig in sorted(non_zero_signals.items()):
+                                bar = data_dict[sym].loc[timestamp]
+                                sc = _compute_size_change(
+                                    sig, portfolio, sym, bar,
+                                    effective_config,
+                                    bar_index=idx,
+                                    full_data=data_dict[sym],
+                                    budget=budgets.get(sym))
+                                if abs(sc) > 0.001:
+                                    pending[sym] = (sc, prices[sym])
 
-                    signal_to = sum(
-                        abs(sc) * p for sc, p in pending.values()
-                    ) / equity
+                    # Phase 3: turnover enforcement
+                    if (effective_config.turnover_config and pending
+                            and equity > 0):
+                        max_to = (
+                            effective_config.turnover_config
+                            .max_turnover_per_bar)
 
-                    if signal_to > max_to and signal_to > 0:
-                        scale = max_to / signal_to
-                        pending = {
-                            sym: (sc * scale, p)
-                            for sym, (sc, p) in pending.items()
-                        }
+                        # Hook IOC: track for reporting, warn if > 50% cap
+                        hook_to = sum(
+                            abs(o.filled_size * o.filled_price)
+                            for fills in step_4b_fills.values()
+                            for o in fills
+                        ) / equity
+                        if hook_to > max_to * 0.5:
+                            warnings.warn(
+                                f"Hook IOC turnover ({hook_to:.1%}) exceeds "
+                                f"50% of turnover cap ({max_to:.1%}).")
 
-                # Phase 4: lot rounding + submit
-                for sym, (sc, price) in sorted(pending.items()):
-                    sc = _apply_lot_rounding(sc, sym, effective_config)
-                    if abs(sc) > 0.001:
-                        _submit_order(
-                            sym, sc, price, brokers[sym], timestamp)
-                        bar_turnover += abs(sc) * price
+                        signal_to = sum(
+                            abs(sc) * p for sc, p in pending.values()
+                        ) / equity
 
-        # Track turnover
-        exempt_to = sum(abs(sc) * p for sc, p in exempt_orders.values())
-        if equity > 0:
-            turnover_history.append(
-                (bar_turnover + exempt_to) / equity)
-        else:
-            turnover_history.append(0.0)
+                        if signal_to > max_to and signal_to > 0:
+                            scale = max_to / signal_to
+                            pending = {
+                                sym: (sc * scale, p)
+                                for sym, (sc, p) in pending.items()
+                            }
 
-        # 5b. Process immediate IOC/FOK from signals
-        for sym in active:
-            bar = data_dict[sym].loc[timestamp]
-            immediate = brokers[sym].process_immediate_orders(
-                bar, timestamp, sym)
-            for order in immediate:
-                trade = portfolio.update_from_order(order, timestamp)
-                if trade and pnl_tracker is not None:
-                    pnl_tracker['bar_realized'][sym] = (
-                        pnl_tracker['bar_realized'].get(sym, 0.0)
-                        + trade.pnl + trade.commission
-                        + trade.slippage_cost
+                    # Phase 4: lot rounding + submit
+                    for sym, (sc, price) in sorted(pending.items()):
+                        sc = _apply_lot_rounding(sc, sym, effective_config)
+                        if abs(sc) > 0.001:
+                            _submit_order(
+                                sym, sc, price, brokers[sym], timestamp)
+                            bar_turnover += abs(sc) * price
+
+            # Track turnover
+            exempt_to = sum(abs(sc) * p for sc, p in exempt_orders.values())
+            if equity > 0:
+                turnover_history.append(
+                    (bar_turnover + exempt_to) / equity)
+            else:
+                turnover_history.append(0.0)
+
+            # 5b. Process immediate IOC/FOK from signals
+            for sym in active:
+                bar = data_dict[sym].loc[timestamp]
+                immediate = brokers[sym].process_immediate_orders(
+                    bar, timestamp, sym)
+                for order in immediate:
+                    trade = portfolio.update_from_order(order, timestamp)
+                    if trade and pnl_tracker is not None:
+                        pnl_tracker['bar_realized'][sym] = (
+                            pnl_tracker['bar_realized'].get(sym, 0.0)
+                            + trade.pnl + trade.commission
+                            + trade.slippage_cost
+                        )
+
+            # 6. Hooks: on_bar
+            if config.hooks and ctx is not None:
+                for hook in config.hooks:
+                    hook.on_bar(ctx)
+
+            # 6.5. Periodic costs (borrowing, funding)
+            # v1.9.7: iterate `active` (symbols with a bar at this
+            # timestamp) instead of all `symbols`. For inactive symbols
+            # we have no fresh price and the timestamp shouldn't
+            # advance — when the symbol's next bar arrives, bar_seconds
+            # naturally spans the gap (numerically equivalent to the
+            # current per-tick charge, since cost is linear in
+            # bar_seconds). Saves O(N_active × N_symbols) → O(sum of
+            # active bars) calls on mixed-frequency multi-asset runs.
+            if config.periodic_cost_model is not None:
+                for sym in active:
+                    pos = portfolio.positions.get(sym)
+                    if not (pos and not pos.is_flat):
+                        # Position is flat — no shares borrowed, so no cost.
+                        # We still advance the timestamp so that on reopen
+                        # the next charge bills only for the new position's
+                        # actual lifespan, not for the (zero-exposure) flat
+                        # period.
+                        last_cost_timestamp[sym] = timestamp
+                        continue
+                    mc = resolve_config(
+                        config.margin_config,
+                        config.asset_margin_configs, sym)
+                    last_ts = last_cost_timestamp.get(sym, timestamp)
+                    delta = (timestamp - last_ts).total_seconds()
+                    cost = config.periodic_cost_model.calculate_cost(
+                        pos, prices[sym], timestamp, mc,
+                        bar_seconds=max(0.0, delta))
+                    if cost > 0:
+                        portfolio.deduct_cost(cost)
+                    last_cost_timestamp[sym] = timestamp
+
+            # 7. Record equity + per-asset PnL
+            portfolio._record_equity(timestamp)
+            if pnl_tracker is not None:
+                _record_per_asset_pnl(
+                    timestamp, portfolio, symbols, pnl_tracker)
+
+            # 7b. Negative equity termination (gap risk)
+            if (config.margin_config is not None
+                    and config.margin_config.stop_on_negative_equity
+                    and portfolio.total_equity < 0):
+                break
+
+        # --- Post-loop: notify hooks (once per backtest, symmetric with start) ---
+    finally:
+        # --- Notify hooks: backtest end (once per backtest; fires even
+        # if the loop above raised, so hooks holding open file handles,
+        # sockets, or LatencyHook queues get cleanup). started_hooks
+        # gates this so a start that raised mid-dispatch doesn't trigger
+        # an unmatched end.
+        if started_hooks:
+            primary_sym = sorted_symbols[0]
+            primary_data = data_dict[primary_sym]
+            end_ctx = LifecycleContext(
+                phase="end",
+                timestamp=primary_data.index[-1],
+                symbols=sorted_symbols,
+                config=config,
+                data_dict=data_dict,
+                primary_symbol=primary_sym,
+                primary_data=primary_data,
+            )
+            for hook in config.hooks:
+                # Each end-hook is wrapped: if a hook itself raises
+                # in its end callback, we MUST NOT let that mask the
+                # primary engine exception (Python's try/finally
+                # semantics would re-raise the latest exception,
+                # losing the original RuntimeError from the loop).
+                # Emit a warning so a buggy end-hook is still
+                # visible, but don't propagate.
+                try:
+                    call_hook_lifecycle_end(hook, end_ctx)
+                except Exception as exc:
+                    warnings.warn(
+                        f"on_backtest_end raised on "
+                        f"{type(hook).__name__}: {exc!r}. "
+                        f"Suppressed so any primary exception "
+                        f"propagates; original is still in "
+                        f"__context__."
                     )
 
-        # 6. Hooks: on_bar
-        if config.hooks and ctx is not None:
-            for hook in config.hooks:
-                hook.on_bar(ctx)
-
-        # 6.5. Periodic costs (borrowing, funding)
-        if config.periodic_cost_model is not None:
-            for sym in symbols:
-                pos = portfolio.positions.get(sym)
-                if not (pos and not pos.is_flat):
-                    # Position is flat — no shares borrowed, so no cost.
-                    # We still advance the timestamp so that on reopen
-                    # the next charge bills only for the new position's
-                    # actual lifespan, not for the (zero-exposure) flat
-                    # period.
-                    last_cost_timestamp[sym] = timestamp
-                    continue
-                mc = resolve_config(
-                    config.margin_config,
-                    config.asset_margin_configs, sym)
-                last_ts = last_cost_timestamp.get(sym, timestamp)
-                delta = (timestamp - last_ts).total_seconds()
-                cost = config.periodic_cost_model.calculate_cost(
-                    pos, prices[sym], timestamp, mc,
-                    bar_seconds=max(0.0, delta))
-                if cost > 0:
-                    portfolio.deduct_cost(cost)
-                last_cost_timestamp[sym] = timestamp
-
-        # 7. Record equity + per-asset PnL
-        portfolio._record_equity(timestamp)
-        if pnl_tracker is not None:
-            _record_per_asset_pnl(
-                timestamp, portfolio, symbols, pnl_tracker)
-
-        # 7b. Negative equity termination (gap risk)
-        if (config.margin_config is not None
-                and config.margin_config.stop_on_negative_equity
-                and portfolio.total_equity < 0):
-            break
-
-    # --- Post-loop: notify hooks (once per backtest, symmetric with start) ---
-    if config.hooks:
-        primary_sym = sorted_symbols[0]
-        primary_data = data_dict[primary_sym]
-        end_ctx = LifecycleContext(
-            phase="end",
-            timestamp=primary_data.index[-1],
-            symbols=sorted_symbols,
-            config=config,
-            data_dict=data_dict,
-            primary_symbol=primary_sym,
-            primary_data=primary_data,
-        )
-        for hook in config.hooks:
-            call_hook_lifecycle_end(hook, end_ctx)
 
     # --- Build results ---
     equity_curve = portfolio.get_equity_curve()

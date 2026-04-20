@@ -75,6 +75,16 @@ AIphaForge also works perfectly well as a general-purpose backtest framework for
 - Default `trading_days=252` reproduces v1.9.4 numbers exactly.
 - **Pickle compatibility across versions is not guaranteed.** `BacktestResult` gained new fields (`trading_days`, `per_asset_trading_days`); pickles created with v1.9.4 should be regenerated rather than loaded into v1.9.5. If you need long-term persistence, use `result.to_dict()` + JSON.
 
+### v1.9.7 — Vectorized honesty + edge-case cleanup
+A small follow-up to v1.9.6 closing 10 demo-discovered correctness gaps. No new public features; existing APIs preserved.
+
+- **Vectorized warning loop**: `BacktestEngine` now warns when `mode='vectorized'` is given config it silently ignores — `position_sizing` / `position_size` (composite warning), `take_profit`, `trailing_stop_rule`, `impact_model`, `margin_config`, `periodic_cost_model`. Default vectorized usage emits zero warnings. Switch to `mode='event_driven'` to honor any of these.
+- **Single-asset `BacktestResult.symbols` populated**: was `[]` for single-asset runs (only multi-asset set it), which silently broke any consumer that read the field. `_build_result` now sets it from `config.symbols`. Removes the v1.9.6 `market_impact.estimate_capacity` fallback workaround (kept as defense-in-depth for custom cores).
+- **Event-driven try/finally end-hook**: `on_backtest_end` now fires even when the main loop raises mid-run, matching vectorized's symmetry. Hooks holding open file handles, sockets, or pending `LatencyHook` queues no longer leak on a crash. A `started_hooks` flag gates the end-call so a start that itself raised does not trigger an unmatched end.
+- **Periodic cost loop perf**: iterate `active` symbols only (mixed-frequency multi-asset no longer pays O(timeline × N_symbols) cost-model calls). Numerically identical (cost is linear in `bar_seconds`); just fewer calls.
+- **Bar-0 signal in `extract_trades_vectorized`**: pre-existing engine bug surfaced by v1.9.7 review — `pos_diff.iloc[0]` is always NaN, so a non-zero `positions.iloc[0]` was invisible to the loop and the next non-zero diff was misinterpreted as opening a fresh trade in the wrong direction. Empirical: `signals=[1,1,0,0,1,1,0]` produced phantom short + missing long, sum_pnl off by ~$4000. Fixed by priming `entry_time` from `positions.iloc[0]`.
+- **Vectorized stop-loss visible in trades**: stop-loss exits no longer silently absent from the vectorized trade list. `PercentageStopLoss.apply_vectorized` gains a keyword-only `return_mask` parameter (default `False` — preserves single-Series contract for any user subclass). When wired, `extract_trades_vectorized` uses a segment-based reconstruction to emit `Trade(reason='stop_loss')` entries with `exit_price = entry_price * (1 - threshold * direction)` matching the engine's stop math. Reversal segments preserved. No-stop-loss path falls through to the v1.9.6 in-loop implementation byte-identically.
+
 ### v1.9.6 — Engine stability release
 A focused round of correctness fixes covering 10 long-standing bugs found in an engine-wide audit. No new features; existing public APIs are preserved.
 
