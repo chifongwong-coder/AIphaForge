@@ -890,7 +890,7 @@ class BacktestEngine:
         return data.copy()
 
     def _get_signals(
-        self, data: pd.DataFrame, symbol: str = "default",
+        self, data: pd.DataFrame, *, symbol: str = "default",
     ) -> pd.Series:
         """Get trading signals. NaN = hold, 0 = flat, nonzero = trade."""
         if self._target_weights is not None:

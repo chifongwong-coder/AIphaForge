@@ -150,7 +150,7 @@ class PerformanceAnalyzer:
             # "full": root-mean-square of min(r, 0) over ALL observations
             clipped = np.minimum(self.returns, 0.0)
             daily_downside = np.sqrt((clipped ** 2).mean())
-        if daily_downside == 0 or np.isnan(daily_downside):
+        if daily_downside < 1e-12 or np.isnan(daily_downside):
             return 0.0
         return annualize(daily_downside, self.trading_days, is_volatility=True)
 

@@ -65,6 +65,17 @@ class TestFloatingPointStdGuard:
         # Pre-fix this returned ~infinity / garbage
         assert analyzer.information_ratio(benchmark) == 0.0
 
+    def test_downside_volatility_on_constant_returns_is_zero(self):
+        # Same FP-noise pattern as sharpe/sortino — must be guarded.
+        analyzer = PerformanceAnalyzer.__new__(PerformanceAnalyzer)
+        analyzer.returns = pd.Series([1e-18, -1e-18] * 50)
+        analyzer.trading_days = 252
+        analyzer._downside_method = "full"
+        # Pre-fix this returned ~annualized(1e-18 * sqrt(252)) ≈ 1.6e-17
+        # but more importantly could fall through to garbage on mixed
+        # sign noise where (neg**2).mean() is nonzero-tiny.
+        assert analyzer.downside_volatility == 0.0
+
 
 class TestSetTargetWeightsSingleAsset:
     """set_target_weights must work on single-asset runs.
@@ -85,6 +96,41 @@ class TestSetTargetWeightsSingleAsset:
         res = eng.run(df)
         assert res.equity_curve is not None
         assert len(res.equity_curve) == len(df)
+        # Weight=0.5 must translate to ~50% of capital at entry,
+        # not 0.5 shares. Pre-fix this path raised — now lock in the
+        # semantic contract so we catch any future drift.
+        assert res.num_trades >= 1
+        t = res.trades[0]
+        notional = t.size * t.entry_price
+        assert 0.4 * 100_000 < notional < 0.6 * 100_000, (
+            f"Expected ~50% notional ($50k), got ${notional:,.0f}"
+        )
+
+    def test_single_asset_weight_mode_vectorized_matches_event_driven(self):
+        # Vectorized and event-driven paths should produce equivalent
+        # position sizing under the same weight schedule. The event-
+        # driven path routes through _compute_weight_change; vectorized
+        # relies on FIXED_FRACTION sizing interpreting the signal
+        # magnitude as an equity fraction. Both should end up ~50%.
+        df = _synthetic_ohlcv(n=60, seed=7)
+        schedule = {
+            "2024-01-02": {"S": 0.5},
+            "2024-02-10": {"S": 0.0},
+        }
+        eng_v = BacktestEngine(initial_capital=100_000, mode="vectorized")
+        eng_v.set_target_weights(schedule)
+        res_v = eng_v.run(df, symbol="S")
+
+        eng_e = BacktestEngine(initial_capital=100_000, mode="event_driven")
+        eng_e.set_target_weights(schedule)
+        res_e = eng_e.run(df, symbol="S")
+
+        # Both modes should find the 50% target and translate that to
+        # a notional near 50% of initial capital on the rebalance bar.
+        for res in (res_v, res_e):
+            assert res.num_trades >= 1
+            notional = res.trades[0].size * res.trades[0].entry_price
+            assert 0.4 * 100_000 < notional < 0.6 * 100_000
 
     def test_single_asset_target_weights_respects_symbol_kwarg(self):
         df = _synthetic_ohlcv(n=50)
