@@ -283,7 +283,7 @@ def sharpe_ratio(
     excess = returns - rf_per_period
     std = excess.std()
 
-    if std == 0 or np.isnan(std):
+    if std < 1e-12 or np.isnan(std):
         return 0.0
 
     return float((excess.mean() / std) * np.sqrt(trading_days))
@@ -326,7 +326,7 @@ def sortino_ratio(
         clipped = np.minimum(excess, 0.0)
         downside_std = np.sqrt((clipped ** 2).mean())
 
-    if downside_std == 0 or np.isnan(downside_std):
+    if downside_std < 1e-12 or np.isnan(downside_std):
         return 0.0
 
     return float((excess.mean() / downside_std) * np.sqrt(trading_days))

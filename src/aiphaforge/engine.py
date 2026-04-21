@@ -472,7 +472,7 @@ class BacktestEngine:
             )
 
         # Generate signals
-        signals = self._get_signals(data)
+        signals = self._get_signals(data, symbol=symbol)
 
         # Build config bundle (with run-time benchmark overrides)
         config = self._build_config(
@@ -480,6 +480,8 @@ class BacktestEngine:
             benchmark_type=benchmark_type,
             symbols=[symbol],
         )
+        if self._target_weights is not None:
+            config.is_weight_mode = True
 
         # Guard: multiple LatencyHook instances wrapping the same inner_hook
         latency_hooks = [h for h in self.hooks if isinstance(h, LatencyHook)]
@@ -887,9 +889,15 @@ class BacktestEngine:
 
         return data.copy()
 
-    def _get_signals(self, data: pd.DataFrame) -> pd.Series:
+    def _get_signals(
+        self, data: pd.DataFrame, symbol: str = "default",
+    ) -> pd.Series:
         """Get trading signals. NaN = hold, 0 = flat, nonzero = trade."""
-        if self._signals is not None:
+        if self._target_weights is not None:
+            signals_dict = self._weights_to_signals(
+                self._target_weights, {symbol: data})
+            signals = signals_dict[symbol]
+        elif self._signals is not None:
             signals = self._signals.reindex(data.index)
             # NaN from reindex means "no signal" = hold (preserve NaN)
         elif self._strategy is not None:

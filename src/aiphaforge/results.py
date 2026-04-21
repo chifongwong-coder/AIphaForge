@@ -271,6 +271,13 @@ class BacktestResult:
             d['per_asset_trading_days'] = dict(self.per_asset_trading_days)
         if self.benchmark_metrics is not None:
             d['benchmark_metrics'] = self.benchmark_metrics
+            d['benchmark_name'] = self.benchmark_name
+        if self.symbols:
+            d['symbols'] = list(self.symbols)
+        if self.per_asset_metrics is not None:
+            d['per_asset_metrics'] = self.per_asset_metrics
+        if self.turnover_history is not None:
+            d['turnover_history'] = list(self.turnover_history)
         return d
 
     # ========== Output Methods ==========

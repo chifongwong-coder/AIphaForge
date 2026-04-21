@@ -241,10 +241,11 @@ class PerformanceAnalyzer:
             return 0.0
 
         excess = aligned.iloc[:, 0] - aligned.iloc[:, 1]
-        if excess.std() == 0:
+        tracking_error = excess.std()
+        if tracking_error < 1e-12 or np.isnan(tracking_error):
             return 0.0
 
-        return annualize(excess.mean() / excess.std(), self.trading_days, is_volatility=True)
+        return annualize(excess.mean() / tracking_error, self.trading_days, is_volatility=True)
 
     # ========== Trade Statistics ==========
 
