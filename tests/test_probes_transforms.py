@@ -382,6 +382,13 @@ class TestValidator:
         assert not result.passed
         assert any("inf" in e for e in result.errors)
 
+    def test_non_positive_price_detected(self):
+        data = _ohlcv()
+        data.loc[data.index[0], "low"] = 0.0
+        result = validate_ohlcv_integrity(data)
+        assert not result.passed
+        assert any("non-positive" in e for e in result.errors)
+
 
 # ---------- Pipeline ----------
 

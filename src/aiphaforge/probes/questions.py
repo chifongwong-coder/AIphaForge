@@ -64,12 +64,15 @@ _PCT_TOLERANCE = ToleranceProfile(
 
 # ---------- Normalization / parsing helpers ----------
 
-_BINARY_YES_ALIASES = frozenset({
-    "yes", "y", "true", "t", "1", "up", "higher", "above", "positive",
-})
-_BINARY_NO_ALIASES = frozenset({
-    "no", "n", "false", "f", "0", "down", "lower", "below", "negative",
-})
+# Binary aliases are deliberately *not* directional (no up/higher/down/lower).
+# Direction-style aliases live in `_DIRECTION_*` and are only routed to a
+# binary template by templates whose semantics are explicitly "is X higher
+# than Y" (currently none of the built-ins). Mixing directional aliases
+# into binary scoring would silently mis-score templates of the form "Was
+# the close BELOW $60?" where "down" is the user's hedge and unrelated to
+# the truth value.
+_BINARY_YES_ALIASES = frozenset({"yes", "y", "true", "t", "1"})
+_BINARY_NO_ALIASES = frozenset({"no", "n", "false", "f", "0"})
 
 _DIRECTION_UP_ALIASES = frozenset({
     "up", "higher", "positive", "rose", "rising", "increase", "increased",
@@ -80,6 +83,20 @@ _DIRECTION_DOWN_ALIASES = frozenset({
 _DIRECTION_UNCHANGED_ALIASES = frozenset({
     "unchanged", "flat", "same", "equal", "zero",
 })
+
+
+def _make_question_id(symbol: str, ts: pd.Timestamp, template_id: str) -> str:
+    """Build a question_id that uniquely encodes (symbol, timestamp, template).
+
+    Uses the full ISO timestamp, not just the date, so intraday probes do
+    not silently collide. Symbols containing '|' are rejected to keep the
+    pipe-delimited format unambiguous.
+    """
+    if "|" in symbol:
+        raise ValueError(
+            f"symbol must not contain '|' (used as question_id delimiter): {symbol!r}"
+        )
+    return f"{symbol}|{ts.isoformat()}|{template_id}"
 
 
 def normalize_binary(text: str) -> Optional[bool]:
@@ -128,6 +145,13 @@ class QuestionTemplate(Protocol):
 
 # ---------- Built-in templates ----------
 
+_OHLC_PROMPT_SUFFIX = (
+    " Answer as a single decimal number in the dataset's price units, "
+    "with no currency symbol, no thousands separators, and no rounding "
+    "below the bar's reported precision."
+)
+
+
 class _OHLCBase:
     """Shared implementation for same-bar OHLC numeric templates."""
 
@@ -149,12 +173,12 @@ class OpenQuestion(_OHLCBase):
 
     def build(self, data, symbol, ts):
         return QuestionSpec(
-            question_id=f"{symbol}|{ts.date()}|{self.template_id}",
+            question_id=_make_question_id(symbol, ts, self.template_id),
             symbol=symbol,
             timestamp=ts,
             template_id=self.template_id,
             answer_type=self.answer_type,
-            prompt_text=f"What was the open of {symbol} on {ts.date()}?",
+            prompt_text=f"What was the open of {symbol} on {ts.date()}?" + _OHLC_PROMPT_SUFFIX,
             choices=None,
             truth_value=self._truth(data, ts),
             tolerance=self.tolerance,
@@ -168,12 +192,12 @@ class HighQuestion(_OHLCBase):
 
     def build(self, data, symbol, ts):
         return QuestionSpec(
-            question_id=f"{symbol}|{ts.date()}|{self.template_id}",
+            question_id=_make_question_id(symbol, ts, self.template_id),
             symbol=symbol,
             timestamp=ts,
             template_id=self.template_id,
             answer_type=self.answer_type,
-            prompt_text=f"What was the high of {symbol} on {ts.date()}?",
+            prompt_text=f"What was the high of {symbol} on {ts.date()}?" + _OHLC_PROMPT_SUFFIX,
             choices=None,
             truth_value=self._truth(data, ts),
             tolerance=self.tolerance,
@@ -187,12 +211,12 @@ class LowQuestion(_OHLCBase):
 
     def build(self, data, symbol, ts):
         return QuestionSpec(
-            question_id=f"{symbol}|{ts.date()}|{self.template_id}",
+            question_id=_make_question_id(symbol, ts, self.template_id),
             symbol=symbol,
             timestamp=ts,
             template_id=self.template_id,
             answer_type=self.answer_type,
-            prompt_text=f"What was the low of {symbol} on {ts.date()}?",
+            prompt_text=f"What was the low of {symbol} on {ts.date()}?" + _OHLC_PROMPT_SUFFIX,
             choices=None,
             truth_value=self._truth(data, ts),
             tolerance=self.tolerance,
@@ -206,12 +230,12 @@ class CloseQuestion(_OHLCBase):
 
     def build(self, data, symbol, ts):
         return QuestionSpec(
-            question_id=f"{symbol}|{ts.date()}|{self.template_id}",
+            question_id=_make_question_id(symbol, ts, self.template_id),
             symbol=symbol,
             timestamp=ts,
             template_id=self.template_id,
             answer_type=self.answer_type,
-            prompt_text=f"What was the closing price of {symbol} on {ts.date()}?",
+            prompt_text=f"What was the closing price of {symbol} on {ts.date()}?" + _OHLC_PROMPT_SUFFIX,
             choices=None,
             truth_value=self._truth(data, ts),
             tolerance=self.tolerance,
@@ -242,7 +266,7 @@ class CloseVsOpen:
         else:
             truth = "down"
         return QuestionSpec(
-            question_id=f"{symbol}|{ts.date()}|{self.template_id}",
+            question_id=_make_question_id(symbol, ts, self.template_id),
             symbol=symbol,
             timestamp=ts,
             template_id=self.template_id,
@@ -266,7 +290,24 @@ class GapVsPrevClose:
     answer_type: Literal["numeric"] = "numeric"
 
     def __init__(self, tolerance: Optional[ToleranceProfile] = None):
-        self.tolerance = tolerance or _PCT_TOLERANCE
+        # Sign matters here: a +1.2% gap up is qualitatively different from
+        # a -1.2% gap down. Default to a sign-sensitive profile so a model
+        # that gets the magnitude right but the direction wrong is scored
+        # `miss` regardless of magnitude band.
+        if tolerance is None:
+            tolerance = ToleranceProfile(
+                absolute_floor=_PCT_TOLERANCE.absolute_floor,
+                exact_threshold=_PCT_TOLERANCE.exact_threshold,
+                near_threshold=_PCT_TOLERANCE.near_threshold,
+                rough_threshold=_PCT_TOLERANCE.rough_threshold,
+                exact_range_width=_PCT_TOLERANCE.exact_range_width,
+                near_range_width=_PCT_TOLERANCE.near_range_width,
+                rough_range_width=_PCT_TOLERANCE.rough_range_width,
+                max_range_width=_PCT_TOLERANCE.max_range_width,
+                sign_sensitive=True,
+                sign_epsilon=1e-4,
+            )
+        self.tolerance = tolerance
 
     def build(self, data, symbol, ts):
         if ts not in data.index:
@@ -281,7 +322,7 @@ class GapVsPrevClose:
         prev_close = float(data.iloc[pos - 1]["close"])
         gap = (bar_open - prev_close) / prev_close
         return QuestionSpec(
-            question_id=f"{symbol}|{ts.date()}|{self.template_id}",
+            question_id=_make_question_id(symbol, ts, self.template_id),
             symbol=symbol,
             timestamp=ts,
             template_id=self.template_id,
@@ -315,7 +356,7 @@ class BarRangePct:
         bar_close = float(data.loc[ts, "close"])
         rng = (bar_high - bar_low) / bar_close
         return QuestionSpec(
-            question_id=f"{symbol}|{ts.date()}|{self.template_id}",
+            question_id=_make_question_id(symbol, ts, self.template_id),
             symbol=symbol,
             timestamp=ts,
             template_id=self.template_id,
@@ -361,7 +402,7 @@ class ReturnSign:
         else:
             truth = "down"
         return QuestionSpec(
-            question_id=f"{symbol}|{ts.date()}|{self.template_id}",
+            question_id=_make_question_id(symbol, ts, self.template_id),
             symbol=symbol,
             timestamp=ts,
             template_id=self.template_id,
@@ -484,14 +525,16 @@ class QuestionSet:
     def export_questions(self, path: str) -> None:
         records = self.prompt_records()
         # Defensive structural check — this invariant is load-bearing
-        # (it's the reason we use two separate record types).
+        # (it's the reason we use two separate record types). Use raise
+        # rather than assert so it survives `python -O`.
         for r in records:
             d = asdict(r)
-            assert "truth_value" not in d, (
-                f"QuestionPromptRecord for {r.question_id} unexpectedly "
-                "contains truth_value; export aborted"
-            )
-            assert "tolerance" not in d
+            if "truth_value" in d or "tolerance" in d:
+                raise RuntimeError(
+                    f"QuestionPromptRecord for {r.question_id} unexpectedly "
+                    "contains answer-key fields; export aborted to prevent "
+                    "leakage"
+                )
         with open(path, "w") as f:
             for r in records:
                 f.write(json.dumps(_serialize_prompt(r)) + "\n")

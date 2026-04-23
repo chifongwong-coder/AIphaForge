@@ -44,14 +44,22 @@ def _ohlcv(n: int = 60, seed: int = 0) -> pd.DataFrame:
 
 class TestNormalize:
     @pytest.mark.parametrize("text,expected", [
-        ("yes", True), ("Y", True), ("true", True), ("up", True),
-        ("no", False), ("N", False), ("false", False), ("down", False),
+        ("yes", True), ("Y", True), ("true", True), ("1", True),
+        ("no", False), ("N", False), ("false", False), ("0", False),
     ])
     def test_binary(self, text, expected):
         assert normalize_binary(text) is expected
 
     def test_binary_unparseable_returns_none(self):
         assert normalize_binary("maybe") is None
+
+    @pytest.mark.parametrize("text", ["up", "down", "higher", "lower"])
+    def test_binary_does_not_overload_direction_aliases(self, text):
+        # Directional aliases live in normalize_direction, not
+        # normalize_binary — mapping "up" → True for an arbitrary
+        # binary template ("Was the close BELOW $60?") would silently
+        # mis-score the answer.
+        assert normalize_binary(text) is None
 
     @pytest.mark.parametrize("text,expected", [
         ("up", "up"), ("Higher", "up"), ("rose", "up"),
@@ -263,6 +271,32 @@ class TestStatusAndAggregation:
                            parsed_answer=None, parse_status="invalid")
         s = score_question(qs, ans)
         assert s.validity == "invalid"
+
+    def test_question_id_mismatch_raises(self):
+        # Regression: pairing contract is enforced eagerly so off-by-one
+        # in a list-zip cannot silently produce wrong scores.
+        data = _ohlcv()
+        qs = OpenQuestion().build(data, "X", data.index[5])
+        ans = AnswerRecord(
+            "WRONG_ID", raw_answer="x", parsed_answer=100.0,
+            parse_status="valid",
+        )
+        with pytest.raises(ValueError, match="id mismatch"):
+            score_question(qs, ans)
+
+
+class TestMixedCaseChoiceTemplate:
+    def test_uppercase_allowed_set_normalized_correctly(self):
+        # Regression: a future direction-style template using
+        # ["UP", "DOWN", "UNCHANGED"] (uppercase) must still resolve
+        # canonical-direction normalization back into the template's
+        # exact casing — otherwise `parsed not in allowed` rejects the
+        # answer as `invalid`.
+        from aiphaforge.probes.scoring import _normalize_choice
+        result = _normalize_choice("Higher", ["UP", "DOWN", "UNCHANGED"])
+        assert result == "UP"
+        result = _normalize_choice("fell", ["UP", "DOWN", "UNCHANGED"])
+        assert result == "DOWN"
 
 
 # ---------- Aggregator ----------

@@ -502,6 +502,14 @@ def validate_ohlcv_integrity(data: pd.DataFrame) -> IntegrityCheckResult:
     if (v < 0).any():
         errors.append(f"volume has {int((v < 0).sum())} negative bars")
 
+    # Positive-price guard: any non-positive open/high/low/close is a
+    # broken bar (extreme noise after OHLCJitter, bad input, etc.).
+    for col, arr in (("open", o), ("high", h), ("low", low), ("close", c)):
+        if (arr <= 0).any():
+            errors.append(
+                f"column '{col}' has {int((arr <= 0).sum())} non-positive values"
+            )
+
     return IntegrityCheckResult(passed=not errors, errors=errors)
 
 

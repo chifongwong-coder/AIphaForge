@@ -202,6 +202,32 @@ class TestBuildQuestionSet:
         qs = build_question_set(data, "AAPL", [ts, ts], [OpenQuestion()])
         assert len(qs) == 1
 
+    def test_intraday_question_ids_distinct(self):
+        # Regression: question_id must encode the full timestamp, not
+        # just the date, so two intraday bars on the same calendar day
+        # produce distinct ids and the answer-file lookup works.
+        idx = pd.DatetimeIndex([
+            "2024-03-12 09:30:00",
+            "2024-03-12 14:00:00",
+        ])
+        intraday = pd.DataFrame(
+            {
+                "open": [100.0, 101.0], "high": [101.0, 102.0],
+                "low": [99.0, 100.0], "close": [100.5, 101.5],
+                "volume": [1e6, 1e6],
+            },
+            index=idx,
+        )
+        qs = build_question_set(intraday, "X", list(idx), [OpenQuestion()])
+        assert len(qs) == 2
+        ids = [q.question_id for q in qs]
+        assert ids[0] != ids[1]
+
+    def test_pipe_in_symbol_rejected(self):
+        data = _ohlcv(n=60)
+        with pytest.raises(ValueError, match="must not contain"):
+            OpenQuestion().build(data, "BAD|SYM", data.index[5])
+
     def test_default_templates_cover_eight(self):
         # Plan §1.2 specifies 4 OHLC + 4 direction/relative templates.
         assert len(DEFAULT_TEMPLATES) == 8

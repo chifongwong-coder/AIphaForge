@@ -43,15 +43,26 @@ _BAND_WEIGHTS = {"exact": 1.00, "near": 0.67, "rough": 0.33, "miss": 0.00}
 
 
 def _normalize_choice(text: str, allowed: Sequence[str]) -> Optional[str]:
-    """Normalize a choice answer. Returns None on no match.
+    """Normalize a choice answer. Returns the matching `allowed` value or None.
 
     Dispatches to :func:`normalize_direction` when the allowed set is
     the canonical up/down/unchanged vocabulary; falls back to
-    case-insensitive exact match for other choice templates.
+    case-insensitive exact match for other choice templates. The
+    returned value is always one of the strings in ``allowed`` (or
+    ``None``), preserving the template's original case.
     """
     allowed_set = {c.lower() for c in allowed}
     if allowed_set == {"up", "down", "unchanged"}:
-        return normalize_direction(text)
+        # Map the canonical direction back to the user's exact `allowed`
+        # casing so downstream `parsed in allowed` checks succeed even
+        # when the template uses, e.g., ["UP", "DOWN", "UNCHANGED"].
+        canonical = normalize_direction(text)
+        if canonical is None:
+            return None
+        for c in allowed:
+            if c.lower() == canonical:
+                return c
+        return None
     if text is None:
         return None
     cand = str(text).strip().lower()
@@ -263,7 +274,18 @@ def _invalid_score(
 
 
 def score_question(qs: QuestionSpec, ans: AnswerRecord) -> QuestionScore:
-    """Score a single question against a user-supplied answer record."""
+    """Score a single question against a user-supplied answer record.
+
+    Raises ``ValueError`` if ``qs.question_id != ans.question_id``: the
+    pairing contract is enforced eagerly so an off-by-one in a list-zip
+    cannot silently produce wrong scores.
+    """
+    if qs.question_id != ans.question_id:
+        raise ValueError(
+            f"score_question: question/answer id mismatch — "
+            f"qs.question_id={qs.question_id!r} but "
+            f"ans.question_id={ans.question_id!r}"
+        )
     if ans.parse_status in ("refusal", "missing"):
         return _invalid_score(qs, ans)
     if ans.parse_status == "invalid":
