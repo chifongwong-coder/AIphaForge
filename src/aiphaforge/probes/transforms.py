@@ -90,14 +90,15 @@ class SymbolMasker:
     order_invertible = True
     stochastic = False
 
-    # A small held-out universe of plausible-looking obscure tickers.
-    # NOT real listed tickers — chosen to look plausible to a frontier
-    # LLM without matching any real recent symbol the model might
-    # recognize. Users can extend this list.
-    DEFAULT_ALIAS_POOL: tuple[str, ...] = (
-        "QRTL", "ZNXP", "VYBA", "KLMN", "WJDR", "PFXC", "BHGM",
-        "TOQS", "EUIK", "RYHV", "AMNB", "SLEC", "DGUF", "CXTW",
-        "YOPI", "FNVA", "JPRZ", "WUBE", "MKLO", "HQAI",
+    # Synthetic alias pool — opaque ``SYM_xxxx`` IDs that are clearly
+    # not real listed tickers. Earlier drafts shipped 4-letter
+    # "obscure" aliases, but several turned out to be real listed
+    # symbols; a frontier LLM would recognize them and the pattern.
+    # Users who want plausibly-equity-shaped aliases must supply
+    # ``alias_pool=...`` explicitly and accept the responsibility of
+    # checking the strings against real-listed databases.
+    DEFAULT_ALIAS_POOL: tuple[str, ...] = tuple(
+        f"SYM_{i:04d}" for i in range(1000)
     )
 
     def __init__(
@@ -107,13 +108,11 @@ class SymbolMasker:
         seed: int = 0,
         alias_pool: Optional[Sequence[str]] = None,
         collision_policy: Literal["fail"] = "fail",
-        strategy: Literal["hash", "opaque"] = "hash",
     ):
         self.symbols = tuple(symbols)
         self.seed = seed
         self.alias_pool = tuple(alias_pool) if alias_pool else self.DEFAULT_ALIAS_POOL
         self.collision_policy = collision_policy
-        self.strategy = strategy
         self._mapping = self._compute_mapping()
         self._inverse = {v: k for k, v in self._mapping.items()}
 
@@ -127,6 +126,10 @@ class SymbolMasker:
                 f"SymbolMasker alias pool ({len(self.alias_pool)}) "
                 f"smaller than symbol count ({len(self.symbols)})"
             )
+        # `replace=False` only guarantees distinct *indices* into the
+        # alias pool. If the user-supplied pool itself contains
+        # duplicate strings, two distinct indices can map to the same
+        # alias — the `seen` check below is the actual collision guard.
         rng = np.random.default_rng(self.seed)
         chosen_indices = rng.choice(
             len(self.alias_pool),
@@ -138,11 +141,10 @@ class SymbolMasker:
         for sym, idx in zip(self.symbols, chosen_indices):
             alias = self.alias_pool[idx]
             if alias in seen:
-                # Should not happen given replace=False, but enforce
-                # the contract explicitly per plan §2.4.
                 raise ValueError(
                     f"SymbolMasker alias collision on '{alias}' "
-                    f"(strategy={self.strategy}, seed={self.seed})"
+                    f"(seed={self.seed}); the user-supplied alias_pool "
+                    "contains duplicate strings"
                 )
             seen.add(alias)
             mapping[sym] = alias
@@ -373,6 +375,10 @@ class BlockBootstrap:
     def apply(
         self, data: pd.DataFrame, *, seed: Optional[int] = None,
     ) -> pd.DataFrame:
+        if len(data) < 2:
+            raise ValueError(
+                f"BlockBootstrap requires at least 2 bars, got {len(data)}"
+            )
         rng = np.random.default_rng(seed)
         indices = _block_bootstrap_indices(
             n_bars=len(data), block_size=self.block_size, rng=rng
@@ -578,30 +584,41 @@ class TransformPipeline:
         """Apply transforms in canonical stage order, then validate.
 
         Stochastic transforms each receive a deterministically derived
-        sub-seed from the given ``seed`` so repeated calls with the
-        same outer seed produce identical output.
+        sub-seed from the given ``seed``. Sub-seeds are spawned in
+        **canonical stage order**, not user input order, so two
+        pipelines containing the same transforms in different
+        user-supplied orders produce byte-identical output for the
+        same outer seed.
         """
+        sorted_transforms = self._stage_sorted()
         rng_seq = np.random.SeedSequence(seed) if seed is not None else None
         children = (
-            list(rng_seq.spawn(len(self.transforms)))
+            list(rng_seq.spawn(len(sorted_transforms)))
             if rng_seq is not None
-            else [None] * len(self.transforms)
+            else [None] * len(sorted_transforms)
         )
-        # Map child seed sequences back to their parent transform.
-        child_map = dict(zip(map(id, self.transforms), children))
 
         out = data
-        for t in self._stage_sorted():
-            child = child_map[id(t)]
+        for t, child in zip(sorted_transforms, children):
             sub_seed = (
                 int(child.generate_state(1)[0]) if child is not None else None
             )
-            out = t.apply(out, seed=sub_seed)
+            try:
+                out = t.apply(out, seed=sub_seed)
+            except Exception as e:
+                raise type(e)(
+                    f"transform '{t.name}' failed on outer seed={seed} "
+                    f"sub_seed={sub_seed}: {e}"
+                ) from e
 
         result = validate_ohlcv_integrity(out)
         if not result.passed:
+            # Identify the last-applied transform so the user knows
+            # which stage produced the invalid frame.
+            last = sorted_transforms[-1].name if sorted_transforms else "(none)"
             raise ValueError(
-                "Transform pipeline produced invalid OHLCV: "
+                f"Transform pipeline produced invalid OHLCV after "
+                f"'{last}' (outer seed={seed}): "
                 + "; ".join(result.errors)
             )
         return out

@@ -69,9 +69,29 @@ class TestSymbolMasker:
     def test_alias_pool_too_small_raises(self):
         with pytest.raises(ValueError, match="alias pool"):
             SymbolMasker(
-                symbols=[f"S{i}" for i in range(50)],
+                symbols=[f"S{i}" for i in range(5)],
+                alias_pool=("A", "B", "C"),
                 seed=0,
             )
+
+    def test_user_supplied_pool_with_duplicates_raises(self):
+        # Regression: replace=False guarantees distinct *indices*; if
+        # the user-supplied pool contains duplicate strings, two
+        # distinct indices can map to the same alias. With a pool of
+        # only duplicates, the collision is unavoidable.
+        with pytest.raises(ValueError, match="alias collision"):
+            SymbolMasker(
+                symbols=["A", "B"],
+                alias_pool=("DUP", "DUP"),
+                seed=0,
+            )
+
+    def test_default_alias_pool_is_synthetic(self):
+        # Defensive: the default alias pool MUST be obviously synthetic
+        # (SYM_xxxx pattern), not real-looking 4-letter tickers. Earlier
+        # drafts shipped real listed symbols by accident.
+        for alias in SymbolMasker.DEFAULT_ALIAS_POOL[:5]:
+            assert alias.startswith("SYM_")
 
     def test_unknown_mask_unmask_raises(self):
         sm = SymbolMasker(symbols=["AAPL"], seed=0)
@@ -240,6 +260,20 @@ class TestBlockBootstrap:
         # Average across realizations should be close to the anchor
         # (since average return is ~1 for a near-zero-drift series).
         assert np.mean(first_closes) == pytest.approx(100.0, rel=0.05)
+        # And the first close MUST vary across seeds — otherwise a
+        # future refactor that silently clamps the first bar would
+        # reintroduce the mistaken "all realizations start exactly at
+        # the anchor" property.
+        assert np.std(first_closes) > 0
+
+    def test_empty_data_raises(self):
+        bb = BlockBootstrap(block_size=5)
+        empty = pd.DataFrame(
+            columns=["open", "high", "low", "close", "volume"],
+            index=pd.DatetimeIndex([], name="t"),
+        )
+        with pytest.raises(ValueError, match="at least 2 bars"):
+            bb.apply(empty, seed=0)
 
     def test_index_preserved(self):
         bb = BlockBootstrap(block_size=20)
@@ -340,6 +374,13 @@ class TestValidator:
         result = validate_ohlcv_integrity(data)
         assert not result.passed
         assert any("monotonic" in e for e in result.errors)
+
+    def test_inf_detected(self):
+        data = _ohlcv()
+        data.loc[data.index[0], "close"] = np.inf
+        result = validate_ohlcv_integrity(data)
+        assert not result.passed
+        assert any("inf" in e for e in result.errors)
 
 
 # ---------- Pipeline ----------
@@ -447,6 +488,43 @@ class TestTransformPipeline:
         a = pipeline.apply(data, seed=42)
         b = pipeline.apply(data, seed=43)
         assert not np.allclose(a["close"].to_numpy(), b["close"].to_numpy())
+
+    def test_user_order_does_not_affect_output(self):
+        # Regression: two pipelines with the same transforms in
+        # different user-supplied orders must produce byte-identical
+        # output for the same outer seed, because sub-seeds are
+        # spawned in canonical stage order (not user input order).
+        data = _ohlcv(n=60)
+        sm = SymbolMasker(symbols=["X"], seed=7)
+        ps = PriceScale(factor=1.5)
+        bb = BlockBootstrap(block_size=10)
+        p_user = TransformPipeline(
+            transforms=[bb, ps, sm], mode="market_level"  # user put series first
+        )
+        p_canon = TransformPipeline(
+            transforms=[sm, ps, bb], mode="market_level"  # already canonical
+        )
+        pd.testing.assert_frame_equal(
+            p_user.apply(data, seed=42), p_canon.apply(data, seed=42)
+        )
+
+    def test_pipeline_error_names_offending_transform(self):
+        # A transform that always raises should surface its name in
+        # the chained error so debugging isn't guesswork.
+        class _Boom:
+            name = "Boom"
+            category = "series"
+            supports_view_only = False
+            supports_market_level = True
+            order_invertible = False
+            stochastic = False
+
+            def apply(self, data, *, seed=None):
+                raise RuntimeError("kaboom")
+
+        p = TransformPipeline(transforms=[_Boom()], mode="market_level")
+        with pytest.raises(RuntimeError, match="transform 'Boom' failed"):
+            p.apply(_ohlcv(), seed=1)
 
     def test_stochastic_pipeline_flag(self):
         bb = BlockBootstrap(block_size=10)
