@@ -302,6 +302,75 @@ class MetricConfig:
     low_anchor_threshold: float
 
 
+# ---------- v2.0.1 r5: determinism check types ----------
+
+# Implementation-shape contract for the agent factory; distinct from
+# the existing order-shape ``AgentContract`` (which controls
+# transform admissibility under ``view_only``). Plan §5.1 forbids
+# reusing or shadowing the existing name.
+AgentImplementationContract = Literal[
+    "strategy",
+    "hook",
+    "hook_view_only_capable",
+    "callable_factory",
+]
+
+
+class UnsupportedScenarioError(RuntimeError):
+    """Framework scenario is unsupported in this release.
+
+    Distinct from an ordinary user-agent exception: this is raised by
+    the framework's own preflight when the requested combination is
+    known not to work (e.g. ``view_only`` with a plain hook contract,
+    pending the v2.2 broker-proxy wrapper). The orchestrator catches
+    it and records ``status="unsupported"`` rather than treating it as
+    a determinism failure.
+    """
+
+
+@dataclass(frozen=True)
+class ResolvedDeterminismConfig:
+    """Resolved tuple of (profile, metrics, rel_tol).
+
+    Returned by ``resolve_determinism_config``. The ``requested_*``
+    fields preserve the user's original kwarg values so the manifest
+    can show both requested and resolved.
+    """
+
+    profile: Literal["v2_compat", "llm_balanced", "off"]
+    determinism_metrics: tuple[str, ...]
+    determinism_rel_tol: Optional[float]
+    requested_profile: Literal["auto", "v2_compat", "llm_balanced"]
+    requested_metrics: Optional[tuple[str, ...]]
+    requested_rel_tol: Optional[float]
+
+
+@dataclass(frozen=True)
+class DeterminismCheckResult:
+    """One arm's determinism-check result.
+
+    Plan §5.6 r5. Models exactly one arm — the orchestrator combines
+    a raw and a transformed instance into the per-scenario manifest
+    entry.
+
+    Internal ``metric_values_run_1/2`` are finite-float-only dicts
+    over the metrics that were actually extracted. The JSON
+    ``ArmResult`` serializer expands missing keys to ``None`` and
+    normalizes ``nan``/``inf`` to string sentinels — see plan §5.10.
+    """
+
+    passed: Optional[bool]
+    status: Literal["passed", "failed", "error", "unsupported"]
+    metric_values_run_1: dict[str, float]
+    metric_values_run_2: dict[str, float]
+    failed_metrics: list[str]
+    determinism_metrics: tuple[str, ...]
+    determinism_rel_tol: float
+    error_type: Optional[str] = None
+    error_message: Optional[str] = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
 @dataclass
 class ABScenario:
     """A single A/B scenario specification.
