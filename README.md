@@ -258,25 +258,53 @@ The engine never calls the LLM.
 
 ```python
 from aiphaforge.probes import (
-    KnowledgeProbe, DEFAULT_TEMPLATES, sample_dates,
+    KnowledgeProbe, OpenQuestion, ToleranceProfile,
+    DEFAULT_TEMPLATES, sample_dates,
     AnswerRecord, serialize_answer_records,
+    parse_numeric_answer,
 )
 
-# 1. Generate a question set from the dataset.
-probe = KnowledgeProbe(symbol="AAPL", templates=DEFAULT_TEMPLATES)
+# 1. Generate a question set from the dataset. Mix the default
+#    templates with a strict-mode opt-in template — the
+#    ``*_strict()`` presets use bp-scale exact thresholds calibrated
+#    for memorization detection (the loose preset matches v2.0
+#    defaults; opt-in only, no behavior change for existing callers).
+templates = list(DEFAULT_TEMPLATES) + [
+    OpenQuestion(tolerance=ToleranceProfile.us_equity_price_strict()),
+]
+probe = KnowledgeProbe(symbol="AAPL", templates=templates)
 ts_list = sample_dates(data, n=200, seed=42, start=1)
 qs = probe.build(data, ts_list)
 qs.export_questions("questions.jsonl")     # safe to feed to the LLM
 qs.export_answer_key("answer_key.jsonl")   # KEEP PRIVATE — truth values
 
 # 2. ... user runs questions.jsonl through their LLM externally,
-#    parses each reply into a typed value (bool / float / int / str),
+#    uses ``parse_numeric_answer(reply)`` (or the choice/binary
+#    parsers) to coerce free-text replies into typed values,
 #    and writes answers.jsonl as a list of AnswerRecord rows ...
 
-# 3. Score.
-report = probe.score("answers.jsonl", question_set=qs)
+# 3. Score, attesting to provider configuration for cross-paper
+#    comparability. Recommended keys (model, snapshot_id,
+#    temperature, prompt_template_hash, system_fingerprint,
+#    prompt_cache_disclosed, ...) are listed in
+#    ``RECOMMENDED_PROVIDER_CONFIG_KEYS`` — the engine never
+#    verifies these claims; the user owns the attestation.
+report = probe.score(
+    "answers.jsonl", question_set=qs,
+    provider_config={
+        "model": "claude-opus-4-7",
+        "temperature": 0.0,
+        "prompt_cache_disclosed": True,
+        "seed_attestation": False,
+    },
+)
 print(f"score_real bands: {report.bands_breakdown}")
 print(f"band_index_arbitrary: {report.band_index_arbitrary:.3f}")
+# Per-template breakdown surfaces selective-memorization signals
+# (e.g. "model nails close prices but is hopeless on highs").
+for tid, entry in (report.by_template or {}).items():
+    print(f"  {tid}: exact={entry['exact_rate']:.2%} "
+          f"miss={entry['miss_rate']:.2%}")
 ```
 
 ### LLM Memory Probes — A/B
@@ -311,6 +339,18 @@ result = run_ab_probe(
     scenarios=scenarios,
     n_repeat=10,
     enable_ai_noise_control=True,                  # for stochastic transforms
+    # v2.0.1: per-scenario determinism check catches Hooks whose
+    # non-determinism is exposed only by transformed inputs.
+    # ``determinism_profile="auto"`` resolves to ``v2_compat`` for
+    # ``raw_only`` (preserves v2.0 behavior) and ``llm_balanced``
+    # for ``per_scenario`` — which checks total_return + num_trades
+    # + win_rate at rel_tol=1e-3, the practical LLM noise floor.
+    agent_determinism_check="per_scenario",
+    determinism_profile="auto",
+    # ``agent_implementation_contract`` declares the agent's shape so
+    # unsupported combinations (e.g. view_only + plain hook) are
+    # reported as ``status="unsupported"`` rather than as failures.
+    agent_implementation_contract="strategy",
     provider_config={"model": "claude-opus-4-7", "temperature": 0.0},
 )
 

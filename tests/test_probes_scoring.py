@@ -452,3 +452,187 @@ class TestFileWorkflow:
         s = report.question_scores[0]
         assert s.contains_truth is True
         assert s.range_width_ratio is not None
+
+
+# ---------- v2.0.1 M5: by_template aggregation ----------
+
+class TestByTemplate:
+    def _build_multi(self, *, all_correct: bool):
+        from aiphaforge.probes.scoring import score_question
+        data = _ohlcv(n=60)
+        qs = build_question_set(
+            data, "X", [data.index[10], data.index[20]],
+            [OpenQuestion(), CloseQuestion(), CloseVsOpen()],
+        )
+        scores = []
+        for q in qs:
+            if all_correct:
+                ans = AnswerRecord(
+                    q.question_id, raw_answer=str(q.truth_value),
+                    parsed_answer=q.truth_value, parse_status="valid",
+                )
+            else:
+                # Mix: parse_status valid but with deliberately wrong
+                # numeric to force band="miss".
+                wrong = q.truth_value
+                if isinstance(wrong, (int, float)):
+                    wrong = float(wrong) * 1000.0
+                ans = AnswerRecord(
+                    q.question_id, raw_answer=str(wrong),
+                    parsed_answer=wrong, parse_status="valid",
+                )
+            scores.append(score_question(q, ans))
+        return qs, scores
+
+    def test_by_template_populated_with_one_entry_per_template(self):
+        qs, scores = self._build_multi(all_correct=True)
+        report = aggregate_scores(qs, scores)
+        assert report.by_template is not None
+        # OpenQuestion, CloseQuestion, CloseVsOpen → 3 distinct templates.
+        assert set(report.by_template.keys()) == {
+            q.template_id for q in qs.questions
+        }
+        assert len(report.by_template) == 3
+
+    def test_by_template_inner_keys_match_schema(self):
+        qs, scores = self._build_multi(all_correct=True)
+        report = aggregate_scores(qs, scores)
+        # r5 §6.1 TemplateAggregate shape.
+        expected = {
+            "n_questions", "submitted_answers", "valid_answers",
+            "invalid_answers", "missing_answers", "refusal_answers",
+            "coverage_rate", "parse_success_rate",
+            "exact_rate", "near_rate", "rough_rate", "miss_rate",
+            "band_index_arbitrary", "bands_breakdown",
+            "mean_range_width_ratio", "median_range_width_ratio",
+            "max_range_width_exceeded_count",
+        }
+        for tid, entry in report.by_template.items():
+            assert set(entry.keys()) == expected
+            assert entry["n_questions"] >= 1
+            # All-correct fixture: every band rate is non-None and bounded.
+            assert 0.0 <= entry["exact_rate"] <= 1.0
+
+    def test_by_template_n_questions_sum_equals_total(self):
+        qs, scores = self._build_multi(all_correct=True)
+        report = aggregate_scores(qs, scores)
+        total = sum(e["n_questions"] for e in report.by_template.values())
+        assert total == report.total_questions
+
+    def test_per_template_rates_pass_through_when_all_correct(self):
+        qs, scores = self._build_multi(all_correct=True)
+        report = aggregate_scores(qs, scores)
+        for entry in report.by_template.values():
+            # exact + near + rough + miss == 1.0 over the valid bucket.
+            assert entry["exact_rate"] + entry["near_rate"] \
+                + entry["rough_rate"] + entry["miss_rate"] \
+                == pytest.approx(1.0)
+
+    def test_single_template_report_has_one_entry(self):
+        data = _ohlcv(n=30)
+        qs = build_question_set(
+            data, "X", [data.index[5], data.index[10]], [OpenQuestion()],
+        )
+        scores = []
+        for q in qs:
+            ans = AnswerRecord(
+                q.question_id, raw_answer=str(q.truth_value),
+                parsed_answer=q.truth_value, parse_status="valid",
+            )
+            scores.append(score_question(q, ans))
+        report = aggregate_scores(qs, scores)
+        assert report.by_template is not None
+        assert len(report.by_template) == 1
+        only = next(iter(report.by_template.values()))
+        assert only["n_questions"] == 2
+
+    def test_empty_question_set_yields_none(self):
+        from aiphaforge.probes.questions import QuestionSet
+        empty = QuestionSet(questions=[])
+        report = aggregate_scores(empty, [])
+        assert report.by_template is None
+
+    def test_band_index_per_template_independent_of_global(self):
+        # Selective-memorization signal: OpenQuestion all-correct vs
+        # CloseQuestion all-wrong should yield distinct band_index
+        # values per template even when the global rate is mixed.
+        data = _ohlcv(n=40)
+        qs = build_question_set(
+            data, "X", [data.index[10], data.index[20]],
+            [OpenQuestion(), CloseQuestion()],
+        )
+        scores = []
+        for q in qs:
+            if q.template_id == "open":
+                pa = q.truth_value
+            else:
+                pa = float(q.truth_value) * 1000.0
+            scores.append(score_question(
+                q, AnswerRecord(
+                    q.question_id, raw_answer=str(pa),
+                    parsed_answer=pa, parse_status="valid",
+                ),
+            ))
+        report = aggregate_scores(qs, scores)
+        assert report.by_template["open"]["exact_rate"] == pytest.approx(1.0)
+        assert report.by_template["close"]["miss_rate"] == pytest.approx(1.0)
+
+    # ---- r5 §6 mandated tests ----
+
+    def test_by_template_zero_valid_answers_uses_none_band_rates(self):
+        # r5 §6.2: when valid_answers == 0, band rates must be None,
+        # not 0.0, so a "no scorable answers" template is not visually
+        # indistinguishable from an "all-miss" template.
+        data = _ohlcv(n=30)
+        qs = build_question_set(
+            data, "X", [data.index[5], data.index[10]], [OpenQuestion()],
+        )
+        # Submit all answers as parse_status="invalid" so valid_answers is 0
+        # but submitted_answers > 0 — exercises the None-band-rate path.
+        scores = []
+        for q in qs:
+            scores.append(score_question(
+                q, AnswerRecord(
+                    q.question_id, raw_answer="garbage",
+                    parsed_answer=None, parse_status="invalid",
+                ),
+            ))
+        report = aggregate_scores(qs, scores)
+        entry = report.by_template["open"]
+        assert entry["valid_answers"] == 0
+        assert entry["exact_rate"] is None
+        assert entry["near_rate"] is None
+        assert entry["rough_rate"] is None
+        assert entry["miss_rate"] is None
+        # Coverage and parse-success use different denominators and
+        # remain numeric even when no answer scored as valid.
+        assert entry["coverage_rate"] == pytest.approx(1.0)
+        assert entry["parse_success_rate"] == pytest.approx(0.0)
+        # band_index_arbitrary should also be None when no valid answers.
+        assert entry["band_index_arbitrary"] is None
+
+    def test_by_template_type_shape_includes_counts_and_breakdown(self):
+        # r5 §6.1: TemplateAggregate must carry counts (n_questions,
+        # submitted/valid/invalid/missing/refusal), a bands_breakdown
+        # dict, range-width aggregates, and the max-range-exceeded
+        # count alongside the rate fields.
+        qs, scores = self._build_multi(all_correct=True)
+        report = aggregate_scores(qs, scores)
+        for entry in report.by_template.values():
+            # Counts.
+            for key in (
+                "n_questions", "submitted_answers", "valid_answers",
+                "invalid_answers", "missing_answers", "refusal_answers",
+            ):
+                assert isinstance(entry[key], int)
+            # Counts must add up: submitted+missing == n_questions.
+            assert (
+                entry["submitted_answers"] + entry["missing_answers"]
+                == entry["n_questions"]
+            )
+            # Breakdown is a real dict.
+            assert isinstance(entry["bands_breakdown"], dict)
+            # Range-width aggregates and exceeded count exist.
+            assert "mean_range_width_ratio" in entry
+            assert "median_range_width_ratio" in entry
+            assert isinstance(entry["max_range_width_exceeded_count"], int)

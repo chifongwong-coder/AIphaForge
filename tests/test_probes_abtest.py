@@ -493,13 +493,27 @@ class TestRunABProbe:
 # ---------- Determinism check ----------
 
 class TestDeterminismCheck:
+    def _resolved(self, *, metrics=("total_return",), rel_tol=1e-3):
+        # v2.0.1 r5: _check_agent_determinism now requires a
+        # ResolvedDeterminismConfig (built by run_ab_probe via
+        # resolve_determinism_config). Tests build one inline.
+        from aiphaforge.probes.abtest import resolve_determinism_config
+        return resolve_determinism_config(
+            mode="raw_only", profile="v2_compat",
+            determinism_metrics=metrics,
+            determinism_rel_tol=rel_tol,
+        )
+
     def test_deterministic_strategy_passes(self):
         data = _ohlcv(n=40)
-        ok = _check_agent_determinism(
-            _baseline_factory, data, seed=0,
+        result = _check_agent_determinism(
+            _baseline_factory, data,
+            resolved_config=self._resolved(),
+            seed=0,
             engine_kwargs={"include_benchmark": False},
         )
-        assert ok is True
+        assert result.passed is True
+        assert result.status == "passed"
 
     def test_nondeterministic_strategy_flagged(self):
         # Strategy whose RNG seed is incremented on every construction,
@@ -507,10 +521,13 @@ class TestDeterminismCheck:
         # the second invocation. Using a class-level counter rather
         # than an unseeded `default_rng()` keeps the test reproducible
         # across machines and Python versions.
-        class _RandomTilt:
+        from aiphaforge.strategies import BaseStrategy
+
+        class _RandomTilt(BaseStrategy):
             _counter = 0
 
             def __init__(self):
+                super().__init__()
                 _RandomTilt._counter += 1
                 self._rng = np.random.default_rng(seed=_RandomTilt._counter)
 
@@ -521,8 +538,13 @@ class TestDeterminismCheck:
                 )
 
         data = _ohlcv(n=40)
-        ok = _check_agent_determinism(
-            lambda: _RandomTilt(), data, seed=0,
+        result = _check_agent_determinism(
+            lambda: _RandomTilt(), data,
+            resolved_config=self._resolved(),
+            seed=0,
             engine_kwargs={"include_benchmark": False},
         )
-        assert ok is False
+        assert result.passed is False
+        assert result.status == "failed"
+        # The failed metric is total_return per the v2_compat profile.
+        assert "total_return" in result.failed_metrics

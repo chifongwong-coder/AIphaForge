@@ -21,15 +21,17 @@ Aggregation rules follow `docs/plans/v2.0-plan.md` §1.7:
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict
 from statistics import median
-from typing import Any, Optional, Sequence
+from typing import Any, Literal, Optional, Sequence, Union
 
 from aiphaforge.probes.models import (
     AnswerRecord,
     QAProbeReport,
     QuestionScore,
     QuestionSpec,
+    TemplateAggregate,
     ToleranceProfile,
 )
 from aiphaforge.probes.questions import (
@@ -37,6 +39,351 @@ from aiphaforge.probes.questions import (
     normalize_binary,
     normalize_direction,
 )
+
+# ---------- v2.0.1 user-facing parser helpers ----------
+
+# Regex for a signed scientific-notation float. Accepts ASCII '-' and
+# Unicode minus '−' (U+2212). Anchored matches happen via .fullmatch
+# at use sites; this is the building block.
+_NUMBER_RE = re.compile(
+    r"[-−]?\d+(?:,\d{3})*(?:\.\d+)?(?:[eE][-+]?\d+)?"
+)
+
+# Currency symbols / unit suffixes to strip before number parsing.
+_CURRENCY_SYMBOLS = ("$", "€", "£", "¥", "₿")
+_UNIT_SUFFIXES = (
+    " usd", " eur", " gbp", " jpy", " btc",
+    "usd ", "eur ", "gbp ", "jpy ", "btc ",
+)
+# Approximation prefixes to strip before number parsing.
+_APPROX_PREFIXES = (
+    "about", "approximately", "approx", "approx.", "around", "roughly",
+    "~", "≈",
+)
+# "I don't know" / refusal-style replies that always parse to None.
+_DONT_KNOW_PATTERNS = frozenset({
+    "", "n/a", "na", "none", "null", "unknown", "i don't know",
+    "i dont know", "idk", "no answer", "cannot answer", "can't answer",
+})
+
+
+def _normalize_minus(s: str) -> str:
+    """Convert Unicode minus (U+2212) and en/em-dash to ASCII '-'.
+
+    Used for the *number-parsing* path only; the range-detection path
+    handles em-dash separately via a dedicated split rule.
+    """
+    return s.replace("\u2212", "-")
+
+
+def _strip_currency_and_units(s: str) -> str:
+    out = s
+    for sym in _CURRENCY_SYMBOLS:
+        out = out.replace(sym, "")
+    lo = out.lower()
+    for suf in _UNIT_SUFFIXES:
+        lo = lo.replace(suf, " ")
+    return lo
+
+
+def _strip_approximation(s: str) -> str:
+    out = s.strip().lower()
+    for pref in _APPROX_PREFIXES:
+        if out.startswith(pref):
+            out = out[len(pref):].lstrip(" \t.")
+    return out
+
+
+def _try_float(token: str) -> Optional[float]:
+    """Parse a single numeric token to float, returning None on failure.
+
+    Handles thousands separators and Unicode minus.
+    """
+    cleaned = _normalize_minus(token).replace(",", "").strip()
+    if not cleaned:
+        return None
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def _extract_numbers(s: str) -> list[float]:
+    """Find all numeric tokens in `s` and return them parsed."""
+    out: list[float] = []
+    for m in _NUMBER_RE.finditer(_normalize_minus(s)):
+        v = _try_float(m.group(0))
+        if v is not None:
+            out.append(v)
+    return out
+
+
+def _try_range(s: str) -> Optional[tuple[float, float]]:
+    """Detect a numeric-range answer; return (lo, hi) or None.
+
+    Conventions (documented in the public docstring):
+    - Bracketed: ``[lo, hi]`` or ``(lo, hi)``
+    - Worded: ``lo to hi``, ``between lo and hi``, ``from lo to hi``
+    - Hyphen with or without spaces: ``lo-hi`` and ``lo - hi`` are
+      both ranges (r5 §2.1: parser is an answer parser, not an
+      expression evaluator).
+    - En/em-dash with or without spaces: ``lo–hi``, ``lo — hi``.
+    """
+    raw = s.strip()
+    norm = raw.lower()
+
+    # Bracketed forms.
+    bracket_match = re.fullmatch(
+        r"[\[(]\s*([-−]?\d[\d.,eE+\-−]*)\s*,\s*([-−]?\d[\d.,eE+\-−]*)\s*[\])]",
+        raw,
+    )
+    if bracket_match:
+        lo = _try_float(bracket_match.group(1))
+        hi = _try_float(bracket_match.group(2))
+        if lo is not None and hi is not None:
+            return (lo, hi)
+
+    # Worded forms.
+    for pattern in (
+        r"^\s*from\s+(.+?)\s+to\s+(.+?)\s*$",
+        r"^\s*between\s+(.+?)\s+and\s+(.+?)\s*$",
+        r"^\s*(.+?)\s+to\s+(.+?)\s*$",
+    ):
+        m = re.match(pattern, norm)
+        if m:
+            lo = _try_float(m.group(1))
+            hi = _try_float(m.group(2))
+            if lo is not None and hi is not None:
+                return (lo, hi)
+
+    # En/em-dash range (with or without surrounding spaces).
+    em_match = re.fullmatch(
+        r"\s*([-−]?\d[\d.,eE+\-−]*)\s*[\u2013\u2014]\s*([-−]?\d[\d.,eE+\-−]*)\s*",
+        raw,
+    )
+    if em_match:
+        lo = _try_float(em_match.group(1))
+        hi = _try_float(em_match.group(2))
+        if lo is not None and hi is not None:
+            return (lo, hi)
+
+    # Hyphen, with OR without surrounding spaces (r5 §2.1).
+    direct = re.fullmatch(
+        r"\s*([-−]?\d[\d.,eE+]*(?:\.\d+)?)\s*-\s*(\d[\d.,eE+]*(?:\.\d+)?)\s*",
+        raw,
+    )
+    if direct:
+        lo = _try_float(direct.group(1))
+        hi = _try_float(direct.group(2))
+        if lo is not None and hi is not None:
+            return (lo, hi)
+
+    return None
+
+
+def _strict_raise(stage: str, text: Any, suggestion: str) -> None:
+    """Build the standard strict-mode ValueError."""
+    raw = repr(text)
+    if len(raw) > 200:
+        raw = raw[:197] + "..."
+    raise ValueError(
+        f"parse failed at {stage!r} on input {raw}; {suggestion}"
+    )
+
+
+def parse_numeric_answer(
+    text: Optional[str],
+    *,
+    strict: bool = False,
+    permissive: bool = False,
+    percent: Literal["reject", "decimal", "number"] = "reject",
+) -> Union[float, tuple[float, float], None]:
+    """Parse a raw LLM reply string into a typed numeric value.
+
+    Returns ``float`` for scalars, ``tuple[float, float]`` for ranges,
+    or ``None`` for unparseable input. Pure function — no side effects,
+    no LLM call.
+
+    Hyphen handling (r5 §2.1):
+        Hyphen-separated two-number answers are ranges, not
+        arithmetic. Both ``"172-175"`` and ``"172 - 175"`` parse to
+        ``(172.0, 175.0)``. The parser is an answer parser, not an
+        expression evaluator. Callers expecting subtraction must
+        pre-evaluate before calling this helper.
+
+    Percent handling (``percent``, r5 §2.1):
+        Inputs ending in ``%`` are ambiguous — the downstream
+        template may want a decimal (``0.025``) or a number
+        (``2.5``). Default ``"reject"`` returns ``None`` (or raises
+        in strict mode). ``"decimal"`` divides by 100; ``"number"``
+        keeps the raw value. Apply consistently per-template.
+
+    Hedging signal:
+        ``"about 172"`` returns ``172.0`` and **drops the hedging
+        signal**. Users who want to surface "this answer was hedged"
+        must re-scan ``raw_answer`` separately and stash the flag on
+        ``AnswerRecord.metadata``.
+
+    Multi-number replies (``permissive``):
+        Frontier LLMs frequently emit conversational replies like
+        ``"the open was 172.06 and the close was 175.30"``. With the
+        default ``permissive=False`` this returns ``None`` — the
+        parser refuses to guess. With ``permissive=True``, the first
+        numeric token wins.
+
+    Strict mode (``strict``):
+        Raises ``ValueError`` instead of returning ``None`` when the
+        input cannot be parsed. The error message includes the
+        verbatim input (truncated to 200 chars), the parse stage that
+        failed, and a one-line suggested fix.
+    """
+    if text is None:
+        if strict:
+            _strict_raise("input-presence", text, "input is None")
+        return None
+
+    raw = str(text).strip()
+    if raw.lower() in _DONT_KNOW_PATTERNS:
+        if strict:
+            _strict_raise(
+                "don't-know-detection", text,
+                f"input matches don't-know pattern {raw!r}",
+            )
+        return None
+
+    # Percent handling — detect a trailing ``%`` and dispatch on the
+    # caller's policy. Done early because percent strings should not
+    # fall through to currency/range stripping.
+    pct_match = re.fullmatch(
+        r"\s*([-−]?\d[\d.,eE+\-−]*)\s*%\s*", raw,
+    )
+    if pct_match:
+        if percent == "reject":
+            if strict:
+                _strict_raise(
+                    "percent-policy", text,
+                    "percent sign present but percent='reject'; "
+                    "pass percent='decimal' (divide by 100) or "
+                    "percent='number' (keep raw) to accept",
+                )
+            return None
+        v = _try_float(pct_match.group(1))
+        if v is None:
+            if strict:
+                _strict_raise(
+                    "percent-extraction", text,
+                    "could not extract a number before %",
+                )
+            return None
+        return v / 100.0 if percent == "decimal" else v
+
+    # 1. Try range detection BEFORE scalar parsing so "172-175" wins
+    #    over "172" (first-number-extraction).
+    pre_clean = _strip_approximation(_strip_currency_and_units(raw))
+    rng = _try_range(pre_clean)
+    if rng is None:
+        # Also try on the un-stripped raw input (some range forms
+        # don't survive currency stripping unchanged).
+        rng = _try_range(raw)
+    if rng is not None:
+        return rng
+
+    # 2. Scalar parsing path.
+    cleaned = _strip_approximation(_strip_currency_and_units(raw))
+    cleaned = _normalize_minus(cleaned)
+
+    numbers = _extract_numbers(cleaned)
+    if len(numbers) == 0:
+        if strict:
+            _strict_raise(
+                "number-extraction", text,
+                "no numeric tokens detected",
+            )
+        return None
+    if len(numbers) == 1:
+        return numbers[0]
+
+    # Multi-number reply.
+    if permissive:
+        return numbers[0]
+    if strict:
+        _strict_raise(
+            "multi-token disambiguation", text,
+            f"{len(numbers)} numeric tokens detected; pass "
+            "permissive=True to take the first or strip the "
+            "surrounding context before parsing",
+        )
+    return None
+
+
+def parse_choice_answer(
+    text: Optional[str],
+    allowed: Sequence[str],
+    *,
+    strict: bool = False,
+) -> Optional[str]:
+    """Parse a raw LLM reply into one of `allowed`, or None.
+
+    Wraps the internal :func:`_normalize_choice` (which dispatches to
+    direction-aware normalisation when ``allowed`` is the canonical
+    up/down/unchanged vocabulary) with a public, strict-aware API
+    symmetric to :func:`parse_numeric_answer`.
+
+    Hedging tokens (e.g., ``"probably yes"``, ``"likely up"``) parse
+    to ``None`` — the user is responsible for upstream pre-stripping
+    if they want to honor hedges.
+    """
+    if text is None:
+        if strict:
+            _strict_raise("input-presence", text, "input is None")
+        return None
+    if str(text).strip().lower() in _DONT_KNOW_PATTERNS:
+        if strict:
+            _strict_raise(
+                "don't-know-detection", text,
+                "input matches don't-know pattern",
+            )
+        return None
+    out = _normalize_choice(str(text), allowed)
+    if out is None and strict:
+        _strict_raise(
+            "choice-match", text,
+            f"input did not match any allowed value in {list(allowed)!r}",
+        )
+    return out
+
+
+def parse_binary_answer(
+    text: Optional[str],
+    *,
+    strict: bool = False,
+) -> Optional[bool]:
+    """Parse a raw LLM reply into True / False / None.
+
+    Wraps :func:`normalize_binary` with a strict-aware API symmetric
+    to :func:`parse_numeric_answer` and :func:`parse_choice_answer`.
+    Directional aliases (``"up"``, ``"higher"``) deliberately do NOT
+    map to True — see the v2.0 fix in
+    `aiphaforge.probes.questions.normalize_binary`.
+    """
+    if text is None:
+        if strict:
+            _strict_raise("input-presence", text, "input is None")
+        return None
+    if str(text).strip().lower() in _DONT_KNOW_PATTERNS:
+        if strict:
+            _strict_raise(
+                "don't-know-detection", text,
+                "input matches don't-know pattern",
+            )
+        return None
+    out = normalize_binary(str(text))
+    if out is None and strict:
+        _strict_raise(
+            "binary-match", text,
+            "input did not normalize to yes/true/1 or no/false/0",
+        )
+    return out
 
 # Weights for the descriptive `band_index_arbitrary` aggregate.
 _BAND_WEIGHTS = {"exact": 1.00, "near": 0.67, "rough": 0.33, "miss": 0.00}
@@ -384,6 +731,75 @@ def aggregate_scores(
     mean_width = sum(range_widths) / len(range_widths) if range_widths else None
     median_width = median(range_widths) if range_widths else None
 
+    # Per-template breakdown (v2.0.1 r5, A5). Typed dict keyed by
+    # template_id; load-bearing for selective-memorization detection.
+    # We pair each question with its score to bucket by template_id.
+    by_template: Optional[dict[str, TemplateAggregate]] = None
+    if total > 0:
+        templates: dict[str, list[QuestionScore]] = {}
+        for q, s in zip(question_set, all_scores):
+            templates.setdefault(q.template_id, []).append(s)
+        by_template = {}
+        for tid, tscores in templates.items():
+            t_n = len(tscores)
+            t_valid_list = [s for s in tscores if s.validity == "valid"]
+            t_valid = len(t_valid_list)
+            t_invalid = sum(
+                1 for s in tscores
+                if s.validity not in ("valid", "missing", "refusal")
+            )
+            t_missing = sum(1 for s in tscores if s.validity == "missing")
+            t_refusal = sum(1 for s in tscores if s.validity == "refusal")
+            # ``submitted`` excludes the synthetic missing rows we
+            # added when no answer was sent at all. The score-side
+            # ``validity == "missing"`` covers both the synthetic
+            # rows and any caller-supplied missing answers; per
+            # plan §6.2 we surface coverage as
+            # submitted/n_questions and parse-success as
+            # valid/max(submitted, 1).
+            t_submitted = t_n - t_missing
+            t_coverage = t_submitted / t_n if t_n else 0.0
+            t_parse_ok = t_valid / t_submitted if t_submitted else 0.0
+            tcounts = _band_counts(t_valid_list)
+            t_widths = [
+                s.range_width_ratio for s in tscores
+                if s.range_width_ratio is not None
+            ]
+            t_exceeded = sum(
+                1 for s in tscores if s.max_range_width_exceeded
+            )
+
+            def _trate(band: str, denom: int = t_valid) -> Optional[float]:
+                # Plan §6.2: zero-valid templates report None for band
+                # rates so they aren't confused with all-miss reports.
+                if denom == 0:
+                    return None
+                return tcounts.get(band, 0) / denom
+
+            by_template[tid] = TemplateAggregate(
+                n_questions=t_n,
+                submitted_answers=t_submitted,
+                valid_answers=t_valid,
+                invalid_answers=t_invalid,
+                missing_answers=t_missing,
+                refusal_answers=t_refusal,
+                coverage_rate=t_coverage,
+                parse_success_rate=t_parse_ok,
+                exact_rate=_trate("exact"),
+                near_rate=_trate("near"),
+                rough_rate=_trate("rough"),
+                miss_rate=_trate("miss"),
+                band_index_arbitrary=_band_index(tcounts, t_valid),
+                bands_breakdown=tcounts,
+                mean_range_width_ratio=(
+                    sum(t_widths) / len(t_widths) if t_widths else None
+                ),
+                median_range_width_ratio=(
+                    median(t_widths) if t_widths else None
+                ),
+                max_range_width_exceeded_count=t_exceeded,
+            )
+
     return QAProbeReport(
         total_questions=total,
         submitted_answers=submitted,
@@ -402,7 +818,7 @@ def aggregate_scores(
         mean_range_width_ratio=mean_width,
         median_range_width_ratio=median_width,
         max_range_width_exceeded_count=max_range_exceeded_count,
-        by_template=None,
+        by_template=by_template,
         by_symbol=None,
         by_period=None,
         question_scores=all_scores,
@@ -423,11 +839,71 @@ def _parse_answer_payload(
     return raw_parsed
 
 
+def _merge_provider_config(
+    manifest: Optional[dict[str, Any]],
+    provider_config: Optional[dict[str, Any]],
+) -> tuple[Optional[dict[str, Any]], Optional[dict[str, Any]]]:
+    """Merge a `provider_config` kwarg into the report manifest.
+
+    Rules per plan §3 (r5):
+    - Keys present in only one source pass through.
+    - Keys present in BOTH with the same value → merged silently.
+    - Keys present in BOTH with different values → ValueError naming
+      the conflicting key + both values.
+    - Provenance per key (``"manifest"`` / ``"kwarg"`` / ``"both"``)
+      is recorded under ``manifest["provider_config_provenance"]``.
+    - Empty-bucket rule: do not write or preserve `provider_config` /
+      `provider_config_provenance` unless the merged config has at
+      least one key. If the input manifest contains literal empty
+      buckets and merge is empty, strip them from the output.
+
+    Returns ``(merged_manifest, provenance)``. Both are ``None`` when
+    no manifest material at all was supplied.
+    """
+    if not manifest and not provider_config:
+        return None, None
+    out = dict(manifest or {})
+    existing_pc = dict(out.get("provider_config") or {})
+    incoming_pc = dict(provider_config or {})
+    provenance: dict[str, str] = {}
+    merged: dict[str, Any] = {}
+    all_keys = set(existing_pc) | set(incoming_pc)
+    for key in sorted(all_keys):
+        in_existing = key in existing_pc
+        in_incoming = key in incoming_pc
+        if in_existing and in_incoming:
+            v_existing = existing_pc[key]
+            v_incoming = incoming_pc[key]
+            if v_existing != v_incoming:
+                raise ValueError(
+                    f"provider_config collision on key {key!r}: "
+                    f"manifest has {v_existing!r}, kwarg has {v_incoming!r}. "
+                    "Same-key conflicts must be resolved by the caller; "
+                    "remove one source or align the values."
+                )
+            merged[key] = v_existing
+            provenance[key] = "both"
+        elif in_existing:
+            merged[key] = existing_pc[key]
+            provenance[key] = "manifest"
+        else:
+            merged[key] = incoming_pc[key]
+            provenance[key] = "kwarg"
+    if merged:
+        out["provider_config"] = merged
+        out["provider_config_provenance"] = provenance
+        return out, provenance
+    out.pop("provider_config", None)
+    out.pop("provider_config_provenance", None)
+    return out, None
+
+
 def score_answer_file(
     question_set: QuestionSet,
     answers_path: str,
     *,
     manifest: Optional[dict[str, Any]] = None,
+    provider_config: Optional[dict[str, Any]] = None,
 ) -> QAProbeReport:
     """Score a JSONL file of :class:`AnswerRecord` rows.
 
@@ -439,7 +915,17 @@ def score_answer_file(
     silently ignored (they may have come from a different question
     set). Questions in the set with no matching answer row are
     treated as ``missing`` by :func:`aggregate_scores`.
+
+    ``provider_config`` (v2.0.1) lets callers attach the user's
+    LLM configuration for cross-paper comparability. Recommended
+    keys live in :data:`aiphaforge.probes.models.RECOMMENDED_PROVIDER_CONFIG_KEYS`
+    (e.g., ``model``, ``snapshot_id``, ``temperature``,
+    ``prompt_template_hash``, ``prompt_cache_disclosed``,
+    ``system_fingerprint``). When both ``manifest["provider_config"]``
+    and ``provider_config=`` carry the same key with different
+    values, a ``ValueError`` is raised — never silent merge.
     """
+    merged_manifest, _ = _merge_provider_config(manifest, provider_config)
     qs_by_id = {q.question_id: q for q in question_set}
     scores: list[QuestionScore] = []
     with open(answers_path, "r") as f:
@@ -463,7 +949,7 @@ def score_answer_file(
                 metadata=obj.get("metadata", {}) or {},
             )
             scores.append(score_question(qs, ans))
-    return aggregate_scores(question_set, scores, manifest=manifest)
+    return aggregate_scores(question_set, scores, manifest=merged_manifest)
 
 
 # Re-export a couple of utilities for users wiring their own scorers.
@@ -471,6 +957,9 @@ __all__ = [
     "aggregate_scores",
     "normalize_binary",
     "normalize_direction",
+    "parse_binary_answer",
+    "parse_choice_answer",
+    "parse_numeric_answer",
     "score_answer_file",
     "score_question",
 ]

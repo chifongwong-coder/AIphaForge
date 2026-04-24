@@ -16,7 +16,7 @@ else:
 import aiphaforge
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-EXPECTED_VERSION = "2.0.0"
+EXPECTED_VERSION = "2.0.1"
 
 
 def _read_pyproject_version() -> str:
@@ -46,6 +46,7 @@ def test_multi_asset_result_symbols_preserves_order():
     """
     import numpy as np
     import pandas as pd
+
     from aiphaforge import BacktestEngine
     from aiphaforge.fees import ZeroFeeModel
 
@@ -75,6 +76,7 @@ def test_single_asset_result_has_symbols_populated():
     """
     import numpy as np
     import pandas as pd
+
     from aiphaforge import BacktestEngine
     from aiphaforge.fees import ZeroFeeModel
 

@@ -19,7 +19,7 @@ from __future__ import annotations
 import hashlib
 import warnings
 from dataclasses import asdict
-from typing import Any, Callable, Dict, List, Optional, Sequence, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Union
 
 import numpy as np
 import pandas as pd
@@ -30,10 +30,15 @@ from aiphaforge.probes.models import (
     ABProbeResult,
     ABScenario,
     AgentContract,
+    AgentImplementationContract,
+    DeterminismCheckResult,
     MetricConfig,
     MetricDropSummary,
+    ResolvedDeterminismConfig,
     ScenarioABReport,
+    UnsupportedScenarioError,
 )
+from aiphaforge.probes.scoring import _merge_provider_config
 from aiphaforge.probes.transforms import TransformPipeline
 from aiphaforge.results import BacktestResult
 from aiphaforge.strategies import (
@@ -261,43 +266,262 @@ def _run_one_arm(
     return engine.run(data)
 
 
-# ---------- Determinism check ----------
+# ---------- v2.0.1 r5: determinism check ----------
+
+# Profile defaults — see plan §5.3.
+_PROFILE_V2_COMPAT = (("total_return",), 1e-12)
+_PROFILE_LLM_BALANCED = (("total_return", "num_trades", "win_rate"), 1e-3)
+
+
+def resolve_determinism_config(
+    *,
+    mode: Literal["off", "raw_only", "per_scenario"],
+    profile: Literal["auto", "v2_compat", "llm_balanced"],
+    determinism_metrics: Optional[Sequence[str]],
+    determinism_rel_tol: Optional[float],
+) -> ResolvedDeterminismConfig:
+    """Resolve user kwargs into a concrete metrics/tol pair.
+
+    Plan §5.3 r5. ``auto + raw_only`` → ``v2_compat``; ``auto +
+    per_scenario`` → ``llm_balanced``; ``auto + off`` → no metrics.
+    Explicit ``determinism_metrics=`` and ``determinism_rel_tol=``
+    override the profile.
+    """
+    requested_metrics: Optional[tuple[str, ...]] = (
+        tuple(determinism_metrics) if determinism_metrics is not None else None
+    )
+
+    if mode == "off":
+        resolved_profile: Literal["v2_compat", "llm_balanced", "off"] = "off"
+        base_metrics: tuple[str, ...] = ()
+        base_tol: Optional[float] = None
+    else:
+        if profile == "auto":
+            resolved_profile = (
+                "v2_compat" if mode == "raw_only" else "llm_balanced"
+            )
+        else:
+            resolved_profile = profile
+        if resolved_profile == "v2_compat":
+            base_metrics, base_tol = _PROFILE_V2_COMPAT
+        else:
+            base_metrics, base_tol = _PROFILE_LLM_BALANCED
+
+    metrics_out = (
+        requested_metrics if requested_metrics is not None else base_metrics
+    )
+    tol_out = (
+        determinism_rel_tol if determinism_rel_tol is not None else base_tol
+    )
+
+    return ResolvedDeterminismConfig(
+        profile=resolved_profile,
+        determinism_metrics=metrics_out,
+        determinism_rel_tol=tol_out,
+        requested_profile=profile,
+        requested_metrics=requested_metrics,
+        requested_rel_tol=determinism_rel_tol,
+    )
+
+
+def _stable_view_fingerprint(view: pd.DataFrame) -> str:
+    """Deterministic hash of a transformed view, for replayability check.
+
+    Same shape + same byte content → same fingerprint. Used by the
+    per-scenario transformed-arm check to refuse user transforms
+    that ignore ``seed=`` (plan §5.8).
+    """
+    h = hashlib.sha256()
+    h.update(view.values.astype(np.float64).tobytes())
+    h.update(np.asarray(view.index.values).tobytes())
+    h.update(",".join(map(str, view.columns)).encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+def _is_finite(x: float) -> bool:
+    return not (np.isnan(x) or np.isinf(x))
+
+
+def _values_match(v1: float, v2: float, *, rel_tol: float) -> bool:
+    """Symmetric relative-tolerance equality with NaN handling.
+
+    Two NaNs match (both runs failed identically). One NaN does not
+    match a finite value. Both finite values use the existing
+    symmetric denominator.
+    """
+    nan1 = np.isnan(v1)
+    nan2 = np.isnan(v2)
+    if nan1 and nan2:
+        return True
+    if nan1 or nan2:
+        return False
+    denom = max(abs(v1), abs(v2), 1e-12)
+    return abs(v1 - v2) / denom < rel_tol
+
 
 def _check_agent_determinism(
     factory: AgentFactory,
     data: pd.DataFrame,
     *,
+    resolved_config: ResolvedDeterminismConfig,
     seed: Optional[int],
     engine_kwargs: Optional[Dict[str, Any]],
-    metric: str = "total_return",
-) -> bool:
-    """Run the same factory twice on identical inputs.
+    transforms: Optional[Sequence] = None,
+    mode: str = "market_level",
+) -> DeterminismCheckResult:
+    """Run the factory twice on identical inputs; return result object.
 
-    Returns True if both runs produce the same metric value (within
-    1e-12 relative tolerance), False otherwise. The runner cannot
-    police what a stateful Hook does internally — this surfaces
-    non-determinism so the user sees it as a warning rather than
-    silently absorbing it into the obfuscation noise term.
+    Plan §5.7 r5 contract:
+    1. Exactly one engine pair per arm (extracted metrics share runs).
+    2. ``UnsupportedScenarioError`` re-raised to the orchestrator.
+    3. Ordinary exceptions → ``status="error"``, ``passed=False``.
+    4. Returns metric-level pass/fail accounting in ``failed_metrics``.
     """
+    transforms = list(transforms) if transforms else []
+    metrics = resolved_config.determinism_metrics
+    rel_tol = resolved_config.determinism_rel_tol or 0.0
+
     try:
         r1 = _run_one_arm(
-            factory, data, transforms=[], mode="market_level",
+            factory, data, transforms=transforms, mode=mode,
             seed=seed, engine_kwargs=engine_kwargs,
         )
         r2 = _run_one_arm(
-            factory, data, transforms=[], mode="market_level",
+            factory, data, transforms=transforms, mode=mode,
             seed=seed, engine_kwargs=engine_kwargs,
         )
-    except Exception:
+    except UnsupportedScenarioError:
+        # Framework preflight signals — orchestrator records as
+        # status="unsupported", not as a determinism failure.
+        raise
+    except Exception as exc:
+        return DeterminismCheckResult(
+            passed=False,
+            status="error",
+            metric_values_run_1={},
+            metric_values_run_2={},
+            failed_metrics=[],
+            determinism_metrics=tuple(metrics),
+            determinism_rel_tol=rel_tol,
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+        )
+
+    values_1: dict[str, float] = {}
+    values_2: dict[str, float] = {}
+    failed: list[str] = []
+    for m in metrics:
+        v1 = _extract_metric(r1, m)
+        v2 = _extract_metric(r2, m)
+        # Internal dataclass dicts are finite-float-only; let the
+        # JSON serializer expand to None / sentinels.
+        if _is_finite(v1):
+            values_1[m] = float(v1)
+        if _is_finite(v2):
+            values_2[m] = float(v2)
+        if not _values_match(v1, v2, rel_tol=rel_tol):
+            failed.append(m)
+
+    if failed:
+        return DeterminismCheckResult(
+            passed=False,
+            status="failed",
+            metric_values_run_1=values_1,
+            metric_values_run_2=values_2,
+            failed_metrics=failed,
+            determinism_metrics=tuple(metrics),
+            determinism_rel_tol=rel_tol,
+        )
+    return DeterminismCheckResult(
+        passed=True,
+        status="passed",
+        metric_values_run_1=values_1,
+        metric_values_run_2=values_2,
+        failed_metrics=[],
+        determinism_metrics=tuple(metrics),
+        determinism_rel_tol=rel_tol,
+    )
+
+
+def _arm_result_to_json(
+    result: Optional[DeterminismCheckResult],
+    *,
+    metrics: Sequence[str],
+    rel_tol: Optional[float],
+) -> Optional[dict[str, Any]]:
+    """Serialize one ``DeterminismCheckResult`` to JSON-safe ``ArmResult``.
+
+    Plan §5.10 r5: every requested metric appears as a key (missing
+    → None, never omitted); NaN/inf normalize to string sentinels.
+    Returns ``None`` when ``result is None`` (the off-mode shape).
+    """
+    if result is None:
+        return None
+    metric_keys = tuple(metrics)
+
+    def _project(values: dict[str, float]) -> dict[str, Optional[Union[float, str]]]:
+        out: dict[str, Optional[Union[float, str]]] = {}
+        for k in metric_keys:
+            if k not in values:
+                out[k] = None
+                continue
+            v = values[k]
+            if np.isnan(v):
+                out[k] = "nan"
+            elif np.isposinf(v):
+                out[k] = "inf"
+            elif np.isneginf(v):
+                out[k] = "-inf"
+            else:
+                out[k] = float(v)
+        return out
+
+    return {
+        "passed": result.passed,
+        "status": result.status,
+        "metric_values_run_1": _project(result.metric_values_run_1),
+        "metric_values_run_2": _project(result.metric_values_run_2),
+        "failed_metrics": list(result.failed_metrics),
+        "determinism_metrics": list(metric_keys),
+        "determinism_rel_tol": rel_tol,
+        "error_type": result.error_type,
+        "error_message": result.error_message,
+        "metadata": dict(result.metadata),
+    }
+
+
+def _legacy_pass(
+    result: Optional[DeterminismCheckResult],
+    *,
+    mode: str,
+) -> Optional[bool]:
+    """Plan §5.11: legacy bool mirror conversion."""
+    if mode == "off":
+        return None
+    if result is None:
         return False
-    v1 = _extract_metric(r1, metric)
-    v2 = _extract_metric(r2, metric)
-    if np.isnan(v1) and np.isnan(v2):
-        return True
-    if np.isnan(v1) or np.isnan(v2):
-        return False
-    denom = max(abs(v1), abs(v2), 1e-12)
-    return abs(v1 - v2) / denom < 1e-12
+    return result.status == "passed"
+
+
+def _preflight_unsupported(
+    *,
+    contract: Optional[AgentImplementationContract],
+    scenario_mode: str,
+) -> Optional[str]:
+    """Return an UnsupportedScenarioError reason or None.
+
+    Plan §5.5 / §5.15: preflight detects the v2.0.1 unsupported
+    combinations. Currently only ``view_only`` + plain ``hook``.
+    Other contracts are admitted; the orchestrator surfaces ordinary
+    runtime errors as ``status="error"``.
+    """
+    if scenario_mode == "view_only" and contract == "hook":
+        return (
+            "view_only with a plain hook is unsupported in v2.0.1; "
+            "use hook_view_only_capable or wait for the v2.2 broker-proxy "
+            "wrapper."
+        )
+    return None
 
 
 # ---------- Drop math ----------
@@ -345,13 +569,60 @@ def _hash_data(data: pd.DataFrame) -> str:
     return h.hexdigest()[:16]
 
 
+def _format_determinism_warning(
+    *,
+    subject: str,
+    scenario_id: str,
+    arm: str,
+    result: DeterminismCheckResult,
+) -> Optional[str]:
+    """Build a status-based warning per plan §5.14.
+
+    Returns ``None`` for ``passed`` results. Warning text always
+    carries ``subject=``, ``scenario=``, ``arm=``, and either
+    ``failed_metrics=`` or ``reason=``.
+    """
+    status = result.status
+    if status == "passed":
+        return None
+    if status == "failed":
+        return (
+            f"agent_determinism_check_failed: subject={subject} "
+            f"scenario={scenario_id} arm={arm} "
+            f"failed_metrics={result.failed_metrics}; "
+            f"determinism_rel_tol={result.determinism_rel_tol}; "
+            "see manifest for values."
+        )
+    if status == "error":
+        return (
+            f"agent_determinism_check_error: subject={subject} "
+            f"scenario={scenario_id} arm={arm} "
+            f"reason='{result.error_type}: {result.error_message}'."
+        )
+    if status == "unsupported":
+        return (
+            f"agent_determinism_check_unsupported: subject={subject} "
+            f"scenario={scenario_id} arm={arm} "
+            f"reason='{result.error_message}'; "
+            "this is not a determinism failure."
+        )
+    return None
+
+
 def _scenario_warnings(
     scenario: ABScenario,
     *,
     parity_warning: Optional[str],
-    determinism_ok_ai: bool,
-    determinism_ok_baseline: bool,
+    transformed_ai: Optional[DeterminismCheckResult] = None,
+    transformed_baseline: Optional[DeterminismCheckResult] = None,
 ) -> List[str]:
+    """Per-scenario warnings.
+
+    Raw-arm warnings emit ONCE per subject at the top level (plan
+    §5.14: "raw warnings emit once per subject, not once per
+    scenario"). This function only handles transform-detectability,
+    capacity-parity, and the transformed-arm determinism warnings.
+    """
     out: List[str] = []
     detectable = sorted({
         getattr(t, "name", type(t).__name__)
@@ -367,18 +638,20 @@ def _scenario_warnings(
         )
     if parity_warning:
         out.append(parity_warning)
-    if not determinism_ok_ai:
-        out.append(
-            "agent_determinism_check_failed_ai: re-running the AI factory "
-            "on identical inputs produced different metric values. "
-            "Stochastic agents bias paired comparisons; consider "
-            "temperature=0 with a deterministic seed."
+    if transformed_ai is not None:
+        w = _format_determinism_warning(
+            subject="ai", scenario_id=scenario.scenario_id,
+            arm="transformed", result=transformed_ai,
         )
-    if not determinism_ok_baseline:
-        out.append(
-            "agent_determinism_check_failed_baseline: baseline factory "
-            "is non-deterministic on identical inputs."
+        if w:
+            out.append(w)
+    if transformed_baseline is not None:
+        w = _format_determinism_warning(
+            subject="baseline", scenario_id=scenario.scenario_id,
+            arm="transformed", result=transformed_baseline,
         )
+        if w:
+            out.append(w)
     return out
 
 
@@ -422,6 +695,11 @@ def run_ab_probe(
     min_valid_repeats: int = 5,
     agent_contract: Optional[AgentContract] = None,
     enable_ai_noise_control: bool = False,
+    agent_determinism_check: Literal["off", "raw_only", "per_scenario"] = "raw_only",
+    determinism_profile: Literal["auto", "v2_compat", "llm_balanced"] = "auto",
+    determinism_metrics: Optional[Sequence[str]] = None,
+    determinism_rel_tol: Optional[float] = None,
+    agent_implementation_contract: Optional[AgentImplementationContract] = None,
     engine_kwargs: Optional[Dict[str, Any]] = None,
     provider_config: Optional[Dict[str, Any]] = None,
     parity_band: tuple[float, float] = (0.5, 2.0),
@@ -432,6 +710,34 @@ def run_ab_probe(
     baseline raw, baseline test); paired seeds within a repeat keep
     AI and baseline aligned on the same transform realization.
     Output is descriptive — no p-values, no verdicts.
+
+    Determinism check (v2.0.1 r5):
+        ``agent_determinism_check`` chooses ``off`` / ``raw_only``
+        (default; v2.0-compatible) / ``per_scenario``.
+
+        ``determinism_profile`` resolves into a concrete
+        (metrics, rel_tol) pair. ``"auto"`` + ``raw_only`` →
+        ``v2_compat`` (``("total_return",)`` + ``1e-12``); ``"auto"``
+        + ``per_scenario`` → ``llm_balanced``
+        (``("total_return", "num_trades", "win_rate")`` + ``1e-3``).
+        Explicit ``determinism_metrics=`` and
+        ``determinism_rel_tol=`` override the profile.
+
+        ``agent_implementation_contract`` declares the agent's
+        implementation shape (``"strategy"`` / ``"hook"`` /
+        ``"hook_view_only_capable"`` / ``"callable_factory"``);
+        unsupported combinations (e.g. ``view_only`` + plain
+        ``"hook"``) are reported as ``status="unsupported"`` rather
+        than as a determinism failure.
+
+        Distinct from the existing ``agent_contract`` kwarg, which
+        is the *order-shape* literal governing transform
+        admissibility under ``view_only``.
+
+        The canonical determinism schema lives at
+        ``manifest["determinism_check"]`` with ``schema_version``;
+        legacy flat mirror fields (``ai_determinism_check_passed``,
+        ...) are derived from it.
     """
     cfg_map: Dict[str, MetricConfig] = dict(DEFAULT_METRIC_CONFIG)
     if metric_config:
@@ -457,24 +763,41 @@ def run_ab_probe(
         else list(range(n_repeat))
     )
 
-    # Determinism check (one factory each, separate from main loop).
-    # Note: this is a once-per-probe check on the raw path. A Hook
-    # whose non-determinism is triggered only by transformed inputs
-    # (e.g., a regime-flag-driven random call) will not be caught
-    # here — surface that limitation in the warning string.
-    determinism_ok_ai = _check_agent_determinism(
-        ai_factory, data, seed=seeds_used[0],
-        engine_kwargs=engine_kwargs,
-    )
-    determinism_ok_baseline = _check_agent_determinism(
-        baseline_factory, data, seed=seeds_used[0],
-        engine_kwargs=engine_kwargs,
+    # Resolve determinism config once (plan §5.3).
+    resolved = resolve_determinism_config(
+        mode=agent_determinism_check,
+        profile=determinism_profile,
+        determinism_metrics=determinism_metrics,
+        determinism_rel_tol=determinism_rel_tol,
     )
 
+    # Raw determinism — one engine pair per subject, shared across
+    # all scenarios in per_scenario mode (plan §5.4).
+    raw_ai: Optional[DeterminismCheckResult] = None
+    raw_baseline: Optional[DeterminismCheckResult] = None
+    if agent_determinism_check != "off":
+        raw_ai = _check_agent_determinism(
+            ai_factory, data,
+            resolved_config=resolved,
+            seed=seeds_used[0], engine_kwargs=engine_kwargs,
+        )
+        raw_baseline = _check_agent_determinism(
+            baseline_factory, data,
+            resolved_config=resolved,
+            seed=seeds_used[0], engine_kwargs=engine_kwargs,
+        )
+        # Raw warnings emit once per subject at the top level (plan
+        # §5.14) — not duplicated under each scenario_id.
+        for subj, res in (("ai", raw_ai), ("baseline", raw_baseline)):
+            w = _format_determinism_warning(
+                subject=subj, scenario_id="__raw__",
+                arm="raw", result=res,
+            )
+            if w:
+                warnings.warn(w, stacklevel=2)
+
     # Capture baseline + AI configuration for cross-paper manifest
-    # comparability — two probes using `MACrossBaseline(short=10,
-    # long=30)` vs `MACrossBaseline(short=20, long=50)` produce
-    # non-comparable excess_drops; the repr distinguishes them.
+    # comparability.
     try:
         ai_repr = repr(ai_factory())
     except Exception as e:  # pragma: no cover - defensive
@@ -485,26 +808,146 @@ def run_ab_probe(
         baseline_repr = f"<unrepresentable: {e!r}>"
 
     scenario_reports: List[ScenarioABReport] = []
+    transformed_ai_per_scenario: Dict[str, Optional[DeterminismCheckResult]] = {}
+    transformed_baseline_per_scenario: Dict[str, Optional[DeterminismCheckResult]] = {}
     for scenario in scenarios:
-        scenario_reports.append(
-            _run_scenario(
-                scenario=scenario,
-                ai_factory=ai_factory,
-                baseline_factory=baseline_factory,
-                data=data,
-                metrics=metrics,
-                cfg_map=cfg_map,
-                seeds_used=seeds_used,
-                n_repeat=n_repeat,
-                min_valid_repeats=min_valid_repeats,
-                agent_contract=agent_contract,
-                enable_ai_noise_control=enable_ai_noise_control,
-                engine_kwargs=engine_kwargs,
-                parity_band=parity_band,
-                determinism_ok_ai=determinism_ok_ai,
-                determinism_ok_baseline=determinism_ok_baseline,
-            )
+        report, t_ai, t_base = _run_scenario(
+            scenario=scenario,
+            ai_factory=ai_factory,
+            baseline_factory=baseline_factory,
+            data=data,
+            metrics=metrics,
+            cfg_map=cfg_map,
+            seeds_used=seeds_used,
+            n_repeat=n_repeat,
+            min_valid_repeats=min_valid_repeats,
+            agent_contract=agent_contract,
+            agent_implementation_contract=agent_implementation_contract,
+            enable_ai_noise_control=enable_ai_noise_control,
+            engine_kwargs=engine_kwargs,
+            parity_band=parity_band,
+            agent_determinism_check=agent_determinism_check,
+            resolved_config=resolved,
         )
+        scenario_reports.append(report)
+        transformed_ai_per_scenario[scenario.scenario_id] = t_ai
+        transformed_baseline_per_scenario[scenario.scenario_id] = t_base
+
+    # Build canonical determinism_check first (plan §5.9, §5.16 #6).
+    metric_keys = resolved.determinism_metrics
+    rel_tol_out = resolved.determinism_rel_tol
+
+    def _per_scenario_dict(
+        transformed_map: Dict[str, Optional[DeterminismCheckResult]],
+        raw_result: Optional[DeterminismCheckResult],
+    ) -> Dict[str, Dict[str, Optional[Dict[str, Any]]]]:
+        # Per-scenario raw fields are intentionally duplicated under
+        # every scenario_id for self-contained export (plan §5.13);
+        # the raw check is still executed only once.
+        raw_arm = _arm_result_to_json(
+            raw_result, metrics=metric_keys, rel_tol=rel_tol_out,
+        )
+        out: Dict[str, Dict[str, Optional[Dict[str, Any]]]] = {}
+        for sid, t_res in transformed_map.items():
+            out[sid] = {
+                "raw": raw_arm,
+                "transformed": _arm_result_to_json(
+                    t_res, metrics=metric_keys, rel_tol=rel_tol_out,
+                ),
+            }
+        return out
+
+    canonical = {
+        "schema_version": "2.0.1",
+        "mode": agent_determinism_check,
+        "agent_implementation_contract": agent_implementation_contract,
+        "requested": {
+            "determinism_profile": resolved.requested_profile,
+            "determinism_metrics": (
+                list(resolved.requested_metrics)
+                if resolved.requested_metrics is not None
+                else None
+            ),
+            "determinism_rel_tol": resolved.requested_rel_tol,
+        },
+        "resolved": {
+            "profile": resolved.profile,
+            "determinism_metrics": list(metric_keys),
+            "determinism_rel_tol": rel_tol_out,
+        },
+        "subjects": {
+            "ai": {
+                "raw": _arm_result_to_json(
+                    raw_ai, metrics=metric_keys, rel_tol=rel_tol_out,
+                ),
+                "per_scenario": (
+                    _per_scenario_dict(transformed_ai_per_scenario, raw_ai)
+                    if agent_determinism_check == "per_scenario"
+                    else {}
+                ),
+            },
+            "baseline": {
+                "raw": _arm_result_to_json(
+                    raw_baseline, metrics=metric_keys, rel_tol=rel_tol_out,
+                ),
+                "per_scenario": (
+                    _per_scenario_dict(
+                        transformed_baseline_per_scenario, raw_baseline,
+                    )
+                    if agent_determinism_check == "per_scenario"
+                    else {}
+                ),
+            },
+        },
+        "controls": {},
+        "extension": {},
+    }
+
+    # Legacy flat mirrors derived from canonical (plan §5.11, §5.12).
+    def _flat_per_scenario(
+        subject_block: Dict[str, Any],
+    ) -> Dict[str, Dict[str, Any]]:
+        flat: Dict[str, Dict[str, Any]] = {}
+        for sid, arms in subject_block.get("per_scenario", {}).items():
+            raw_arm = arms.get("raw") or {}
+            t_arm = arms.get("transformed") or {}
+            flat[sid] = {
+                "raw_passed": raw_arm.get("passed"),
+                "raw_status": raw_arm.get("status"),
+                "raw_failed_metrics": raw_arm.get("failed_metrics", []),
+                "raw_metric_values_run_1": raw_arm.get(
+                    "metric_values_run_1", {}
+                ),
+                "raw_metric_values_run_2": raw_arm.get(
+                    "metric_values_run_2", {}
+                ),
+                "raw_error_type": raw_arm.get("error_type"),
+                "raw_error_message": raw_arm.get("error_message"),
+                "transformed_passed": t_arm.get("passed"),
+                "transformed_status": t_arm.get("status"),
+                "transformed_failed_metrics": t_arm.get(
+                    "failed_metrics", []
+                ),
+                "transformed_metric_values_run_1": t_arm.get(
+                    "metric_values_run_1", {}
+                ),
+                "transformed_metric_values_run_2": t_arm.get(
+                    "metric_values_run_2", {}
+                ),
+                "transformed_error_type": t_arm.get("error_type"),
+                "transformed_error_message": t_arm.get("error_message"),
+            }
+        return flat
+
+    is_off = agent_determinism_check == "off"
+    legacy_status_ai = (
+        "off" if is_off
+        else (raw_ai.status if raw_ai is not None else "error")
+    )
+    legacy_status_baseline = (
+        "off" if is_off
+        else (raw_baseline.status if raw_baseline is not None else "error")
+    )
 
     manifest = {
         "data_hash": _hash_data(data),
@@ -523,12 +966,38 @@ def run_ab_probe(
         "agent_contract": agent_contract,
         "enable_ai_noise_control": enable_ai_noise_control,
         "parity_band": list(parity_band),
-        "ai_determinism_check_passed": determinism_ok_ai,
-        "baseline_determinism_check_passed": determinism_ok_baseline,
+        "determinism_check": canonical,
+        # Legacy mirror fields (plan §5.11) — derived from canonical.
+        "agent_determinism_check_mode": agent_determinism_check,
+        "determinism_profile": resolved.profile,
+        "determinism_metrics": list(metric_keys),
+        "determinism_rel_tol": rel_tol_out,
+        "agent_implementation_contract": agent_implementation_contract,
+        "ai_determinism_check_passed": _legacy_pass(
+            raw_ai, mode=agent_determinism_check,
+        ),
+        "baseline_determinism_check_passed": _legacy_pass(
+            raw_baseline, mode=agent_determinism_check,
+        ),
+        "ai_determinism_check_status": legacy_status_ai,
+        "baseline_determinism_check_status": legacy_status_baseline,
+        "ai_determinism_failed_metrics": (
+            [] if is_off
+            else (raw_ai.failed_metrics if raw_ai is not None else [])
+        ),
+        "baseline_determinism_failed_metrics": (
+            [] if is_off
+            else (raw_baseline.failed_metrics if raw_baseline is not None else [])
+        ),
+        "ai_determinism_check_per_scenario": _flat_per_scenario(
+            canonical["subjects"]["ai"]
+        ),
+        "baseline_determinism_check_per_scenario": _flat_per_scenario(
+            canonical["subjects"]["baseline"]
+        ),
         "ai_factory_repr": ai_repr,
         "baseline_factory_repr": baseline_repr,
         "engine_kwargs": dict(engine_kwargs or {}),
-        "provider_config": dict(provider_config or {}),
         "scenarios": [
             {
                 "scenario_id": s.scenario_id,
@@ -547,7 +1016,13 @@ def run_ab_probe(
             for s in scenarios
         ],
     }
-    return ABProbeResult(scenarios=scenario_reports, manifest=manifest)
+    # Provider config plumbed through the same merge helper as Q&A so
+    # the empty-bucket strip rule (plan §3.4) applies uniformly.
+    merged_manifest, _prov = _merge_provider_config(manifest, provider_config)
+    return ABProbeResult(
+        scenarios=scenario_reports,
+        manifest=merged_manifest if merged_manifest is not None else manifest,
+    )
 
 
 def _run_scenario(
@@ -562,12 +1037,17 @@ def _run_scenario(
     n_repeat: int,
     min_valid_repeats: int,
     agent_contract: Optional[AgentContract],
+    agent_implementation_contract: Optional[AgentImplementationContract],
     enable_ai_noise_control: bool,
     engine_kwargs: Optional[Dict[str, Any]],
     parity_band: tuple[float, float],
-    determinism_ok_ai: bool,
-    determinism_ok_baseline: bool,
-) -> ScenarioABReport:
+    agent_determinism_check: str,
+    resolved_config: ResolvedDeterminismConfig,
+) -> tuple[
+    ScenarioABReport,
+    Optional[DeterminismCheckResult],
+    Optional[DeterminismCheckResult],
+]:
     """Run one ABScenario across n_repeat repeats."""
 
     # Pre-check: TransformPipeline construction validates mode and
@@ -789,12 +1269,120 @@ def _run_scenario(
             stacklevel=2,
         )
 
+    # Per-scenario determinism check (plan §5.4 r5). The raw-arm
+    # check ran once at the top level; here we run the transformed
+    # arm. Plan §5.5: framework preflight detects unsupported
+    # combinations (e.g. view_only + plain hook) and surfaces them as
+    # status="unsupported", not as failures. Plan §5.8: the gate is
+    # replayability, not stochasticity — a seeded stochastic
+    # transform that produces the same fingerprint twice IS valid.
+    transformed_ai: Optional[DeterminismCheckResult] = None
+    transformed_baseline: Optional[DeterminismCheckResult] = None
+    if (
+        agent_determinism_check == "per_scenario"
+        and scenario.transforms
+    ):
+        unsupported_reason = _preflight_unsupported(
+            contract=agent_implementation_contract,
+            scenario_mode=scenario.mode,
+        )
+        if unsupported_reason is not None:
+            transformed_ai = DeterminismCheckResult(
+                passed=None,
+                status="unsupported",
+                metric_values_run_1={},
+                metric_values_run_2={},
+                failed_metrics=[],
+                determinism_metrics=resolved_config.determinism_metrics,
+                determinism_rel_tol=resolved_config.determinism_rel_tol or 0.0,
+                error_type="UnsupportedScenarioError",
+                error_message=unsupported_reason,
+            )
+            transformed_baseline = transformed_ai
+        else:
+            # Replayability fingerprint test (plan §5.8). User
+            # transforms that ignore seed get reported as
+            # status="unsupported".
+            replay_seed = seeds_used[0]
+            replayable = True
+            try:
+                pipeline = TransformPipeline(
+                    transforms=list(scenario.transforms),
+                    mode=scenario.mode,
+                )
+                view_1 = pipeline.apply(data, seed=replay_seed)
+                view_2 = pipeline.apply(data, seed=replay_seed)
+                fp_1 = _stable_view_fingerprint(view_1)
+                fp_2 = _stable_view_fingerprint(view_2)
+                replayable = fp_1 == fp_2
+            except Exception:
+                # Pipeline construction failure isn't a determinism
+                # question; the per-arm check below will surface it
+                # with the appropriate status.
+                replayable = True
+
+            if not replayable:
+                transformed_ai = DeterminismCheckResult(
+                    passed=None,
+                    status="unsupported",
+                    metric_values_run_1={},
+                    metric_values_run_2={},
+                    failed_metrics=[],
+                    determinism_metrics=resolved_config.determinism_metrics,
+                    determinism_rel_tol=resolved_config.determinism_rel_tol or 0.0,
+                    error_type="NonReplayableViewError",
+                    error_message=(
+                        "transform pipeline produced different views for the "
+                        "same seed; cannot fix the arm for a determinism check."
+                    ),
+                )
+                transformed_baseline = transformed_ai
+            else:
+                try:
+                    transformed_ai = _check_agent_determinism(
+                        ai_factory, data,
+                        resolved_config=resolved_config,
+                        seed=replay_seed,
+                        engine_kwargs=engine_kwargs,
+                        transforms=scenario.transforms,
+                        mode=scenario.mode,
+                    )
+                except UnsupportedScenarioError as exc:
+                    transformed_ai = DeterminismCheckResult(
+                        passed=None, status="unsupported",
+                        metric_values_run_1={}, metric_values_run_2={},
+                        failed_metrics=[],
+                        determinism_metrics=resolved_config.determinism_metrics,
+                        determinism_rel_tol=resolved_config.determinism_rel_tol or 0.0,
+                        error_type="UnsupportedScenarioError",
+                        error_message=str(exc),
+                    )
+                try:
+                    transformed_baseline = _check_agent_determinism(
+                        baseline_factory, data,
+                        resolved_config=resolved_config,
+                        seed=replay_seed,
+                        engine_kwargs=engine_kwargs,
+                        transforms=scenario.transforms,
+                        mode=scenario.mode,
+                    )
+                except UnsupportedScenarioError as exc:
+                    transformed_baseline = DeterminismCheckResult(
+                        passed=None, status="unsupported",
+                        metric_values_run_1={}, metric_values_run_2={},
+                        failed_metrics=[],
+                        determinism_metrics=resolved_config.determinism_metrics,
+                        determinism_rel_tol=resolved_config.determinism_rel_tol or 0.0,
+                        error_type="UnsupportedScenarioError",
+                        error_message=str(exc),
+                    )
+
     n_unique = n_repeat if is_stochastic_pipeline else 1
     warning_list = _scenario_warnings(
         scenario,
         parity_warning=parity_warning,
-        determinism_ok_ai=determinism_ok_ai,
-        determinism_ok_baseline=determinism_ok_baseline,
+        transformed_ai=transformed_ai,
+        transformed_baseline=transformed_baseline,
     )
     if enable_ai_noise_control and not is_stochastic_pipeline:
         warning_list.append(
@@ -803,7 +1391,7 @@ def _run_scenario(
             "enable_ai_noise_control=True (control is vacuous)."
         )
 
-    return ScenarioABReport(
+    report = ScenarioABReport(
         scenario_id=scenario.scenario_id,
         mode=scenario.mode,
         n_repeat_requested=n_repeat,
@@ -812,6 +1400,7 @@ def _run_scenario(
         per_repeat_table=per_repeat_table,
         warnings=warning_list,
     )
+    return report, transformed_ai, transformed_baseline
 
 
 __all__ = [

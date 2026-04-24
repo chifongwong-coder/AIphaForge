@@ -11,7 +11,7 @@ invariants are documented there.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Literal, Optional, Sequence, TypedDict
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -51,6 +51,98 @@ class ToleranceProfile:
     max_range_width: Optional[float] = None
     sign_sensitive: bool = False
     sign_epsilon: float = 0.0
+
+    # ---------- v2.0.1 per-asset-class presets ----------
+    # Each asset class ships in two flavors:
+    #   - loose: calibrated for "useful prediction" tolerance
+    #     (e.g., ±50 bps on US equity); v2.0 default.
+    #   - strict: calibrated for memorization detection
+    #     (e.g., ±1 bp on US equity); use this when the question
+    #     is "does the model recall the bar exactly?".
+    #
+    # Numbers are starting points calibrated from typical daily
+    # ranges. Verify on your data before publication. See
+    # `docs/plans/v2.0.1-plan.md` §A3.
+
+    @classmethod
+    def us_equity_price(cls) -> "ToleranceProfile":
+        """Loose: useful-prediction tolerance for US equity prices (~50 bps)."""
+        return cls(
+            absolute_floor=1e-6,
+            exact_threshold=0.005, near_threshold=0.02, rough_threshold=0.05,
+            exact_range_width=0.005, near_range_width=0.02,
+            rough_range_width=0.05, max_range_width=0.20,
+        )
+
+    @classmethod
+    def us_equity_price_strict(cls) -> "ToleranceProfile":
+        """Strict: memorization-detection tolerance for US equity (~1 bp)."""
+        return cls(
+            absolute_floor=1e-6,
+            exact_threshold=0.0001, near_threshold=0.005, rough_threshold=0.02,
+            exact_range_width=0.0001, near_range_width=0.005,
+            rough_range_width=0.02, max_range_width=0.08,
+        )
+
+    @classmethod
+    def crypto_price(cls) -> "ToleranceProfile":
+        """Loose: useful-prediction tolerance for crypto (~100 bps; higher vol)."""
+        return cls(
+            absolute_floor=1e-6,
+            exact_threshold=0.01, near_threshold=0.05, rough_threshold=0.15,
+            exact_range_width=0.01, near_range_width=0.05,
+            rough_range_width=0.15, max_range_width=0.60,
+        )
+
+    @classmethod
+    def crypto_price_strict(cls) -> "ToleranceProfile":
+        """Strict: memorization-detection tolerance for crypto (~5 bps)."""
+        return cls(
+            absolute_floor=1e-6,
+            exact_threshold=0.0005, near_threshold=0.01, rough_threshold=0.05,
+            exact_range_width=0.0005, near_range_width=0.01,
+            rough_range_width=0.05, max_range_width=0.20,
+        )
+
+    @classmethod
+    def futures_price(cls) -> "ToleranceProfile":
+        """Loose: useful-prediction tolerance for futures (~25 bps; tick-constrained)."""
+        return cls(
+            absolute_floor=1e-6,
+            exact_threshold=0.0025, near_threshold=0.01, rough_threshold=0.03,
+            exact_range_width=0.0025, near_range_width=0.01,
+            rough_range_width=0.03, max_range_width=0.12,
+        )
+
+    @classmethod
+    def futures_price_strict(cls) -> "ToleranceProfile":
+        """Strict: memorization-detection tolerance for futures (~0.5 bp)."""
+        return cls(
+            absolute_floor=1e-6,
+            exact_threshold=0.00005, near_threshold=0.0025, rough_threshold=0.01,
+            exact_range_width=0.00005, near_range_width=0.0025,
+            rough_range_width=0.01, max_range_width=0.04,
+        )
+
+    @classmethod
+    def penny_stock_price(cls) -> "ToleranceProfile":
+        """Loose: useful-prediction tolerance for penny stocks (~500 bps; noise-dominated)."""
+        return cls(
+            absolute_floor=1e-4,  # $0.0001 floor — penny stocks are tick-noisy
+            exact_threshold=0.05, near_threshold=0.15, rough_threshold=0.30,
+            exact_range_width=0.05, near_range_width=0.15,
+            rough_range_width=0.30, max_range_width=1.20,
+        )
+
+    @classmethod
+    def penny_stock_price_strict(cls) -> "ToleranceProfile":
+        """Strict: memorization-detection tolerance for penny stocks (~50 bps)."""
+        return cls(
+            absolute_floor=1e-4,
+            exact_threshold=0.005, near_threshold=0.05, rough_threshold=0.15,
+            exact_range_width=0.005, near_range_width=0.05,
+            rough_range_width=0.15, max_range_width=0.60,
+        )
 
 
 @dataclass
@@ -130,6 +222,35 @@ class QuestionScore:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+class TemplateAggregate(TypedDict):
+    """Per-template breakdown entry in ``QAProbeReport.by_template``.
+
+    Plan §6.1 (r5). Counts, rates, breakdowns. Band rates are
+    nullable: when ``valid_answers == 0`` the four band rates
+    (``exact_rate`` / ``near_rate`` / ``rough_rate`` / ``miss_rate``)
+    are ``None`` rather than ``0.0``, so a zero-valid template is
+    not visually indistinguishable from a perfectly-failed one.
+    """
+
+    n_questions: int
+    submitted_answers: int
+    valid_answers: int
+    invalid_answers: int
+    missing_answers: int
+    refusal_answers: int
+    coverage_rate: float
+    parse_success_rate: float
+    exact_rate: Optional[float]
+    near_rate: Optional[float]
+    rough_rate: Optional[float]
+    miss_rate: Optional[float]
+    band_index_arbitrary: Optional[float]
+    bands_breakdown: dict[str, int]
+    mean_range_width_ratio: Optional[float]
+    median_range_width_ratio: Optional[float]
+    max_range_width_exceeded_count: int
+
+
 @dataclass
 class QAProbeReport:
     """Aggregate Q&A probe report.
@@ -158,7 +279,12 @@ class QAProbeReport:
     mean_range_width_ratio: Optional[float]
     median_range_width_ratio: Optional[float]
     max_range_width_exceeded_count: int
-    by_template: Optional["pd.DataFrame"]
+    # v2.0.1 r5: per-template breakdown keyed by ``template_id``.
+    # Inner shape is ``TemplateAggregate``. Populated when at least
+    # one scored question exists; ``None`` for an empty question set.
+    # ``by_symbol`` / ``by_period`` and the full DataFrame form
+    # remain v2.2.
+    by_template: Optional[dict[str, "TemplateAggregate"]]
     by_symbol: Optional["pd.DataFrame"]
     by_period: Optional["pd.DataFrame"]
     question_scores: list[QuestionScore]
@@ -174,6 +300,75 @@ class MetricConfig:
     higher_is_better: bool
     normalization_floor: float
     low_anchor_threshold: float
+
+
+# ---------- v2.0.1 r5: determinism check types ----------
+
+# Implementation-shape contract for the agent factory; distinct from
+# the existing order-shape ``AgentContract`` (which controls
+# transform admissibility under ``view_only``). Plan §5.1 forbids
+# reusing or shadowing the existing name.
+AgentImplementationContract = Literal[
+    "strategy",
+    "hook",
+    "hook_view_only_capable",
+    "callable_factory",
+]
+
+
+class UnsupportedScenarioError(RuntimeError):
+    """Framework scenario is unsupported in this release.
+
+    Distinct from an ordinary user-agent exception: this is raised by
+    the framework's own preflight when the requested combination is
+    known not to work (e.g. ``view_only`` with a plain hook contract,
+    pending the v2.2 broker-proxy wrapper). The orchestrator catches
+    it and records ``status="unsupported"`` rather than treating it as
+    a determinism failure.
+    """
+
+
+@dataclass(frozen=True)
+class ResolvedDeterminismConfig:
+    """Resolved tuple of (profile, metrics, rel_tol).
+
+    Returned by ``resolve_determinism_config``. The ``requested_*``
+    fields preserve the user's original kwarg values so the manifest
+    can show both requested and resolved.
+    """
+
+    profile: Literal["v2_compat", "llm_balanced", "off"]
+    determinism_metrics: tuple[str, ...]
+    determinism_rel_tol: Optional[float]
+    requested_profile: Literal["auto", "v2_compat", "llm_balanced"]
+    requested_metrics: Optional[tuple[str, ...]]
+    requested_rel_tol: Optional[float]
+
+
+@dataclass(frozen=True)
+class DeterminismCheckResult:
+    """One arm's determinism-check result.
+
+    Plan §5.6 r5. Models exactly one arm — the orchestrator combines
+    a raw and a transformed instance into the per-scenario manifest
+    entry.
+
+    Internal ``metric_values_run_1/2`` are finite-float-only dicts
+    over the metrics that were actually extracted. The JSON
+    ``ArmResult`` serializer expands missing keys to ``None`` and
+    normalizes ``nan``/``inf`` to string sentinels — see plan §5.10.
+    """
+
+    passed: Optional[bool]
+    status: Literal["passed", "failed", "error", "unsupported"]
+    metric_values_run_1: dict[str, float]
+    metric_values_run_2: dict[str, float]
+    failed_metrics: list[str]
+    determinism_metrics: tuple[str, ...]
+    determinism_rel_tol: float
+    error_type: Optional[str] = None
+    error_message: Optional[str] = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -270,6 +465,7 @@ class ABProbeResult:
 # manifests; users and the demo page populate these keys when
 # available so cross-run comparison is mechanically possible.
 RECOMMENDED_PROVIDER_CONFIG_KEYS: Sequence[str] = (
+    # v2.0 keys.
     "model",
     "snapshot_id",
     "temperature",
@@ -280,4 +476,15 @@ RECOMMENDED_PROVIDER_CONFIG_KEYS: Sequence[str] = (
     "system_prompt_hash",
     "tool_policy",
     "notes",
+    # v2.0.1 additions for cross-paper comparability of LLM-eval claims.
+    # See `docs/plans/v2.0.1-plan.md` §A2 for the rationale per key.
+    "system_fingerprint",       # OpenAI: verifies the seed claim post-hoc
+    "cache_control",            # Anthropic prompt-caching markers (a leakage vector)
+    "stop_sequences",           # Truncation can shape answers
+    "response_format",          # JSON mode / structured-output schema marker
+    "n_intra_replicates",       # Pooled samples per question
+    "pooling_strategy",         # "single" / "majority_vote" / "mean" / "first_consistent"
+    "n_retries_per_question",   # Provider error retries silently re-sample
+    "seed_attestation",         # Did the provider's API actually honor the seed?
+    "prompt_cache_disclosed",   # Was provider-side caching disabled for the run?
 )
