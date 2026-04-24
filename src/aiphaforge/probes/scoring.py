@@ -24,7 +24,7 @@ import json
 import re
 from dataclasses import asdict
 from statistics import median
-from typing import Any, Optional, Sequence, Union
+from typing import Any, Literal, Optional, Sequence, Union
 
 from aiphaforge.probes.models import (
     AnswerRecord,
@@ -123,10 +123,10 @@ def _try_range(s: str) -> Optional[tuple[float, float]]:
     Conventions (documented in the public docstring):
     - Bracketed: ``[lo, hi]`` or ``(lo, hi)``
     - Worded: ``lo to hi``, ``between lo and hi``, ``from lo to hi``
-    - Hyphen WITHOUT spaces around it: ``lo-hi`` (range)
-    - En/em-dash with or without spaces: ``lo–hi``, ``lo — hi`` (range)
-    - Hyphen WITH spaces around it: ``lo - hi`` is NOT a range — it
-      is interpreted as subtraction by the scalar path.
+    - Hyphen with or without spaces: ``lo-hi`` and ``lo - hi`` are
+      both ranges (r5 §2.1: parser is an answer parser, not an
+      expression evaluator).
+    - En/em-dash with or without spaces: ``lo–hi``, ``lo — hi``.
     """
     raw = s.strip()
     norm = raw.lower()
@@ -166,10 +166,9 @@ def _try_range(s: str) -> Optional[tuple[float, float]]:
         if lo is not None and hi is not None:
             return (lo, hi)
 
-    # Hyphen without surrounding spaces is a range; with surrounding
-    # spaces it is subtraction (caller's scalar path handles that).
+    # Hyphen, with OR without surrounding spaces (r5 §2.1).
     direct = re.fullmatch(
-        r"\s*([-−]?\d[\d.,eE+]*(?:\.\d+)?)-(\d[\d.,eE+]*(?:\.\d+)?)\s*",
+        r"\s*([-−]?\d[\d.,eE+]*(?:\.\d+)?)\s*-\s*(\d[\d.,eE+]*(?:\.\d+)?)\s*",
         raw,
     )
     if direct:
@@ -196,6 +195,7 @@ def parse_numeric_answer(
     *,
     strict: bool = False,
     permissive: bool = False,
+    percent: Literal["reject", "decimal", "number"] = "reject",
 ) -> Union[float, tuple[float, float], None]:
     """Parse a raw LLM reply string into a typed numeric value.
 
@@ -203,13 +203,19 @@ def parse_numeric_answer(
     or ``None`` for unparseable input. Pure function — no side effects,
     no LLM call.
 
-    Hyphen disambiguation:
-        - ``"172-175"`` (no spaces around hyphen) → range ``(172, 175)``.
-        - ``"172 - 175"`` (spaces around hyphen) → subtraction
-          ``-3.0``.
-        - This is a documented convention. Users wanting strict
-          range-only semantics should use bracketed (``[172, 175]``)
-          or worded (``172 to 175``) forms.
+    Hyphen handling (r5 §2.1):
+        Hyphen-separated two-number answers are ranges, not
+        arithmetic. Both ``"172-175"`` and ``"172 - 175"`` parse to
+        ``(172.0, 175.0)``. The parser is an answer parser, not an
+        expression evaluator. Callers expecting subtraction must
+        pre-evaluate before calling this helper.
+
+    Percent handling (``percent``, r5 §2.1):
+        Inputs ending in ``%`` are ambiguous — the downstream
+        template may want a decimal (``0.025``) or a number
+        (``2.5``). Default ``"reject"`` returns ``None`` (or raises
+        in strict mode). ``"decimal"`` divides by 100; ``"number"``
+        keeps the raw value. Apply consistently per-template.
 
     Hedging signal:
         ``"about 172"`` returns ``172.0`` and **drops the hedging
@@ -244,6 +250,32 @@ def parse_numeric_answer(
             )
         return None
 
+    # Percent handling — detect a trailing ``%`` and dispatch on the
+    # caller's policy. Done early because percent strings should not
+    # fall through to currency/range stripping.
+    pct_match = re.fullmatch(
+        r"\s*([-−]?\d[\d.,eE+\-−]*)\s*%\s*", raw,
+    )
+    if pct_match:
+        if percent == "reject":
+            if strict:
+                _strict_raise(
+                    "percent-policy", text,
+                    "percent sign present but percent='reject'; "
+                    "pass percent='decimal' (divide by 100) or "
+                    "percent='number' (keep raw) to accept",
+                )
+            return None
+        v = _try_float(pct_match.group(1))
+        if v is None:
+            if strict:
+                _strict_raise(
+                    "percent-extraction", text,
+                    "could not extract a number before %",
+                )
+            return None
+        return v / 100.0 if percent == "decimal" else v
+
     # 1. Try range detection BEFORE scalar parsing so "172-175" wins
     #    over "172" (first-number-extraction).
     pre_clean = _strip_approximation(_strip_currency_and_units(raw))
@@ -258,17 +290,6 @@ def parse_numeric_answer(
     # 2. Scalar parsing path.
     cleaned = _strip_approximation(_strip_currency_and_units(raw))
     cleaned = _normalize_minus(cleaned)
-
-    # Detect "lo - hi" (subtraction with surrounding spaces).
-    sub_match = re.fullmatch(
-        r"\s*(-?\d[\d.,eE+]*(?:\.\d+)?)\s+-\s+(\d[\d.,eE+]*(?:\.\d+)?)\s*",
-        cleaned,
-    )
-    if sub_match:
-        a = _try_float(sub_match.group(1))
-        b = _try_float(sub_match.group(2))
-        if a is not None and b is not None:
-            return a - b
 
     numbers = _extract_numbers(cleaned)
     if len(numbers) == 0:

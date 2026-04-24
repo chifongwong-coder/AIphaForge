@@ -74,10 +74,14 @@ class TestParseNumericRange:
         result = parse_numeric_answer(text)
         assert result == (lo, hi), f"input {text!r} → {result}, expected {(lo, hi)}"
 
-    def test_hyphen_with_spaces_is_subtraction(self):
-        # The documented disambiguation: "172 - 175" with spaces is
-        # subtraction, not a range. Returns 172 - 175 = -3.
-        assert parse_numeric_answer("172 - 175") == pytest.approx(-3.0)
+    def test_hyphen_with_spaces_is_now_a_range(self):
+        # r5 §2.1: hyphen-separated two-number answers are ranges, not
+        # arithmetic, regardless of whether the hyphen has spaces.
+        # The parser is an answer parser, not an expression evaluator.
+        # Migration note in §8 item 11 calls this out.
+        assert parse_numeric_answer("172 - 175") == (172.0, 175.0)
+        # The unspaced form continues to behave as a range.
+        assert parse_numeric_answer("172-175") == (172.0, 175.0)
 
 
 # ---------- parse_numeric_answer: don't-know / unparseable ----------
@@ -225,3 +229,35 @@ class TestParseBinaryAnswer:
     def test_strict_raises_on_none(self):
         with pytest.raises(ValueError, match="input-presence"):
             parse_binary_answer(None, strict=True)
+
+
+# ---------- v2.0.1 r5 §2.1: percent handling ----------
+
+class TestParseNumericPercent:
+    def test_default_reject_returns_none(self):
+        # Default percent="reject" — caller has not declared whether
+        # the downstream template wants decimal or number form, so the
+        # parser refuses to guess.
+        assert parse_numeric_answer("2.5%") is None
+
+    def test_decimal_divides_by_100(self):
+        assert parse_numeric_answer("2.5%", percent="decimal") == 0.025
+
+    def test_number_keeps_raw(self):
+        assert parse_numeric_answer("2.5%", percent="number") == 2.5
+
+    def test_strict_reject_raises(self):
+        with pytest.raises(ValueError, match="percent-policy"):
+            parse_numeric_answer("2.5%", strict=True)
+
+    def test_negative_percent(self):
+        assert parse_numeric_answer("-1.5%", percent="decimal") == -0.015
+        assert parse_numeric_answer("\u22121.5%", percent="number") == -1.5
+
+    def test_percent_with_whitespace(self):
+        assert parse_numeric_answer("  2.5 %  ", percent="number") == 2.5
+
+    def test_percent_only_when_trailing_sign(self):
+        # "2.5" without % is not affected by the percent kwarg.
+        assert parse_numeric_answer("2.5") == 2.5
+        assert parse_numeric_answer("2.5", percent="decimal") == 2.5
