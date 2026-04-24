@@ -330,11 +330,33 @@ def _stable_view_fingerprint(view: pd.DataFrame) -> str:
     Same shape + same byte content → same fingerprint. Used by the
     per-scenario transformed-arm check to refuse user transforms
     that ignore ``seed=`` (plan §5.8).
+
+    v2.0.2 hardening: hash per-column instead of casting the whole
+    frame to float64. The previous implementation raised
+    ``ValueError`` on user transforms that emit metadata string
+    columns; the caller swallowed it and treated the view as
+    replayable, hiding genuine non-determinism. We now hash numeric
+    columns by their bytes and non-numeric columns by the bytes of
+    their pandas string repr.
     """
     h = hashlib.sha256()
-    h.update(view.values.astype(np.float64).tobytes())
-    h.update(np.asarray(view.index.values).tobytes())
+    # Column names + order — fingerprint changes if either changes.
     h.update(",".join(map(str, view.columns)).encode("utf-8"))
+    h.update(b"|")
+    # Index — works for datetime, int, str alike via numpy bytes.
+    h.update(np.asarray(view.index.values).tobytes())
+    h.update(b"|")
+    # Per-column content hashing keeps numeric paths fast (bytes
+    # roundtrip) while supporting metadata string columns without
+    # raising.
+    for col in view.columns:
+        series = view[col]
+        if np.issubdtype(series.dtype, np.number):
+            h.update(series.to_numpy(dtype=np.float64).tobytes())
+        else:
+            # bool / object / datetime / str — encode the repr.
+            h.update(series.astype(str).str.encode("utf-8").sum())
+        h.update(b";")
     return h.hexdigest()[:16]
 
 
