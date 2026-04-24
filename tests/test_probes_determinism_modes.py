@@ -317,6 +317,55 @@ class TestUnsupportedScenario:
         unsupported = [w for w in warns if "unsupported" in w]
         assert any("not a determinism failure" in w for w in unsupported)
 
+    def test_unsupported_arm_constructs_distinct_instances_per_subject(
+        self, monkeypatch,
+    ):
+        # v2.0.2 #3 hardening: prior code did
+        # ``transformed_baseline = transformed_ai`` in both unsupported
+        # branches, so the two subjects shared one frozen
+        # DeterminismCheckResult. The dataclass's ``metadata`` dict and
+        # ``failed_metrics`` list are mutable; aliasing meant a future
+        # consumer mutating one would silently mutate the other. The
+        # fix builds two independent instances per subject. We verify
+        # by counting DeterminismCheckResult constructions during one
+        # unsupported scenario.
+        from aiphaforge.probes.models import DeterminismCheckResult
+
+        constructed: list[DeterminismCheckResult] = []
+        original_init = DeterminismCheckResult.__init__
+
+        def counting_init(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            if self.status == "unsupported":
+                constructed.append(self)
+
+        monkeypatch.setattr(
+            DeterminismCheckResult, "__init__", counting_init,
+        )
+        scen = ABScenario(
+            scenario_id="vo_hook", mode="view_only",
+            transforms=[PriceScale(factor=2.0)],
+        )
+        run_ab_probe(
+            _det_factory, _det_factory, _ohlcv(n=40), [scen],
+            agent_determinism_check="per_scenario",
+            agent_implementation_contract="hook",
+            **_KW,
+        )
+        # Exactly two unsupported instances (AI + baseline) and they
+        # must be distinct objects, not aliases.
+        unsupported = [r for r in constructed if r.status == "unsupported"]
+        assert len(unsupported) == 2, (
+            f"expected 2 unsupported instances, got {len(unsupported)}"
+        )
+        assert unsupported[0] is not unsupported[1]
+        # Their mutable fields must be independent objects too.
+        assert unsupported[0].metadata is not unsupported[1].metadata
+        assert (
+            unsupported[0].failed_metrics
+            is not unsupported[1].failed_metrics
+        )
+
     def test_preflight_unsupported_helper(self):
         # Pure helper: returns reason or None.
         assert _preflight_unsupported(

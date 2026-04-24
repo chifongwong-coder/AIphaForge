@@ -1287,18 +1287,25 @@ def _run_scenario(
             scenario_mode=scenario.mode,
         )
         if unsupported_reason is not None:
-            transformed_ai = DeterminismCheckResult(
-                passed=None,
-                status="unsupported",
-                metric_values_run_1={},
-                metric_values_run_2={},
-                failed_metrics=[],
-                determinism_metrics=resolved_config.determinism_metrics,
-                determinism_rel_tol=resolved_config.determinism_rel_tol or 0.0,
-                error_type="UnsupportedScenarioError",
-                error_message=unsupported_reason,
-            )
-            transformed_baseline = transformed_ai
+            # Build two independent instances. Sharing the same
+            # frozen DeterminismCheckResult would also share its
+            # mutable fields (metadata dict, failed_metrics list);
+            # downstream code that mutates one would corrupt the
+            # other (v2.0.2 hardening).
+            def _unsupported(reason: str) -> DeterminismCheckResult:
+                return DeterminismCheckResult(
+                    passed=None,
+                    status="unsupported",
+                    metric_values_run_1={},
+                    metric_values_run_2={},
+                    failed_metrics=[],
+                    determinism_metrics=resolved_config.determinism_metrics,
+                    determinism_rel_tol=resolved_config.determinism_rel_tol or 0.0,
+                    error_type="UnsupportedScenarioError",
+                    error_message=reason,
+                )
+            transformed_ai = _unsupported(unsupported_reason)
+            transformed_baseline = _unsupported(unsupported_reason)
         else:
             # Replayability fingerprint test (plan §5.8). User
             # transforms that ignore seed get reported as
@@ -1322,21 +1329,27 @@ def _run_scenario(
                 replayable = True
 
             if not replayable:
-                transformed_ai = DeterminismCheckResult(
-                    passed=None,
-                    status="unsupported",
-                    metric_values_run_1={},
-                    metric_values_run_2={},
-                    failed_metrics=[],
-                    determinism_metrics=resolved_config.determinism_metrics,
-                    determinism_rel_tol=resolved_config.determinism_rel_tol or 0.0,
-                    error_type="NonReplayableViewError",
-                    error_message=(
-                        "transform pipeline produced different views for the "
-                        "same seed; cannot fix the arm for a determinism check."
-                    ),
+                # See unsupported branch above for the no-shared-mutable
+                # rationale (v2.0.2 hardening).
+                _msg = (
+                    "transform pipeline produced different views for the "
+                    "same seed; cannot fix the arm for a determinism check."
                 )
-                transformed_baseline = transformed_ai
+
+                def _non_replayable() -> DeterminismCheckResult:
+                    return DeterminismCheckResult(
+                        passed=None,
+                        status="unsupported",
+                        metric_values_run_1={},
+                        metric_values_run_2={},
+                        failed_metrics=[],
+                        determinism_metrics=resolved_config.determinism_metrics,
+                        determinism_rel_tol=resolved_config.determinism_rel_tol or 0.0,
+                        error_type="NonReplayableViewError",
+                        error_message=_msg,
+                    )
+                transformed_ai = _non_replayable()
+                transformed_baseline = _non_replayable()
             else:
                 try:
                     transformed_ai = _check_agent_determinism(
