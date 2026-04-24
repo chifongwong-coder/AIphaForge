@@ -21,9 +21,10 @@ Aggregation rules follow `docs/plans/v2.0-plan.md` §1.7:
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict
 from statistics import median
-from typing import Any, Optional, Sequence
+from typing import Any, Optional, Sequence, Union
 
 from aiphaforge.probes.models import (
     AnswerRecord,
@@ -37,6 +38,330 @@ from aiphaforge.probes.questions import (
     normalize_binary,
     normalize_direction,
 )
+
+# ---------- v2.0.1 user-facing parser helpers ----------
+
+# Regex for a signed scientific-notation float. Accepts ASCII '-' and
+# Unicode minus '−' (U+2212). Anchored matches happen via .fullmatch
+# at use sites; this is the building block.
+_NUMBER_RE = re.compile(
+    r"[-−]?\d+(?:,\d{3})*(?:\.\d+)?(?:[eE][-+]?\d+)?"
+)
+
+# Currency symbols / unit suffixes to strip before number parsing.
+_CURRENCY_SYMBOLS = ("$", "€", "£", "¥", "₿")
+_UNIT_SUFFIXES = (
+    " usd", " eur", " gbp", " jpy", " btc",
+    "usd ", "eur ", "gbp ", "jpy ", "btc ",
+)
+# Approximation prefixes to strip before number parsing.
+_APPROX_PREFIXES = (
+    "about", "approximately", "approx", "approx.", "around", "roughly",
+    "~", "≈",
+)
+# "I don't know" / refusal-style replies that always parse to None.
+_DONT_KNOW_PATTERNS = frozenset({
+    "", "n/a", "na", "none", "null", "unknown", "i don't know",
+    "i dont know", "idk", "no answer", "cannot answer", "can't answer",
+})
+
+
+def _normalize_minus(s: str) -> str:
+    """Convert Unicode minus (U+2212) and en/em-dash to ASCII '-'.
+
+    Used for the *number-parsing* path only; the range-detection path
+    handles em-dash separately via a dedicated split rule.
+    """
+    return s.replace("\u2212", "-")
+
+
+def _strip_currency_and_units(s: str) -> str:
+    out = s
+    for sym in _CURRENCY_SYMBOLS:
+        out = out.replace(sym, "")
+    lo = out.lower()
+    for suf in _UNIT_SUFFIXES:
+        lo = lo.replace(suf, " ")
+    return lo
+
+
+def _strip_approximation(s: str) -> str:
+    out = s.strip().lower()
+    for pref in _APPROX_PREFIXES:
+        if out.startswith(pref):
+            out = out[len(pref):].lstrip(" \t.")
+    return out
+
+
+def _try_float(token: str) -> Optional[float]:
+    """Parse a single numeric token to float, returning None on failure.
+
+    Handles thousands separators and Unicode minus.
+    """
+    cleaned = _normalize_minus(token).replace(",", "").strip()
+    if not cleaned:
+        return None
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def _extract_numbers(s: str) -> list[float]:
+    """Find all numeric tokens in `s` and return them parsed."""
+    out: list[float] = []
+    for m in _NUMBER_RE.finditer(_normalize_minus(s)):
+        v = _try_float(m.group(0))
+        if v is not None:
+            out.append(v)
+    return out
+
+
+def _try_range(s: str) -> Optional[tuple[float, float]]:
+    """Detect a numeric-range answer; return (lo, hi) or None.
+
+    Conventions (documented in the public docstring):
+    - Bracketed: ``[lo, hi]`` or ``(lo, hi)``
+    - Worded: ``lo to hi``, ``between lo and hi``, ``from lo to hi``
+    - Hyphen WITHOUT spaces around it: ``lo-hi`` (range)
+    - En/em-dash with or without spaces: ``lo–hi``, ``lo — hi`` (range)
+    - Hyphen WITH spaces around it: ``lo - hi`` is NOT a range — it
+      is interpreted as subtraction by the scalar path.
+    """
+    raw = s.strip()
+    norm = raw.lower()
+
+    # Bracketed forms.
+    bracket_match = re.fullmatch(
+        r"[\[(]\s*([-−]?\d[\d.,eE+\-−]*)\s*,\s*([-−]?\d[\d.,eE+\-−]*)\s*[\])]",
+        raw,
+    )
+    if bracket_match:
+        lo = _try_float(bracket_match.group(1))
+        hi = _try_float(bracket_match.group(2))
+        if lo is not None and hi is not None:
+            return (lo, hi)
+
+    # Worded forms.
+    for pattern in (
+        r"^\s*from\s+(.+?)\s+to\s+(.+?)\s*$",
+        r"^\s*between\s+(.+?)\s+and\s+(.+?)\s*$",
+        r"^\s*(.+?)\s+to\s+(.+?)\s*$",
+    ):
+        m = re.match(pattern, norm)
+        if m:
+            lo = _try_float(m.group(1))
+            hi = _try_float(m.group(2))
+            if lo is not None and hi is not None:
+                return (lo, hi)
+
+    # En/em-dash range (with or without surrounding spaces).
+    em_match = re.fullmatch(
+        r"\s*([-−]?\d[\d.,eE+\-−]*)\s*[\u2013\u2014]\s*([-−]?\d[\d.,eE+\-−]*)\s*",
+        raw,
+    )
+    if em_match:
+        lo = _try_float(em_match.group(1))
+        hi = _try_float(em_match.group(2))
+        if lo is not None and hi is not None:
+            return (lo, hi)
+
+    # Hyphen without surrounding spaces is a range; with surrounding
+    # spaces it is subtraction (caller's scalar path handles that).
+    direct = re.fullmatch(
+        r"\s*([-−]?\d[\d.,eE+]*(?:\.\d+)?)-(\d[\d.,eE+]*(?:\.\d+)?)\s*",
+        raw,
+    )
+    if direct:
+        lo = _try_float(direct.group(1))
+        hi = _try_float(direct.group(2))
+        if lo is not None and hi is not None:
+            return (lo, hi)
+
+    return None
+
+
+def _strict_raise(stage: str, text: Any, suggestion: str) -> None:
+    """Build the standard strict-mode ValueError."""
+    raw = repr(text)
+    if len(raw) > 200:
+        raw = raw[:197] + "..."
+    raise ValueError(
+        f"parse failed at {stage!r} on input {raw}; {suggestion}"
+    )
+
+
+def parse_numeric_answer(
+    text: Optional[str],
+    *,
+    strict: bool = False,
+    permissive: bool = False,
+) -> Union[float, tuple[float, float], None]:
+    """Parse a raw LLM reply string into a typed numeric value.
+
+    Returns ``float`` for scalars, ``tuple[float, float]`` for ranges,
+    or ``None`` for unparseable input. Pure function — no side effects,
+    no LLM call.
+
+    Hyphen disambiguation:
+        - ``"172-175"`` (no spaces around hyphen) → range ``(172, 175)``.
+        - ``"172 - 175"`` (spaces around hyphen) → subtraction
+          ``-3.0``.
+        - This is a documented convention. Users wanting strict
+          range-only semantics should use bracketed (``[172, 175]``)
+          or worded (``172 to 175``) forms.
+
+    Hedging signal:
+        ``"about 172"`` returns ``172.0`` and **drops the hedging
+        signal**. Users who want to surface "this answer was hedged"
+        must re-scan ``raw_answer`` separately and stash the flag on
+        ``AnswerRecord.metadata``.
+
+    Multi-number replies (``permissive``):
+        Frontier LLMs frequently emit conversational replies like
+        ``"the open was 172.06 and the close was 175.30"``. With the
+        default ``permissive=False`` this returns ``None`` — the
+        parser refuses to guess. With ``permissive=True``, the first
+        numeric token wins.
+
+    Strict mode (``strict``):
+        Raises ``ValueError`` instead of returning ``None`` when the
+        input cannot be parsed. The error message includes the
+        verbatim input (truncated to 200 chars), the parse stage that
+        failed, and a one-line suggested fix.
+    """
+    if text is None:
+        if strict:
+            _strict_raise("input-presence", text, "input is None")
+        return None
+
+    raw = str(text).strip()
+    if raw.lower() in _DONT_KNOW_PATTERNS:
+        if strict:
+            _strict_raise(
+                "don't-know-detection", text,
+                f"input matches don't-know pattern {raw!r}",
+            )
+        return None
+
+    # 1. Try range detection BEFORE scalar parsing so "172-175" wins
+    #    over "172" (first-number-extraction).
+    pre_clean = _strip_approximation(_strip_currency_and_units(raw))
+    rng = _try_range(pre_clean)
+    if rng is None:
+        # Also try on the un-stripped raw input (some range forms
+        # don't survive currency stripping unchanged).
+        rng = _try_range(raw)
+    if rng is not None:
+        return rng
+
+    # 2. Scalar parsing path.
+    cleaned = _strip_approximation(_strip_currency_and_units(raw))
+    cleaned = _normalize_minus(cleaned)
+
+    # Detect "lo - hi" (subtraction with surrounding spaces).
+    sub_match = re.fullmatch(
+        r"\s*(-?\d[\d.,eE+]*(?:\.\d+)?)\s+-\s+(\d[\d.,eE+]*(?:\.\d+)?)\s*",
+        cleaned,
+    )
+    if sub_match:
+        a = _try_float(sub_match.group(1))
+        b = _try_float(sub_match.group(2))
+        if a is not None and b is not None:
+            return a - b
+
+    numbers = _extract_numbers(cleaned)
+    if len(numbers) == 0:
+        if strict:
+            _strict_raise(
+                "number-extraction", text,
+                "no numeric tokens detected",
+            )
+        return None
+    if len(numbers) == 1:
+        return numbers[0]
+
+    # Multi-number reply.
+    if permissive:
+        return numbers[0]
+    if strict:
+        _strict_raise(
+            "multi-token disambiguation", text,
+            f"{len(numbers)} numeric tokens detected; pass "
+            "permissive=True to take the first or strip the "
+            "surrounding context before parsing",
+        )
+    return None
+
+
+def parse_choice_answer(
+    text: Optional[str],
+    allowed: Sequence[str],
+    *,
+    strict: bool = False,
+) -> Optional[str]:
+    """Parse a raw LLM reply into one of `allowed`, or None.
+
+    Wraps the internal :func:`_normalize_choice` (which dispatches to
+    direction-aware normalisation when ``allowed`` is the canonical
+    up/down/unchanged vocabulary) with a public, strict-aware API
+    symmetric to :func:`parse_numeric_answer`.
+
+    Hedging tokens (e.g., ``"probably yes"``, ``"likely up"``) parse
+    to ``None`` — the user is responsible for upstream pre-stripping
+    if they want to honor hedges.
+    """
+    if text is None:
+        if strict:
+            _strict_raise("input-presence", text, "input is None")
+        return None
+    if str(text).strip().lower() in _DONT_KNOW_PATTERNS:
+        if strict:
+            _strict_raise(
+                "don't-know-detection", text,
+                "input matches don't-know pattern",
+            )
+        return None
+    out = _normalize_choice(str(text), allowed)
+    if out is None and strict:
+        _strict_raise(
+            "choice-match", text,
+            f"input did not match any allowed value in {list(allowed)!r}",
+        )
+    return out
+
+
+def parse_binary_answer(
+    text: Optional[str],
+    *,
+    strict: bool = False,
+) -> Optional[bool]:
+    """Parse a raw LLM reply into True / False / None.
+
+    Wraps :func:`normalize_binary` with a strict-aware API symmetric
+    to :func:`parse_numeric_answer` and :func:`parse_choice_answer`.
+    Directional aliases (``"up"``, ``"higher"``) deliberately do NOT
+    map to True — see the v2.0 fix in
+    `aiphaforge.probes.questions.normalize_binary`.
+    """
+    if text is None:
+        if strict:
+            _strict_raise("input-presence", text, "input is None")
+        return None
+    if str(text).strip().lower() in _DONT_KNOW_PATTERNS:
+        if strict:
+            _strict_raise(
+                "don't-know-detection", text,
+                "input matches don't-know pattern",
+            )
+        return None
+    out = normalize_binary(str(text))
+    if out is None and strict:
+        _strict_raise(
+            "binary-match", text,
+            "input did not normalize to yes/true/1 or no/false/0",
+        )
+    return out
 
 # Weights for the descriptive `band_index_arbitrary` aggregate.
 _BAND_WEIGHTS = {"exact": 1.00, "near": 0.67, "rough": 0.33, "miss": 0.00}
@@ -471,6 +796,9 @@ __all__ = [
     "aggregate_scores",
     "normalize_binary",
     "normalize_direction",
+    "parse_binary_answer",
+    "parse_choice_answer",
+    "parse_numeric_answer",
     "score_answer_file",
     "score_question",
 ]
