@@ -639,17 +639,26 @@ class KnowledgeProbe:
         question_set: QuestionSet,
         *,
         manifest: Optional[dict[str, Any]] = None,
+        provider_config: Optional[dict[str, Any]] = None,
     ):
         """Score a JSONL answers file. Re-exported for facade convenience.
 
         Implementation lives in :mod:`aiphaforge.probes.scoring`; this
         method just calls it. Kept on the class so users can write
         ``probe.score(...)`` symmetrically with ``probe.build(...)``.
+
+        ``provider_config`` (v2.0.1) attaches the user's LLM
+        configuration for cross-paper comparability. See
+        :func:`aiphaforge.probes.score_answer_file` for the merge
+        rule and recommended keys.
         """
         # Import here to avoid a circular import (scoring imports from
         # questions for normalize helpers).
         from aiphaforge.probes.scoring import score_answer_file
-        return score_answer_file(question_set, answers_path, manifest=manifest)
+        return score_answer_file(
+            question_set, answers_path,
+            manifest=manifest, provider_config=provider_config,
+        )
 
 
 def build_question_sets_multi(

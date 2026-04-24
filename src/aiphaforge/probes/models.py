@@ -270,6 +270,7 @@ class ABProbeResult:
 # manifests; users and the demo page populate these keys when
 # available so cross-run comparison is mechanically possible.
 RECOMMENDED_PROVIDER_CONFIG_KEYS: Sequence[str] = (
+    # v2.0 keys.
     "model",
     "snapshot_id",
     "temperature",
@@ -280,4 +281,15 @@ RECOMMENDED_PROVIDER_CONFIG_KEYS: Sequence[str] = (
     "system_prompt_hash",
     "tool_policy",
     "notes",
+    # v2.0.1 additions for cross-paper comparability of LLM-eval claims.
+    # See `docs/plans/v2.0.1-plan.md` §A2 for the rationale per key.
+    "system_fingerprint",       # OpenAI: verifies the seed claim post-hoc
+    "cache_control",            # Anthropic prompt-caching markers (a leakage vector)
+    "stop_sequences",           # Truncation can shape answers
+    "response_format",          # JSON mode / structured-output schema marker
+    "n_intra_replicates",       # Pooled samples per question
+    "pooling_strategy",         # "single" / "majority_vote" / "mean" / "first_consistent"
+    "n_retries_per_question",   # Provider error retries silently re-sample
+    "seed_attestation",         # Did the provider's API actually honor the seed?
+    "prompt_cache_disclosed",   # Was provider-side caching disabled for the run?
 )

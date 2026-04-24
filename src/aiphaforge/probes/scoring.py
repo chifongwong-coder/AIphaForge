@@ -748,11 +748,63 @@ def _parse_answer_payload(
     return raw_parsed
 
 
+def _merge_provider_config(
+    manifest: Optional[dict[str, Any]],
+    provider_config: Optional[dict[str, Any]],
+) -> tuple[Optional[dict[str, Any]], Optional[dict[str, Any]]]:
+    """Merge a `provider_config` kwarg into the report manifest.
+
+    Rules per plan §A2:
+    - Keys present in only one source pass through.
+    - Keys present in BOTH with the same value → merged silently.
+    - Keys present in BOTH with different values → ValueError naming
+      the conflicting key + both values.
+    - Provenance per key (``"manifest"`` / ``"kwarg"`` / ``"both"``)
+      is recorded under ``manifest["provider_config_provenance"]``.
+
+    Returns the modified manifest dict (or None if both inputs were
+    None) plus the provenance dict for tests / introspection.
+    """
+    if not manifest and not provider_config:
+        return None, None
+    out = dict(manifest or {})
+    existing_pc = dict(out.get("provider_config") or {})
+    incoming_pc = dict(provider_config or {})
+    provenance: dict[str, str] = {}
+    merged: dict[str, Any] = {}
+    all_keys = set(existing_pc) | set(incoming_pc)
+    for key in sorted(all_keys):
+        in_existing = key in existing_pc
+        in_incoming = key in incoming_pc
+        if in_existing and in_incoming:
+            v_existing = existing_pc[key]
+            v_incoming = incoming_pc[key]
+            if v_existing != v_incoming:
+                raise ValueError(
+                    f"provider_config collision on key {key!r}: "
+                    f"manifest has {v_existing!r}, kwarg has {v_incoming!r}. "
+                    "Same-key conflicts must be resolved by the caller; "
+                    "remove one source or align the values."
+                )
+            merged[key] = v_existing
+            provenance[key] = "both"
+        elif in_existing:
+            merged[key] = existing_pc[key]
+            provenance[key] = "manifest"
+        else:
+            merged[key] = incoming_pc[key]
+            provenance[key] = "kwarg"
+    out["provider_config"] = merged
+    out["provider_config_provenance"] = provenance
+    return out, provenance
+
+
 def score_answer_file(
     question_set: QuestionSet,
     answers_path: str,
     *,
     manifest: Optional[dict[str, Any]] = None,
+    provider_config: Optional[dict[str, Any]] = None,
 ) -> QAProbeReport:
     """Score a JSONL file of :class:`AnswerRecord` rows.
 
@@ -764,7 +816,17 @@ def score_answer_file(
     silently ignored (they may have come from a different question
     set). Questions in the set with no matching answer row are
     treated as ``missing`` by :func:`aggregate_scores`.
+
+    ``provider_config`` (v2.0.1) lets callers attach the user's
+    LLM configuration for cross-paper comparability. Recommended
+    keys live in :data:`aiphaforge.probes.models.RECOMMENDED_PROVIDER_CONFIG_KEYS`
+    (e.g., ``model``, ``snapshot_id``, ``temperature``,
+    ``prompt_template_hash``, ``prompt_cache_disclosed``,
+    ``system_fingerprint``). When both ``manifest["provider_config"]``
+    and ``provider_config=`` carry the same key with different
+    values, a ``ValueError`` is raised — never silent merge.
     """
+    merged_manifest, _ = _merge_provider_config(manifest, provider_config)
     qs_by_id = {q.question_id: q for q in question_set}
     scores: list[QuestionScore] = []
     with open(answers_path, "r") as f:
@@ -788,7 +850,7 @@ def score_answer_file(
                 metadata=obj.get("metadata", {}) or {},
             )
             scores.append(score_question(qs, ans))
-    return aggregate_scores(question_set, scores, manifest=manifest)
+    return aggregate_scores(question_set, scores, manifest=merged_manifest)
 
 
 # Re-export a couple of utilities for users wiring their own scorers.
