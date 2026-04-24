@@ -17,6 +17,14 @@ The engine never calls LLMs. Users run their LLM externally and submit
 typed answers / hook-driven decisions back into the probe runners.
 """
 
+from aiphaforge.probes.abtest import (
+    DEFAULT_METRIC_CONFIG,
+    DEFAULT_METRICS,
+    MACrossBaseline,
+    MeanRevBaseline,
+    MomentumBaseline,
+    run_ab_probe,
+)
 from aiphaforge.probes.models import (
     ABProbeResult,
     ABScenario,
@@ -82,11 +90,17 @@ __all__ = [
     "ReturnSign",
     "ScenarioABReport",
     "ToleranceProfile",
+    "DEFAULT_METRIC_CONFIG",
+    "DEFAULT_METRICS",
+    "MACrossBaseline",
+    "MeanRevBaseline",
+    "MomentumBaseline",
     "aggregate_scores",
     "build_question_set",
     "build_question_sets_multi",
     "normalize_binary",
     "normalize_direction",
+    "run_ab_probe",
     "sample_dates",
     "score_answer_file",
     "score_question",
