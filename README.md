@@ -99,6 +99,15 @@ under [Quick Start](#quick-start).
 - **Breakdowns**: monthly / yearly return tables, multi-strategy comparison
 - **Benchmark overlay**: custom series or automatic buy-and-hold
 
+### LLM Memory Probes
+A screening and inspection toolkit for measuring training-data leakage in LLM-driven backtests. Two orthogonal probes, no verdicts, no certification — descriptive numbers only.
+- **Q&A Probe**: `KnowledgeProbe` generates objective same-bar OHLC + direction questions from a dataset; user runs them through any LLM externally; engine scores answers against ground truth with banded relative-error tolerance
+- **A/B Probe**: `run_ab_probe()` runs an AI agent and a comparable baseline on raw vs transformed data, computes per-metric `excess_drop = ai_rel_drop − baseline_rel_drop` with symmetric normalization, low-anchor handling, and an optional AI-on-AI noise control to separate transform-induced sensitivity from generic LLM brittleness
+- **7 built-in transforms** across three canonical stages: `SymbolMasker` and `DateShift` (metadata), `PriceScale` and `PriceRebase` (level), `OHLCJitter`, `BlockBootstrap`, `WindowShuffle` (series). Pipeline enforces stage order, mode compatibility, and OHLC integrity validation
+- **Two execution modes**: `view_only` (engine fills at real prices, agent sees transformed view — Strategy-based agents only in v2.0) and `market_level` (transformed dataset becomes the execution market)
+- **Anti-gaming protection**: `max_range_width` cap demotes "predict everything" interval answers to `miss`; auto-injected `transform_detectability_warning` for transforms an LLM may behaviorally react to; capacity-parity check for AI vs baseline turnover mismatch
+- **User-attested manifest**: `provider_config` recommended-keys list (`model`, `snapshot_id`, `temperature`, `prompt_template_hash`, `tool_policy`, …) for cross-paper comparability — engine never verifies these claims, the user owns the publication-grade attestation
+
 ## Quick Start
 
 ### Strategy One-Line Backtest
@@ -239,6 +248,77 @@ result = engine.run(data)
 # Estimate how much capital this strategy can handle
 capacity = estimate_capacity(result, data, min_sharpe=1.0)
 print(f"Max capacity: ${capacity.estimated_capacity:,.0f}")
+```
+
+### LLM Memory Probes — Q&A
+
+The engine generates objective questions, the user runs them through
+any LLM externally, then submits parsed answers back for scoring.
+The engine never calls the LLM.
+
+```python
+from aiphaforge.probes import (
+    KnowledgeProbe, DEFAULT_TEMPLATES, sample_dates,
+    AnswerRecord, serialize_answer_records,
+)
+
+# 1. Generate a question set from the dataset.
+probe = KnowledgeProbe(symbol="AAPL", templates=DEFAULT_TEMPLATES)
+ts_list = sample_dates(data, n=200, seed=42, start=1)
+qs = probe.build(data, ts_list)
+qs.export_questions("questions.jsonl")     # safe to feed to the LLM
+qs.export_answer_key("answer_key.jsonl")   # KEEP PRIVATE — truth values
+
+# 2. ... user runs questions.jsonl through their LLM externally,
+#    parses each reply into a typed value (bool / float / int / str),
+#    and writes answers.jsonl as a list of AnswerRecord rows ...
+
+# 3. Score.
+report = probe.score("answers.jsonl", question_set=qs)
+print(f"score_real bands: {report.bands_breakdown}")
+print(f"band_index_arbitrary: {report.band_index_arbitrary:.3f}")
+```
+
+### LLM Memory Probes — A/B
+
+Compare an AI agent and a comparable baseline on raw vs transformed
+data; the runner returns descriptive `excess_drop` distributions —
+no verdicts, no p-values.
+
+```python
+from aiphaforge.probes import (
+    run_ab_probe, ABScenario, MACrossBaseline,
+    SymbolMasker, BlockBootstrap,
+)
+
+scenarios = [
+    ABScenario(
+        scenario_id="metadata_only",
+        mode="market_level",
+        transforms=[SymbolMasker(symbols=["AAPL"], seed=42)],
+    ),
+    ABScenario(
+        scenario_id="bootstrap_block_20",
+        mode="market_level",
+        transforms=[BlockBootstrap(block_size=20)],
+    ),
+]
+
+result = run_ab_probe(
+    ai_factory=lambda: my_llm_strategy,           # any BaseStrategy or BacktestHook
+    baseline_factory=lambda: MACrossBaseline(short=10, long=30),
+    data=data,
+    scenarios=scenarios,
+    n_repeat=10,
+    enable_ai_noise_control=True,                  # for stochastic transforms
+    provider_config={"model": "claude-opus-4-7", "temperature": 0.0},
+)
+
+for sc in result.scenarios:
+    for m, s in sc.metric_summaries.items():
+        print(f"{sc.scenario_id} {m}: excess_drop ~ {s.mean_excess_drop}")
+    for w in sc.warnings:
+        print(f"  warning: {w}")
 ```
 
 ## Installation
