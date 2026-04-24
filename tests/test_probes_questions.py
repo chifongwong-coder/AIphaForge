@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 
-import numpy as np
 import pandas as pd
 import pytest
 
@@ -22,21 +21,7 @@ from aiphaforge.probes import (
     build_question_sets_multi,
     sample_dates,
 )
-
-
-def _ohlcv(n: int = 60, seed: int = 0) -> pd.DataFrame:
-    rng = np.random.default_rng(seed)
-    closes = 100.0 * np.cumprod(1.0 + rng.normal(0.0, 0.01, size=n))
-    opens = closes * (1.0 + rng.normal(0.0, 0.003, size=n))
-    spreads = np.abs(rng.normal(0.0, 0.005, size=n)) * closes
-    highs = np.maximum(opens, closes) + spreads
-    lows = np.minimum(opens, closes) - spreads
-    vol = rng.integers(1_000_000, 10_000_000, size=n).astype(float)
-    return pd.DataFrame(
-        {"open": opens, "high": highs, "low": lows, "close": closes, "volume": vol},
-        index=pd.bdate_range("2024-01-01", periods=n),
-    )
-
+from tests.conftest import make_probe_ohlcv as _ohlcv  # noqa: E402
 
 # ---------- Same-bar OHLC numeric templates ----------
 

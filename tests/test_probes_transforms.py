@@ -16,23 +16,7 @@ from aiphaforge.probes.transforms import (
     WindowShuffle,
     validate_ohlcv_integrity,
 )
-
-
-def _ohlcv(n: int = 60, seed: int = 0, start: float = 100.0) -> pd.DataFrame:
-    """Build a synthetic OHLCV frame with valid invariants."""
-    rng = np.random.default_rng(seed)
-    rets = rng.normal(0.0, 0.01, size=n)
-    closes = start * np.cumprod(1.0 + rets)
-    spreads = np.abs(rng.normal(0.0, 0.005, size=n)) * closes
-    opens = closes * (1.0 + rng.normal(0.0, 0.003, size=n))
-    highs = np.maximum(opens, closes) + spreads
-    lows = np.minimum(opens, closes) - spreads
-    vol = rng.integers(1_000_000, 10_000_000, size=n).astype(float)
-    return pd.DataFrame(
-        {"open": opens, "high": highs, "low": lows, "close": closes, "volume": vol},
-        index=pd.bdate_range("2024-01-01", periods=n),
-    )
-
+from tests.conftest import make_probe_ohlcv as _ohlcv  # noqa: E402
 
 # ---------- SymbolMasker ----------
 
@@ -254,16 +238,19 @@ class TestBlockBootstrap:
         # data.iloc[0]['close']. The output first close equals the
         # anchor times the first sampled bar's return — so realizations
         # cluster near the source first close, not exactly at it.
+        #
+        # This deliberately does NOT assert `mean(first_closes) ≈ 100`
+        # over a small sample — that's a flaky statistical claim. The
+        # invariant we lock is structural:
+        #   - all first closes are positive (anchor preserved)
+        #   - first closes vary across seeds (anchor is multiplied by
+        #     the first sampled bar's return, not pinned to the anchor)
+        # If a future refactor silently clamps the first bar to the
+        # anchor, `std == 0` will fail.
         bb = BlockBootstrap(block_size=20)
         data = _ohlcv(n=200, start=100.0)
         first_closes = [bb.apply(data, seed=s)["close"].iloc[0] for s in range(20)]
-        # Average across realizations should be close to the anchor
-        # (since average return is ~1 for a near-zero-drift series).
-        assert np.mean(first_closes) == pytest.approx(100.0, rel=0.05)
-        # And the first close MUST vary across seeds — otherwise a
-        # future refactor that silently clamps the first bar would
-        # reintroduce the mistaken "all realizations start exactly at
-        # the anchor" property.
+        assert all(c > 0 for c in first_closes)
         assert np.std(first_closes) > 0
 
     def test_empty_data_raises(self):

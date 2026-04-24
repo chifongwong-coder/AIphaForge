@@ -59,6 +59,36 @@ def make_ohlcv(
     )
 
 
+def make_probe_ohlcv(
+    n: int = 60,
+    seed: int = 0,
+    start: float = 100.0,
+) -> pd.DataFrame:
+    """Generate a synthetic OHLCV frame for the v2.0 probe tests.
+
+    Distinct from :func:`make_ohlcv` because the probe tests need a
+    seed parameter for reproducibility checks AND a drifting open
+    price to exercise the close_vs_open template (where the conftest
+    helper pins ``open[i] = close[i-1]`` and would always classify
+    the bar by sign of the prior return).
+
+    The returned frame is guaranteed valid OHLCV: positive prices,
+    monotonic business-day index, ``high >= max(open, close, low)``
+    and ``low <= min(open, close, high)`` by construction.
+    """
+    rng = np.random.default_rng(seed)
+    closes = start * np.cumprod(1.0 + rng.normal(0.0, 0.01, size=n))
+    opens = closes * (1.0 + rng.normal(0.0, 0.003, size=n))
+    spreads = np.abs(rng.normal(0.0, 0.005, size=n)) * closes
+    highs = np.maximum(opens, closes) + spreads
+    lows = np.minimum(opens, closes) - spreads
+    vol = rng.integers(1_000_000, 10_000_000, size=n).astype(float)
+    return pd.DataFrame(
+        {"open": opens, "high": highs, "low": lows, "close": closes, "volume": vol},
+        index=pd.bdate_range("2024-01-01", periods=n),
+    )
+
+
 @pytest.fixture
 def sample_data() -> pd.DataFrame:
     """100-bar OHLCV DataFrame with moderate upward trend."""

@@ -10,7 +10,6 @@ import pytest
 from aiphaforge.probes import (
     ABScenario,
     MACrossBaseline,
-    MeanRevBaseline,
     MetricConfig,
     run_ab_probe,
 )
@@ -28,20 +27,7 @@ from aiphaforge.probes.transforms import (
     SymbolMasker as SM,
 )
 from aiphaforge.results import BacktestResult
-
-
-def _ohlcv(n: int = 120, seed: int = 0, start: float = 100.0) -> pd.DataFrame:
-    rng = np.random.default_rng(seed)
-    closes = start * np.cumprod(1.0 + rng.normal(0.0, 0.01, size=n))
-    opens = closes * (1.0 + rng.normal(0.0, 0.003, size=n))
-    spreads = np.abs(rng.normal(0.0, 0.005, size=n)) * closes
-    highs = np.maximum(opens, closes) + spreads
-    lows = np.minimum(opens, closes) - spreads
-    vol = rng.integers(1_000_000, 10_000_000, size=n).astype(float)
-    return pd.DataFrame(
-        {"open": opens, "high": highs, "low": lows, "close": closes, "volume": vol},
-        index=pd.bdate_range("2024-01-01", periods=n),
-    )
+from tests.conftest import make_probe_ohlcv as _ohlcv  # noqa: E402
 
 
 def _ai_factory():
@@ -50,11 +36,11 @@ def _ai_factory():
 
 
 def _baseline_factory():
+    # Same strategy as `_ai_factory` so smoke tests can assert
+    # excess_drop ≈ 0 by construction (AI and baseline are identical
+    # → any non-zero excess is a runner bug, not a methodology
+    # finding).
     return MACrossBaseline(short=5, long=20)
-
-
-def _alt_baseline_factory():
-    return MeanRevBaseline(window=20)
 
 
 # ---------- Metric extraction ----------
@@ -179,11 +165,16 @@ class TestRunABProbe:
         assert rep.scenario_id == "metadata_only"
         assert rep.n_repeat_requested == 3
         # SymbolMasker.apply is a no-op on data, so AI=baseline (same
-        # strategy) and excess_drop ≈ 0.
+        # strategy) and excess_drop is exactly 0 across all metrics.
+        # Lock this property so a future refactor that breaks the
+        # paired-seed contract surfaces immediately.
         for m in ("total_return", "sharpe_ratio", "trade_count"):
             s = rep.metric_summaries[m]
             assert len(s.ai_raw) == 3
             assert len(s.excess_drop) == 3
+            for v in s.excess_drop:
+                if v is not None:
+                    assert v == pytest.approx(0.0, abs=1e-12)
         # Detectability warning for SymbolMasker should be present.
         assert any("transform_detectability_warning" in w for w in rep.warnings)
 
@@ -251,7 +242,7 @@ class TestRunABProbe:
                 # produces a length mismatch under view_only.
                 return view["close"].pct_change().iloc[10:].fillna(0.0)
 
-        with pytest.raises(ValueError, match="length"):
+        with pytest.raises(ValueError, match="signal length .* does not match"):
             run_ab_probe(
                 ai_factory=_ShortSignalStrategy,
                 baseline_factory=_baseline_factory,
@@ -511,17 +502,23 @@ class TestDeterminismCheck:
         assert ok is True
 
     def test_nondeterministic_strategy_flagged(self):
-        # Wrap a strategy that adds genuine randomness on each call.
+        # Strategy whose RNG seed is incremented on every construction,
+        # so the determinism check sees a different signal series on
+        # the second invocation. Using a class-level counter rather
+        # than an unseeded `default_rng()` keeps the test reproducible
+        # across machines and Python versions.
         class _RandomTilt:
+            _counter = 0
+
             def __init__(self):
-                self._rng = np.random.default_rng()
+                _RandomTilt._counter += 1
+                self._rng = np.random.default_rng(seed=_RandomTilt._counter)
 
             def generate_signals(self, data):
-                signals = pd.Series(
+                return pd.Series(
                     self._rng.choice([-1, 0, 1], size=len(data)),
                     index=data.index, dtype=float,
                 )
-                return signals
 
         data = _ohlcv(n=40)
         ok = _check_agent_determinism(
