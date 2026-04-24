@@ -52,6 +52,98 @@ class ToleranceProfile:
     sign_sensitive: bool = False
     sign_epsilon: float = 0.0
 
+    # ---------- v2.0.1 per-asset-class presets ----------
+    # Each asset class ships in two flavors:
+    #   - loose: calibrated for "useful prediction" tolerance
+    #     (e.g., ±50 bps on US equity); v2.0 default.
+    #   - strict: calibrated for memorization detection
+    #     (e.g., ±1 bp on US equity); use this when the question
+    #     is "does the model recall the bar exactly?".
+    #
+    # Numbers are starting points calibrated from typical daily
+    # ranges. Verify on your data before publication. See
+    # `docs/plans/v2.0.1-plan.md` §A3.
+
+    @classmethod
+    def us_equity_price(cls) -> "ToleranceProfile":
+        """Loose: useful-prediction tolerance for US equity prices (~50 bps)."""
+        return cls(
+            absolute_floor=1e-6,
+            exact_threshold=0.005, near_threshold=0.02, rough_threshold=0.05,
+            exact_range_width=0.005, near_range_width=0.02,
+            rough_range_width=0.05, max_range_width=0.20,
+        )
+
+    @classmethod
+    def us_equity_price_strict(cls) -> "ToleranceProfile":
+        """Strict: memorization-detection tolerance for US equity (~1 bp)."""
+        return cls(
+            absolute_floor=1e-6,
+            exact_threshold=0.0001, near_threshold=0.005, rough_threshold=0.02,
+            exact_range_width=0.0001, near_range_width=0.005,
+            rough_range_width=0.02, max_range_width=0.08,
+        )
+
+    @classmethod
+    def crypto_price(cls) -> "ToleranceProfile":
+        """Loose: useful-prediction tolerance for crypto (~100 bps; higher vol)."""
+        return cls(
+            absolute_floor=1e-6,
+            exact_threshold=0.01, near_threshold=0.05, rough_threshold=0.15,
+            exact_range_width=0.01, near_range_width=0.05,
+            rough_range_width=0.15, max_range_width=0.60,
+        )
+
+    @classmethod
+    def crypto_price_strict(cls) -> "ToleranceProfile":
+        """Strict: memorization-detection tolerance for crypto (~5 bps)."""
+        return cls(
+            absolute_floor=1e-6,
+            exact_threshold=0.0005, near_threshold=0.01, rough_threshold=0.05,
+            exact_range_width=0.0005, near_range_width=0.01,
+            rough_range_width=0.05, max_range_width=0.20,
+        )
+
+    @classmethod
+    def futures_price(cls) -> "ToleranceProfile":
+        """Loose: useful-prediction tolerance for futures (~25 bps; tick-constrained)."""
+        return cls(
+            absolute_floor=1e-6,
+            exact_threshold=0.0025, near_threshold=0.01, rough_threshold=0.03,
+            exact_range_width=0.0025, near_range_width=0.01,
+            rough_range_width=0.03, max_range_width=0.12,
+        )
+
+    @classmethod
+    def futures_price_strict(cls) -> "ToleranceProfile":
+        """Strict: memorization-detection tolerance for futures (~0.5 bp)."""
+        return cls(
+            absolute_floor=1e-6,
+            exact_threshold=0.00005, near_threshold=0.0025, rough_threshold=0.01,
+            exact_range_width=0.00005, near_range_width=0.0025,
+            rough_range_width=0.01, max_range_width=0.04,
+        )
+
+    @classmethod
+    def penny_stock_price(cls) -> "ToleranceProfile":
+        """Loose: useful-prediction tolerance for penny stocks (~500 bps; noise-dominated)."""
+        return cls(
+            absolute_floor=1e-4,  # $0.0001 floor — penny stocks are tick-noisy
+            exact_threshold=0.05, near_threshold=0.15, rough_threshold=0.30,
+            exact_range_width=0.05, near_range_width=0.15,
+            rough_range_width=0.30, max_range_width=1.20,
+        )
+
+    @classmethod
+    def penny_stock_price_strict(cls) -> "ToleranceProfile":
+        """Strict: memorization-detection tolerance for penny stocks (~50 bps)."""
+        return cls(
+            absolute_floor=1e-4,
+            exact_threshold=0.005, near_threshold=0.05, rough_threshold=0.15,
+            exact_range_width=0.005, near_range_width=0.05,
+            rough_range_width=0.15, max_range_width=0.60,
+        )
+
 
 @dataclass
 class QuestionSpec:
