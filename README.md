@@ -99,6 +99,15 @@ under [Quick Start](#quick-start).
 - **Breakdowns**: monthly / yearly return tables, multi-strategy comparison
 - **Benchmark overlay**: custom series or automatic buy-and-hold
 
+### LLM Memory Probes
+A screening and inspection toolkit for measuring training-data leakage in LLM-driven backtests. Two orthogonal probes, no verdicts, no certification — descriptive numbers only.
+- **Q&A Probe**: `KnowledgeProbe` generates objective same-bar OHLC + direction questions from a dataset; user runs them through any LLM externally; engine scores answers against ground truth with banded relative-error tolerance
+- **A/B Probe**: `run_ab_probe()` runs an AI agent and a comparable baseline on raw vs transformed data, computes per-metric `excess_drop = ai_rel_drop − baseline_rel_drop` with symmetric normalization, low-anchor handling, and an optional AI-on-AI noise control to separate transform-induced sensitivity from generic LLM brittleness
+- **7 built-in transforms** across three canonical stages: `SymbolMasker` and `DateShift` (metadata), `PriceScale` and `PriceRebase` (level), `OHLCJitter`, `BlockBootstrap`, `WindowShuffle` (series). Pipeline enforces stage order, mode compatibility, and OHLC integrity validation
+- **Two execution modes**: `view_only` (engine fills at real prices, agent sees transformed view — Strategy-based agents only in v2.0) and `market_level` (transformed dataset becomes the execution market)
+- **Anti-gaming protection**: `max_range_width` cap demotes "predict everything" interval answers to `miss`; auto-injected `transform_detectability_warning` for transforms an LLM may behaviorally react to; capacity-parity check for AI vs baseline turnover mismatch
+- **User-attested manifest**: `provider_config` recommended-keys list (`model`, `snapshot_id`, `temperature`, `prompt_template_hash`, `tool_policy`, …) for cross-paper comparability — engine never verifies these claims, the user owns the publication-grade attestation
+
 ## Quick Start
 
 ### Strategy One-Line Backtest
