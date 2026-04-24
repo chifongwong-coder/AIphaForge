@@ -251,11 +251,17 @@ def parse_numeric_answer(
             )
         return None
 
+    # Strip currency / approximation prefixes BEFORE percent
+    # detection so hedged or currency-prefixed percent strings
+    # (``"about 2.5%"``, ``"USD 2.5%"``) honor the percent policy
+    # instead of slipping through to scalar extraction.
+    pre_clean = _strip_approximation(_strip_currency_and_units(raw))
+
     # Percent handling — detect a trailing ``%`` and dispatch on the
-    # caller's policy. Done early because percent strings should not
-    # fall through to currency/range stripping.
+    # caller's policy. Done before range detection so ``"5%"`` is not
+    # misread as a partial range.
     pct_match = re.fullmatch(
-        r"\s*([-−]?\d[\d.,eE+\-−]*)\s*%\s*", raw,
+        r"\s*([-−]?\d[\d.,eE+\-−]*)\s*%\s*", pre_clean,
     )
     if pct_match:
         if percent == "reject":
@@ -279,7 +285,6 @@ def parse_numeric_answer(
 
     # 1. Try range detection BEFORE scalar parsing so "172-175" wins
     #    over "172" (first-number-extraction).
-    pre_clean = _strip_approximation(_strip_currency_and_units(raw))
     rng = _try_range(pre_clean)
     if rng is None:
         # Also try on the un-stripped raw input (some range forms

@@ -261,3 +261,40 @@ class TestParseNumericPercent:
         # "2.5" without % is not affected by the percent kwarg.
         assert parse_numeric_answer("2.5") == 2.5
         assert parse_numeric_answer("2.5", percent="decimal") == 2.5
+
+    # ---- v2.0.2 #1: percent policy must survive prefixes ----
+
+    def test_hedged_percent_default_rejects(self):
+        # Realistic LLM output: hedge + percent. The percent="reject"
+        # default safety must hold even with the "about" prefix.
+        assert parse_numeric_answer("about 2.5%") is None
+        assert parse_numeric_answer("approximately 2.5%") is None
+        assert parse_numeric_answer("~2.5%") is None
+        assert parse_numeric_answer("\u22482.5%") is None  # ≈
+
+    def test_hedged_percent_with_decimal_policy(self):
+        assert parse_numeric_answer(
+            "about 2.5%", percent="decimal",
+        ) == 0.025
+
+    def test_hedged_percent_with_number_policy(self):
+        assert parse_numeric_answer(
+            "about 2.5%", percent="number",
+        ) == 2.5
+
+    def test_currency_prefixed_percent_rejects(self):
+        # Nonsensical but possible: currency + percent. Must still
+        # honor the policy rather than silently dropping the % sign.
+        assert parse_numeric_answer("$2.5%") is None
+        assert parse_numeric_answer("USD 2.5%") is None
+        assert parse_numeric_answer("$2.5%", percent="decimal") == 0.025
+
+    def test_negative_hedged_percent(self):
+        # Combines hedge prefix + Unicode minus + percent.
+        assert parse_numeric_answer(
+            "about \u22121.5%", percent="decimal",
+        ) == -0.015
+
+    def test_strict_hedged_percent_raises(self):
+        with pytest.raises(ValueError, match="percent-policy"):
+            parse_numeric_answer("about 2.5%", strict=True)
