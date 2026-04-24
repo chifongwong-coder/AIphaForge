@@ -592,6 +592,66 @@ def build_question_set(
     return QuestionSet(out)
 
 
+class KnowledgeProbe:
+    """High-level entry point for the Q&A workflow.
+
+    Bundles the full Q&A pipeline behind one named class so the
+    common case is a 4-line workflow:
+
+    >>> probe = KnowledgeProbe(symbol="AAPL", templates=DEFAULT_TEMPLATES)
+    >>> qs = probe.build(data, timestamps=sample_dates(data, n=50, seed=0))
+    >>> qs.export_questions("questions.jsonl")
+    >>> qs.export_answer_key("answer_key.jsonl")
+    >>> # ... user runs LLM externally, writes answers.jsonl ...
+    >>> report = probe.score("answers.jsonl", question_set=qs)
+
+    The class is a thin facade over :func:`build_question_set` /
+    :func:`build_question_sets_multi` / :func:`score_answer_file` —
+    use those directly when you need finer control (e.g., per-symbol
+    timestamp sampling).
+    """
+
+    def __init__(
+        self,
+        symbol: str,
+        templates: Sequence[Union[QuestionTemplate, type]] = (),
+    ):
+        self.symbol = symbol
+        # Accept either template instances or template classes (instantiated
+        # with default profile). Plan example shows `OpenQuestion()` instances.
+        self.templates: list[QuestionTemplate] = [
+            t() if isinstance(t, type) else t for t in templates
+        ]
+
+    def build(
+        self,
+        data: pd.DataFrame,
+        timestamps: Sequence[pd.Timestamp],
+    ) -> QuestionSet:
+        """Build the question set for this probe's symbol + templates."""
+        return build_question_set(
+            data, self.symbol, list(timestamps), self.templates
+        )
+
+    @staticmethod
+    def score(
+        answers_path: str,
+        question_set: QuestionSet,
+        *,
+        manifest: Optional[dict[str, Any]] = None,
+    ):
+        """Score a JSONL answers file. Re-exported for facade convenience.
+
+        Implementation lives in :mod:`aiphaforge.probes.scoring`; this
+        method just calls it. Kept on the class so users can write
+        ``probe.score(...)`` symmetrically with ``probe.build(...)``.
+        """
+        # Import here to avoid a circular import (scoring imports from
+        # questions for normalize helpers).
+        from aiphaforge.probes.scoring import score_answer_file
+        return score_answer_file(question_set, answers_path, manifest=manifest)
+
+
 def build_question_sets_multi(
     data_dict: dict[str, pd.DataFrame],
     timestamps_by_symbol: dict[str, Sequence[pd.Timestamp]],

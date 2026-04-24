@@ -209,6 +209,63 @@ class TestRunABProbe:
         # Strategy-based factory in view_only is the supported v2.0 path.
         assert result.scenarios[0].n_repeat_requested == 2
 
+    def test_view_only_with_pricescale_runs(self):
+        # Regression: view_only must work for non-no-op transforms,
+        # not just SymbolMasker. PriceScale changes the prices the
+        # strategy sees but preserves index length so signals
+        # reindex correctly to the real-data bars.
+        from aiphaforge.probes.transforms import PriceScale
+        data = _ohlcv(n=80)
+        scenarios = [
+            ABScenario(
+                scenario_id="rescaled_view",
+                mode="view_only",
+                transforms=[PriceScale(factor=0.5)],
+            ),
+        ]
+        result = run_ab_probe(
+            ai_factory=_ai_factory,
+            baseline_factory=_baseline_factory,
+            data=data,
+            scenarios=scenarios,
+            metrics=("total_return", "trade_count"),
+            n_repeat=2,
+            min_valid_repeats=1,
+            engine_kwargs={"include_benchmark": False},
+        )
+        assert result.scenarios[0].n_repeat_requested == 2
+
+    def test_view_only_signal_length_mismatch_raises(self):
+        # A strategy that returns a shorter signal series cannot be
+        # safely reindexed to real data; the runner must surface this
+        # rather than silently mis-aligning.
+        from aiphaforge.probes.transforms import SymbolMasker as SM
+        from aiphaforge.strategies import BaseStrategy
+        data = _ohlcv(n=80)
+
+        class _ShortSignalStrategy(BaseStrategy):
+            name = "ShortSig"
+
+            def generate_signals(self, view):
+                # Drop the first 10 bars — common warmup pattern but
+                # produces a length mismatch under view_only.
+                return view["close"].pct_change().iloc[10:].fillna(0.0)
+
+        with pytest.raises(ValueError, match="length"):
+            run_ab_probe(
+                ai_factory=_ShortSignalStrategy,
+                baseline_factory=_baseline_factory,
+                data=data,
+                scenarios=[ABScenario(
+                    scenario_id="x", mode="view_only",
+                    transforms=[SM(symbols=["AAPL"], seed=0)],
+                )],
+                metrics=("total_return",),
+                n_repeat=1,
+                min_valid_repeats=1,
+                engine_kwargs={"include_benchmark": False},
+            )
+
     def test_min_valid_repeats_gates_summary_scalars(self):
         data = _ohlcv(n=80)
         scenarios = [
@@ -244,6 +301,44 @@ class TestRunABProbe:
         assert s.dominance_rate is None
         assert s.mean_excess_drop is None
         assert s.median_excess_drop is None
+
+    def test_min_valid_repeats_exceeds_n_repeat_raises(self):
+        data = _ohlcv(n=40)
+        with pytest.raises(ValueError, match="min_valid_repeats"):
+            run_ab_probe(
+                ai_factory=_ai_factory,
+                baseline_factory=_baseline_factory,
+                data=data,
+                scenarios=[ABScenario(
+                    scenario_id="x", mode="market_level",
+                    transforms=[SM(symbols=["AAPL"], seed=0)],
+                )],
+                metrics=("total_return",),
+                n_repeat=2,
+                min_valid_repeats=5,  # > n_repeat
+                engine_kwargs={"include_benchmark": False},
+            )
+
+    def test_manifest_captures_factory_repr_and_engine_kwargs(self):
+        data = _ohlcv(n=40)
+        result = run_ab_probe(
+            ai_factory=_ai_factory,
+            baseline_factory=_baseline_factory,
+            data=data,
+            scenarios=[ABScenario(
+                scenario_id="x", mode="market_level",
+                transforms=[SM(symbols=["AAPL"], seed=0)],
+            )],
+            metrics=("total_return",),
+            n_repeat=2,
+            min_valid_repeats=1,
+            engine_kwargs={"include_benchmark": False, "initial_capital": 50_000},
+        )
+        m = result.manifest
+        # Cross-paper comparability hooks.
+        assert "MACrossBaseline" in m["ai_factory_repr"]
+        assert "MACrossBaseline" in m["baseline_factory_repr"]
+        assert m["engine_kwargs"]["initial_capital"] == 50_000
 
     def test_seeds_length_must_match_n_repeat(self):
         data = _ohlcv(n=40)

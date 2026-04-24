@@ -233,6 +233,50 @@ class TestBuildQuestionSet:
         assert len(DEFAULT_TEMPLATES) == 8
 
 
+class TestKnowledgeProbeFacade:
+    def test_end_to_end_workflow(self, tmp_path):
+        from aiphaforge.probes import (
+            AnswerRecord,
+            KnowledgeProbe,
+            serialize_answer_records,
+        )
+        data = _ohlcv(n=80)
+        # Templates accepted as classes (DEFAULT_TEMPLATES is class tuple).
+        probe = KnowledgeProbe(symbol="AAPL", templates=DEFAULT_TEMPLATES)
+        ts_list = sample_dates(data, n=4, seed=0, start=2)
+        qs = probe.build(data, ts_list)
+        assert len(qs) > 0
+
+        questions_path = tmp_path / "q.jsonl"
+        answer_key_path = tmp_path / "k.jsonl"
+        qs.export_questions(str(questions_path))
+        qs.export_answer_key(str(answer_key_path))
+
+        # Build correct answers from truth.
+        ans = []
+        for q in qs:
+            ans.append(AnswerRecord(
+                question_id=q.question_id,
+                raw_answer=str(q.truth_value),
+                parsed_answer=q.truth_value,
+                parse_status="valid",
+            ))
+        ans_path = tmp_path / "a.jsonl"
+        serialize_answer_records(ans, str(ans_path))
+        report = probe.score(str(ans_path), question_set=qs)
+        assert report.total_questions == len(qs)
+        assert report.valid_answers == len(qs)
+
+    def test_accepts_template_instances_too(self):
+        from aiphaforge.probes import KnowledgeProbe
+        data = _ohlcv(n=40)
+        probe = KnowledgeProbe(
+            symbol="X", templates=[OpenQuestion(), CloseVsOpen()],
+        )
+        qs = probe.build(data, [data.index[5], data.index[10]])
+        assert len(qs) == 4
+
+
 class TestBuildQuestionSetsMulti:
     def test_multi_symbol_concatenation(self):
         data_a = _ohlcv(n=60, seed=1)

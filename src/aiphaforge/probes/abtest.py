@@ -96,9 +96,12 @@ DEFAULT_METRIC_CONFIG: Dict[str, MetricConfig] = {
 # detectability warning into the report (per plan §2.6). These are
 # transforms an LLM may detect and behaviorally react to (refuse,
 # hedge, regime-confuse) regardless of whether actual leakage is
-# being probed.
+# being probed.  ``ReturnsOnlyView`` is listed in the plan but not
+# yet implemented in transforms.py — kept here so the warning fires
+# automatically when v2.0.x ships it.
 _DETECTABLE_TRANSFORM_NAMES = frozenset({
     "SymbolMasker", "DateShift", "ReturnsOnlyView",
+    "OHLCJitter", "BlockBootstrap", "WindowShuffle",
 })
 
 
@@ -230,12 +233,29 @@ def _run_one_arm(
     signals = agent.generate_signals(view)
     # Transforms like DateShift change the index; align signals back
     # to the real-data index so the engine can fill at real bars.
+    # Length must match — bar i in the view corresponds to bar i in
+    # the real frame for all built-in view-only transforms (which
+    # only relabel labels, never reorder rows). A different length
+    # means the strategy emitted an aligned-but-trimmed series we
+    # cannot safely reindex; reject explicitly.
     if isinstance(signals, pd.Series):
+        if len(signals) != len(data):
+            raise ValueError(
+                f"view_only signal length ({len(signals)}) does not "
+                f"match real-data length ({len(data)}); cannot safely "
+                "reindex. Ensure the strategy returns a same-length "
+                "series, or use mode='market_level'."
+            )
         signals = signals.copy()
         signals.index = data.index
     elif isinstance(signals, dict):
         signals = {sym: s.copy() for sym, s in signals.items()}
         for s in signals.values():
+            if len(s) != len(data):
+                raise ValueError(
+                    "view_only multi-asset signal length mismatch; "
+                    "cannot safely reindex."
+                )
             s.index = data.index
     engine.set_signals(signals)
     return engine.run(data)
@@ -427,12 +447,21 @@ def run_ab_probe(
         raise ValueError(
             f"seeds length ({len(seeds)}) must equal n_repeat ({n_repeat})"
         )
+    if min_valid_repeats > n_repeat:
+        raise ValueError(
+            f"min_valid_repeats ({min_valid_repeats}) cannot exceed "
+            f"n_repeat ({n_repeat}); summary scalars would always be None."
+        )
     seeds_used = (
         list(seeds) if seeds is not None
         else list(range(n_repeat))
     )
 
     # Determinism check (one factory each, separate from main loop).
+    # Note: this is a once-per-probe check on the raw path. A Hook
+    # whose non-determinism is triggered only by transformed inputs
+    # (e.g., a regime-flag-driven random call) will not be caught
+    # here — surface that limitation in the warning string.
     determinism_ok_ai = _check_agent_determinism(
         ai_factory, data, seed=seeds_used[0],
         engine_kwargs=engine_kwargs,
@@ -441,6 +470,19 @@ def run_ab_probe(
         baseline_factory, data, seed=seeds_used[0],
         engine_kwargs=engine_kwargs,
     )
+
+    # Capture baseline + AI configuration for cross-paper manifest
+    # comparability — two probes using `MACrossBaseline(short=10,
+    # long=30)` vs `MACrossBaseline(short=20, long=50)` produce
+    # non-comparable excess_drops; the repr distinguishes them.
+    try:
+        ai_repr = repr(ai_factory())
+    except Exception as e:  # pragma: no cover - defensive
+        ai_repr = f"<unrepresentable: {e!r}>"
+    try:
+        baseline_repr = repr(baseline_factory())
+    except Exception as e:  # pragma: no cover
+        baseline_repr = f"<unrepresentable: {e!r}>"
 
     scenario_reports: List[ScenarioABReport] = []
     for scenario in scenarios:
@@ -483,6 +525,9 @@ def run_ab_probe(
         "parity_band": list(parity_band),
         "ai_determinism_check_passed": determinism_ok_ai,
         "baseline_determinism_check_passed": determinism_ok_baseline,
+        "ai_factory_repr": ai_repr,
+        "baseline_factory_repr": baseline_repr,
+        "engine_kwargs": dict(engine_kwargs or {}),
         "provider_config": dict(provider_config or {}),
         "scenarios": [
             {
@@ -588,17 +633,21 @@ def _run_scenario(
         # when explicitly requested, since the control is mathematically
         # vacuous (test_a == test_b by construction).
         if enable_ai_noise_control and is_stochastic_pipeline:
-            # Two independent realizations: same outer seed feeds the
-            # pipeline's spawn machinery, but we offset to get distinct
-            # sub-realizations.
+            # Two independent realizations spawned from `seed_r` per
+            # plan §3.8 ("two independent transformed realizations").
+            # Using SeedSequence.spawn keeps the noise sub-seeds
+            # deterministically derived from the outer seed.
+            child_a, child_b = np.random.SeedSequence(seed_r).spawn(2)
+            sub_a = int(child_a.generate_state(1)[0])
+            sub_b = int(child_b.generate_state(1)[0])
             ai_test_a = _run_one_arm(
                 ai_factory, data, transforms=scenario.transforms,
-                mode=scenario.mode, seed=seed_r * 2 + 1,
+                mode=scenario.mode, seed=sub_a,
                 engine_kwargs=engine_kwargs,
             )
             ai_test_b = _run_one_arm(
                 ai_factory, data, transforms=scenario.transforms,
-                mode=scenario.mode, seed=seed_r * 2 + 2,
+                mode=scenario.mode, seed=sub_b,
                 engine_kwargs=engine_kwargs,
             )
             for m in metrics:
