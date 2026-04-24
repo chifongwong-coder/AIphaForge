@@ -31,6 +31,7 @@ from aiphaforge.probes.models import (
     QAProbeReport,
     QuestionScore,
     QuestionSpec,
+    TemplateAggregate,
     ToleranceProfile,
 )
 from aiphaforge.probes.questions import (
@@ -730,6 +731,75 @@ def aggregate_scores(
     mean_width = sum(range_widths) / len(range_widths) if range_widths else None
     median_width = median(range_widths) if range_widths else None
 
+    # Per-template breakdown (v2.0.1 r5, A5). Typed dict keyed by
+    # template_id; load-bearing for selective-memorization detection.
+    # We pair each question with its score to bucket by template_id.
+    by_template: Optional[dict[str, TemplateAggregate]] = None
+    if total > 0:
+        templates: dict[str, list[QuestionScore]] = {}
+        for q, s in zip(question_set, all_scores):
+            templates.setdefault(q.template_id, []).append(s)
+        by_template = {}
+        for tid, tscores in templates.items():
+            t_n = len(tscores)
+            t_valid_list = [s for s in tscores if s.validity == "valid"]
+            t_valid = len(t_valid_list)
+            t_invalid = sum(
+                1 for s in tscores
+                if s.validity not in ("valid", "missing", "refusal")
+            )
+            t_missing = sum(1 for s in tscores if s.validity == "missing")
+            t_refusal = sum(1 for s in tscores if s.validity == "refusal")
+            # ``submitted`` excludes the synthetic missing rows we
+            # added when no answer was sent at all. The score-side
+            # ``validity == "missing"`` covers both the synthetic
+            # rows and any caller-supplied missing answers; per
+            # plan §6.2 we surface coverage as
+            # submitted/n_questions and parse-success as
+            # valid/max(submitted, 1).
+            t_submitted = t_n - t_missing
+            t_coverage = t_submitted / t_n if t_n else 0.0
+            t_parse_ok = t_valid / t_submitted if t_submitted else 0.0
+            tcounts = _band_counts(t_valid_list)
+            t_widths = [
+                s.range_width_ratio for s in tscores
+                if s.range_width_ratio is not None
+            ]
+            t_exceeded = sum(
+                1 for s in tscores if s.max_range_width_exceeded
+            )
+
+            def _trate(band: str, denom: int = t_valid) -> Optional[float]:
+                # Plan §6.2: zero-valid templates report None for band
+                # rates so they aren't confused with all-miss reports.
+                if denom == 0:
+                    return None
+                return tcounts.get(band, 0) / denom
+
+            by_template[tid] = TemplateAggregate(
+                n_questions=t_n,
+                submitted_answers=t_submitted,
+                valid_answers=t_valid,
+                invalid_answers=t_invalid,
+                missing_answers=t_missing,
+                refusal_answers=t_refusal,
+                coverage_rate=t_coverage,
+                parse_success_rate=t_parse_ok,
+                exact_rate=_trate("exact"),
+                near_rate=_trate("near"),
+                rough_rate=_trate("rough"),
+                miss_rate=_trate("miss"),
+                band_index_arbitrary=_band_index(tcounts, t_valid),
+                bands_breakdown=tcounts,
+                mean_range_width_ratio=(
+                    sum(t_widths) / len(t_widths) if t_widths else None
+                ),
+                median_range_width_ratio=(
+                    median(t_widths) if t_widths else None
+                ),
+                max_range_width_exceeded_count=t_exceeded,
+            )
+
     return QAProbeReport(
         total_questions=total,
         submitted_answers=submitted,
@@ -748,7 +818,7 @@ def aggregate_scores(
         mean_range_width_ratio=mean_width,
         median_range_width_ratio=median_width,
         max_range_width_exceeded_count=max_range_exceeded_count,
-        by_template=None,
+        by_template=by_template,
         by_symbol=None,
         by_period=None,
         question_scores=all_scores,

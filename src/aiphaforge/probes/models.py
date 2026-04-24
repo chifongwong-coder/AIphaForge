@@ -11,7 +11,7 @@ invariants are documented there.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Literal, Optional, Sequence, TypedDict
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -222,6 +222,35 @@ class QuestionScore:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+class TemplateAggregate(TypedDict):
+    """Per-template breakdown entry in ``QAProbeReport.by_template``.
+
+    Plan §6.1 (r5). Counts, rates, breakdowns. Band rates are
+    nullable: when ``valid_answers == 0`` the four band rates
+    (``exact_rate`` / ``near_rate`` / ``rough_rate`` / ``miss_rate``)
+    are ``None`` rather than ``0.0``, so a zero-valid template is
+    not visually indistinguishable from a perfectly-failed one.
+    """
+
+    n_questions: int
+    submitted_answers: int
+    valid_answers: int
+    invalid_answers: int
+    missing_answers: int
+    refusal_answers: int
+    coverage_rate: float
+    parse_success_rate: float
+    exact_rate: Optional[float]
+    near_rate: Optional[float]
+    rough_rate: Optional[float]
+    miss_rate: Optional[float]
+    band_index_arbitrary: Optional[float]
+    bands_breakdown: dict[str, int]
+    mean_range_width_ratio: Optional[float]
+    median_range_width_ratio: Optional[float]
+    max_range_width_exceeded_count: int
+
+
 @dataclass
 class QAProbeReport:
     """Aggregate Q&A probe report.
@@ -250,7 +279,12 @@ class QAProbeReport:
     mean_range_width_ratio: Optional[float]
     median_range_width_ratio: Optional[float]
     max_range_width_exceeded_count: int
-    by_template: Optional["pd.DataFrame"]
+    # v2.0.1 r5: per-template breakdown keyed by ``template_id``.
+    # Inner shape is ``TemplateAggregate``. Populated when at least
+    # one scored question exists; ``None`` for an empty question set.
+    # ``by_symbol`` / ``by_period`` and the full DataFrame form
+    # remain v2.2.
+    by_template: Optional[dict[str, "TemplateAggregate"]]
     by_symbol: Optional["pd.DataFrame"]
     by_period: Optional["pd.DataFrame"]
     question_scores: list[QuestionScore]
