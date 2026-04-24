@@ -113,6 +113,64 @@ class TestMergeRule:
         }
 
 
+# ---------- v2.0.1 r5 §3.4: empty-bucket rule ----------
+
+class TestEmptyBucketRule:
+    def test_manifest_only_does_not_create_empty_buckets(self):
+        # The classic gap: caller passes a manifest with no provider
+        # config and no kwarg; the merge result must not inject
+        # provider_config={} or provider_config_provenance={}.
+        result, prov = _merge_provider_config({"run_id": "abc"}, None)
+        assert result == {"run_id": "abc"}
+        assert "provider_config" not in result
+        assert "provider_config_provenance" not in result
+        assert prov is None
+
+    def test_empty_kwarg_does_not_create_empty_buckets(self):
+        result, prov = _merge_provider_config({"run_id": "abc"}, {})
+        assert "provider_config" not in result
+        assert "provider_config_provenance" not in result
+        assert prov is None
+
+    def test_input_empty_bucket_is_stripped_from_output(self):
+        # Plan §3.4 explicit case: literal {"provider_config": {}} in
+        # the input manifest must not round-trip into the output.
+        result, prov = _merge_provider_config(
+            {"run_id": "abc", "provider_config": {}}, None,
+        )
+        assert result == {"run_id": "abc"}
+        assert prov is None
+
+    def test_input_empty_bucket_with_empty_kwarg_stripped(self):
+        result, prov = _merge_provider_config(
+            {"run_id": "abc", "provider_config": {}}, {},
+        )
+        assert result == {"run_id": "abc"}
+        assert prov is None
+
+    def test_input_empty_bucket_and_provenance_stripped(self):
+        # Idempotency: a manifest that already carries both literal
+        # empty buckets must come back without them.
+        result, prov = _merge_provider_config(
+            {
+                "run_id": "abc",
+                "provider_config": {},
+                "provider_config_provenance": {},
+            },
+            None,
+        )
+        assert result == {"run_id": "abc"}
+        assert prov is None
+
+    def test_non_empty_kwarg_still_writes_buckets(self):
+        # Sanity: the strip rule must not break the populated path.
+        result, prov = _merge_provider_config(
+            {"run_id": "abc"}, {"model": "X"},
+        )
+        assert result["provider_config"] == {"model": "X"}
+        assert result["provider_config_provenance"] == {"model": "kwarg"}
+
+
 # ---------- score_answer_file integration ----------
 
 class TestScoreAnswerFile:

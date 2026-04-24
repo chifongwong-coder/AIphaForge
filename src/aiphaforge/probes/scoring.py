@@ -775,16 +775,20 @@ def _merge_provider_config(
 ) -> tuple[Optional[dict[str, Any]], Optional[dict[str, Any]]]:
     """Merge a `provider_config` kwarg into the report manifest.
 
-    Rules per plan §A2:
+    Rules per plan §3 (r5):
     - Keys present in only one source pass through.
     - Keys present in BOTH with the same value → merged silently.
     - Keys present in BOTH with different values → ValueError naming
       the conflicting key + both values.
     - Provenance per key (``"manifest"`` / ``"kwarg"`` / ``"both"``)
       is recorded under ``manifest["provider_config_provenance"]``.
+    - Empty-bucket rule: do not write or preserve `provider_config` /
+      `provider_config_provenance` unless the merged config has at
+      least one key. If the input manifest contains literal empty
+      buckets and merge is empty, strip them from the output.
 
-    Returns the modified manifest dict (or None if both inputs were
-    None) plus the provenance dict for tests / introspection.
+    Returns ``(merged_manifest, provenance)``. Both are ``None`` when
+    no manifest material at all was supplied.
     """
     if not manifest and not provider_config:
         return None, None
@@ -815,9 +819,13 @@ def _merge_provider_config(
         else:
             merged[key] = incoming_pc[key]
             provenance[key] = "kwarg"
-    out["provider_config"] = merged
-    out["provider_config_provenance"] = provenance
-    return out, provenance
+    if merged:
+        out["provider_config"] = merged
+        out["provider_config_provenance"] = provenance
+        return out, provenance
+    out.pop("provider_config", None)
+    out.pop("provider_config_provenance", None)
+    return out, None
 
 
 def score_answer_file(
