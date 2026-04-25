@@ -1029,6 +1029,37 @@ class TestEffectiveCalendarInference:
         ):
             _effective_calendar_from_transforms([_RaisingProvider()])
 
+    def test_provider_returning_non_calendar_raises_protocol_error(self):
+        # v2.1.1: a marker-bearing provider whose
+        # `get_effective_calendar()` returns something that is NOT a
+        # TradingCalendar must fail at the protocol boundary, NOT
+        # opaquely later in `.stable_fingerprint()`.
+        from aiphaforge.calendars import CalendarProviderProtocolError
+        from aiphaforge.probes.transforms import (
+            _effective_calendar_from_transforms,
+        )
+
+        class _BadReturnProvider:
+            name = "BadReturn"
+            category = "metadata"
+            supports_view_only = True
+            supports_market_level = True
+            order_invertible = True
+            stochastic = False
+            _aiphaforge_calendar_provider = True
+
+            def get_effective_calendar(self):
+                return "this-is-not-a-calendar"  # str, not TradingCalendar
+
+            def apply(self, data, *, seed=None):
+                return data
+
+        with pytest.raises(
+            CalendarProviderProtocolError,
+            match="returned str, expected TradingCalendar",
+        ):
+            _effective_calendar_from_transforms([_BadReturnProvider()])
+
     def test_two_distinct_calendars_raise_conflict(self):
         from aiphaforge.calendars import (
             CHINA_A_SHARE,

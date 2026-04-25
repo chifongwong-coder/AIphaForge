@@ -164,8 +164,23 @@ def _effective_calendar_from_transforms(
                 f"{type(transform).__name__}.get_effective_calendar() "
                 f"raised {type(exc).__name__}: {exc}"
             ) from exc
-        if calendar is not None:
-            calendars.append(calendar)
+        if calendar is None:
+            continue
+        # v2.1.1 guard: a buggy provider returning a non-calendar
+        # object (e.g. a config dict, a string) should fail clearly
+        # at the protocol boundary, not later in
+        # ``.stable_fingerprint()``.
+        from aiphaforge.calendars.core import TradingCalendar
+        if not isinstance(calendar, TradingCalendar):
+            CalendarProviderProtocolError = (
+                _import_calendar_provider_protocol_error()
+            )
+            raise CalendarProviderProtocolError(
+                f"{type(transform).__name__}.get_effective_calendar() "
+                f"returned {type(calendar).__name__}, expected "
+                "TradingCalendar."
+            )
+        calendars.append(calendar)
 
     if not calendars:
         return None
