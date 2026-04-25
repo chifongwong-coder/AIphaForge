@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import hashlib
 import warnings
+from copy import deepcopy
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Iterable, Literal, Mapping, Optional
 
 import pandas as pd
@@ -117,6 +119,28 @@ def _holidays_hash(holidays: frozenset[pd.Timestamp]) -> str:
     return h.hexdigest()[:16]
 
 
+def _freeze_provenance(
+    value: Optional[Mapping[str, Any]],
+) -> Optional[Mapping[str, Any]]:
+    """Deep-copy + wrap a provenance dict in a MappingProxyType.
+
+    Two reasons to do both:
+
+    - **Deep-copy** so a caller mutating their original dict after
+      construction does NOT silently rewrite the calendar's
+      provenance.
+    - **MappingProxyType** wrap so consumers reading the calendar
+      can't accidentally mutate the metadata either.
+
+    Returns ``None`` for ``None`` input. Nested values inside the
+    provenance need not themselves be deeply immutable — they are
+    metadata only, excluded from equality and hashing.
+    """
+    if value is None:
+        return None
+    return MappingProxyType(deepcopy(dict(value)))
+
+
 def _format_offending_dates(
     dates: list[pd.Timestamp],
     *,
@@ -171,7 +195,16 @@ class TradingCalendar:
     holidays: frozenset[pd.Timestamp]
     coverage_start: Optional[pd.Timestamp] = None
     coverage_end: Optional[pd.Timestamp] = None
-    provenance: Optional[Mapping[str, Any]] = None
+    # Metadata only. Excluded from equality and hashing per plan
+    # r4-final §2.1 — keeping `provenance: dict` in the auto-generated
+    # `__hash__` made every predefined calendar unhashable. Wrapped
+    # in a MappingProxyType in __post_init__ so callers can't mutate
+    # it after construction either.
+    provenance: Optional[Mapping[str, Any]] = field(
+        default=None,
+        compare=False,
+        hash=False,
+    )
     _warning_keys_seen: set[str] = field(
         default_factory=set,
         init=False,
@@ -207,6 +240,14 @@ class TradingCalendar:
         normalized_end = _normalize_to_date(self.coverage_end)
         if normalized_end != self.coverage_end:
             object.__setattr__(self, "coverage_end", normalized_end)
+
+        # Freeze provenance: deep-copy + MappingProxyType wrap so
+        # later caller mutation of the original dict cannot rewrite
+        # the calendar's visible provenance, and consumers reading
+        # the field cannot mutate it either. r4-final §2.2.
+        object.__setattr__(
+            self, "provenance", _freeze_provenance(self.provenance),
+        )
 
     # ---- core membership ----
 

@@ -410,3 +410,137 @@ class TestErrorClasses:
         # violations (it's what duck-typing failures usually surface
         # as in stdlib).
         assert issubclass(CalendarProviderProtocolError, TypeError)
+
+
+# ---------- v2.1.0 r4 stabilization §2: hashability + provenance ----------
+
+
+class TestTradingCalendarHashabilityAndProvenance:
+    """v2.1.0 stabilization (M7) — `hash(US_EQUITY)` raised TypeError
+    in the original M1/M2 implementation because `provenance: dict`
+    participated in the auto-generated `__hash__`. r4-final §2 fixes
+    this by marking the field `compare=False, hash=False` and freezing
+    it via MappingProxyType + deep-copy in __post_init__.
+    """
+
+    def test_predefined_calendars_are_hashable(self):
+        from aiphaforge.calendars import (
+            CHINA_A_SHARE,
+            CRYPTO_24_7,
+            US_EQUITY,
+            US_FUTURES_ES,
+        )
+        for cal in (US_EQUITY, CHINA_A_SHARE, CRYPTO_24_7, US_FUTURES_ES):
+            # Must not raise.
+            hash(cal)
+
+    def test_user_calendar_with_dict_provenance_is_hashable(self):
+        cal = TradingCalendar(
+            name="user",
+            weekend_days=frozenset({5, 6}),
+            holidays=frozenset(),
+            provenance={"src": "me", "nested": {"a": 1}},
+        )
+        hash(cal)  # must not raise
+
+    def test_calendar_usable_as_dict_key_and_set_member(self):
+        from aiphaforge.calendars import CHINA_A_SHARE, US_EQUITY
+        s = {US_EQUITY, CHINA_A_SHARE}
+        assert len(s) == 2
+        d = {US_EQUITY: "us", CHINA_A_SHARE: "cn"}
+        assert d[US_EQUITY] == "us"
+
+    def test_calendar_usable_as_lru_cache_arg(self):
+        # Real-world consumer pattern: memoize calendar-keyed
+        # computations.
+        from functools import lru_cache
+
+        from aiphaforge.calendars import US_EQUITY
+
+        @lru_cache(maxsize=4)
+        def f(cal):
+            return cal.name
+
+        assert f(US_EQUITY) == "US_EQUITY"
+        assert f(US_EQUITY) == "US_EQUITY"  # cache hit, no TypeError
+
+    def test_provenance_does_not_affect_equality_or_hash(self):
+        cal_a = TradingCalendar(
+            name="x",
+            weekend_days=frozenset({5, 6}),
+            holidays=frozenset({pd.Timestamp("2024-12-25")}),
+            provenance={"src": "vendor_A"},
+        )
+        cal_b = TradingCalendar(
+            name="x",
+            weekend_days=frozenset({5, 6}),
+            holidays=frozenset({pd.Timestamp("2024-12-25")}),
+            provenance={"src": "vendor_B"},
+        )
+        # Same fields except provenance → equal AND same hash.
+        assert cal_a == cal_b
+        assert hash(cal_a) == hash(cal_b)
+
+    def test_warning_seen_set_does_not_affect_hash_or_fingerprint(self):
+        cal = _us_like_calendar()
+        h_before = hash(cal)
+        fp_before = cal.stable_fingerprint()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            cal.is_trading_day(pd.Timestamp("2020-06-15"))
+        assert cal._warning_keys_seen, "test setup: warning should have fired"
+        assert hash(cal) == h_before
+        assert cal.stable_fingerprint() == fp_before
+
+    def test_predefined_instance_provenance_contains_refresh_fields(self):
+        # r4-final §2.4: instance consumers must not lose
+        # last_verified or next_refresh_target.
+        from aiphaforge.calendars import US_EQUITY
+        prov = US_EQUITY.provenance
+        assert prov["last_verified"]
+        assert prov["next_refresh_target"] == "2033-12-31"
+        # Plus other documented fields per §2.4.
+        for key in (
+            "source", "source_license", "source_package_version",
+            "generation_script_sha256", "generated_at",
+            "coverage_start", "coverage_end",
+            "runtime_dependency", "source_calendar", "market_scope",
+        ):
+            assert key in prov, f"missing provenance key: {key}"
+
+    def test_provenance_is_immutable_after_construction(self):
+        cal = TradingCalendar(
+            name="x",
+            weekend_days=frozenset({5, 6}),
+            holidays=frozenset(),
+            provenance={"src": "me"},
+        )
+        with pytest.raises(TypeError):
+            cal.provenance["hacked"] = True  # type: ignore[index]
+
+    def test_caller_mutating_original_dict_does_not_rewrite_calendar(self):
+        # Critical safety: deep-copy must defend against caller-side
+        # mutation after construction.
+        src = {"src": "me", "nested": {"a": 1}}
+        cal = TradingCalendar(
+            name="x",
+            weekend_days=frozenset({5, 6}),
+            holidays=frozenset(),
+            provenance=src,
+        )
+        src["src"] = "mutated"
+        src["nested"]["a"] = 999
+        assert cal.provenance["src"] == "me"
+        # Deep copy: nested mutation also isolated.
+        assert cal.provenance["nested"]["a"] == 1
+
+    def test_provenance_none_is_preserved(self):
+        cal = TradingCalendar(
+            name="x",
+            weekend_days=frozenset({5, 6}),
+            holidays=frozenset(),
+            provenance=None,
+        )
+        assert cal.provenance is None
+        # And still hashable.
+        hash(cal)
