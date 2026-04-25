@@ -164,8 +164,23 @@ def _effective_calendar_from_transforms(
                 f"{type(transform).__name__}.get_effective_calendar() "
                 f"raised {type(exc).__name__}: {exc}"
             ) from exc
-        if calendar is not None:
-            calendars.append(calendar)
+        if calendar is None:
+            continue
+        # v2.1.1 guard: a buggy provider returning a non-calendar
+        # object (e.g. a config dict, a string) should fail clearly
+        # at the protocol boundary, not later in
+        # ``.stable_fingerprint()``.
+        from aiphaforge.calendars.core import TradingCalendar
+        if not isinstance(calendar, TradingCalendar):
+            CalendarProviderProtocolError = (
+                _import_calendar_provider_protocol_error()
+            )
+            raise CalendarProviderProtocolError(
+                f"{type(transform).__name__}.get_effective_calendar() "
+                f"returned {type(calendar).__name__}, expected "
+                "TradingCalendar."
+            )
+        calendars.append(calendar)
 
     if not calendars:
         return None
@@ -468,6 +483,14 @@ class DateShift:
         Manifest builders read diagnostics from the per-arm result so
         cross-arm or cross-repeat aliasing is structurally impossible.
         """
+        # Capture the original (pre-shift, pre-snap) source index BEFORE
+        # any mutation. v2.1.1 #5 fix: previously _resolve_collisions
+        # tried to invert the shift+snap by computing
+        # ``snapped_target - offset``, which collapses to a single
+        # date for every row in a collision group and reports false
+        # source dates in the audit manifest. The collision resolver
+        # now indexes back into the real source positions.
+        source_index = data.index.copy()
         out = data.copy()
         out.index = out.index + self.offset
         diagnostics: list[TransformDiagnostic] = []
@@ -483,7 +506,9 @@ class DateShift:
             out.index = snapped
 
             if not snapped.is_unique:
-                out, collision_diag = self._resolve_collisions(out)
+                out, collision_diag = self._resolve_collisions(
+                    out, source_index=source_index, target_index=snapped,
+                )
                 if collision_diag is not None:
                     diagnostics.append(collision_diag)
 
@@ -494,10 +519,26 @@ class DateShift:
     # ---- collision resolution ----
 
     def _resolve_collisions(
-        self, out: pd.DataFrame,
+        self,
+        out: pd.DataFrame,
+        *,
+        source_index: pd.DatetimeIndex,
+        target_index: pd.DatetimeIndex,
     ) -> tuple[pd.DataFrame, Optional[TransformDiagnostic]]:
         """Apply ``on_collision`` policy and emit a per-call
         diagnostic.
+
+        v2.1.1 #5: takes both ``source_index`` (pre-shift, pre-snap
+        timestamps captured by the caller) and ``target_index`` (the
+        snapped output index) so collision examples can correctly
+        identify which ORIGINAL source rows collided. The previous
+        implementation derived source timestamps via ``idx[p] -
+        self.offset`` against the snapped index — but every position
+        in a collision group shares the same snapped timestamp, so
+        every "source date" collapsed to a single value. The
+        manifest's ``source_ts`` / ``kept_source_ts`` /
+        ``dropped_source_ts`` fields are audit data and must reflect
+        the real pre-snap source rows.
 
         Returns ``(kept_frame, diagnostic_or_None)``. The diagnostic
         is ``None`` when the collision policy is ``"error"`` (we
@@ -518,9 +559,8 @@ class DateShift:
         """
         # Find duplicate target timestamps, preserving original input
         # order so keep_first / keep_last semantics are well-defined.
-        idx = out.index
         groups: dict[pd.Timestamp, list[int]] = {}
-        for pos, ts in enumerate(idx):
+        for pos, ts in enumerate(target_index):
             groups.setdefault(ts, []).append(pos)
 
         collision_groups = [
@@ -562,19 +602,26 @@ class DateShift:
                 keep_positions.add(positions[-1])
             dropped_count += len(positions) - 1
 
-        keep_mask = [pos in keep_positions for pos in range(len(idx))]
+        keep_mask = [
+            pos in keep_positions for pos in range(len(target_index))
+        ]
         kept = out.iloc[keep_mask]
 
         examples_capped = collision_groups[:10]
         examples = []
         for target_ts, positions in examples_capped:
-            source_timestamps = [idx[p] - self.offset for p in positions]
+            # v2.1.1 #5 fix: index into the REAL source index, never
+            # invert from snapped+offset. Multiple positions in one
+            # collision group have distinct source rows by definition.
+            source_timestamps = [source_index[p] for p in positions]
             if self.on_collision == "keep_first":
-                kept_source = source_timestamps[0]
-                dropped_source = source_timestamps[1:]
-            else:
-                kept_source = source_timestamps[-1]
-                dropped_source = source_timestamps[:-1]
+                kept_pos = positions[0]
+            else:  # keep_last
+                kept_pos = positions[-1]
+            kept_source = source_index[kept_pos]
+            dropped_source = [
+                source_index[p] for p in positions if p != kept_pos
+            ]
             examples.append({
                 "target_ts": target_ts,
                 "source_ts": list(source_timestamps),
