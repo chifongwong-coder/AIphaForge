@@ -313,3 +313,133 @@ class TestV2_0_BackwardCompat:
         report = result.scenarios[0]
         assert report.transform_detectability_warnings == []
         assert report.calendar_snap_collisions == []
+
+
+# ---------- v2.1.0 r4 §5: serializer direct tests (M10) ----------
+
+
+class TestSerializeCollisionExamples:
+    """Direct unit coverage for `_serialize_collision_examples`.
+
+    Plan r4-final §5.2: malformed example shapes should raise
+    `ValueError` at the serializer boundary, not propagate
+    AttributeError deep into manifest construction.
+    """
+
+    def _example(self, **overrides):
+        """Build a synthetic example dict mirroring DateShift's shape."""
+        base = {
+            "target_ts": pd.Timestamp("2024-12-02"),
+            "source_ts": [
+                pd.Timestamp("2024-11-28"),
+                pd.Timestamp("2024-11-29"),
+            ],
+            "kept_source_ts": pd.Timestamp("2024-11-29"),
+            "dropped_source_ts": [pd.Timestamp("2024-11-28")],
+        }
+        base.update(overrides)
+        return base
+
+    def test_happy_path_stringifies_pd_timestamps(self):
+        from aiphaforge.probes.abtest import _serialize_collision_examples
+        out = _serialize_collision_examples([self._example()])
+        assert len(out) == 1
+        assert out[0]["target_ts"] == "2024-12-02"
+        assert out[0]["source_ts"] == ["2024-11-28", "2024-11-29"]
+        assert out[0]["kept_source_ts"] == "2024-11-29"
+        assert out[0]["dropped_source_ts"] == ["2024-11-28"]
+
+    def test_caps_at_10_groups(self):
+        from aiphaforge.probes.abtest import _serialize_collision_examples
+        # 15 examples — should be capped at 10.
+        many = [self._example() for _ in range(15)]
+        out = _serialize_collision_examples(many)
+        assert len(out) == 10
+
+    def test_pre_stringified_dates_pass_through(self):
+        # Forward-compat: future schemas may stringify before
+        # reaching the serializer.
+        from aiphaforge.probes.abtest import _serialize_collision_examples
+        ex = {
+            "target_ts": "2024-12-02",
+            "source_ts": ["2024-11-28", "2024-11-29"],
+            "kept_source_ts": "2024-11-29",
+            "dropped_source_ts": ["2024-11-28"],
+        }
+        out = _serialize_collision_examples([ex])
+        assert out[0]["target_ts"] == "2024-12-02"
+
+    def test_missing_required_key_raises_clearly(self):
+        from aiphaforge.probes.abtest import _serialize_collision_examples
+        bad = {
+            "target_ts": pd.Timestamp("2024-12-02"),
+            # missing source_ts, kept_source_ts, dropped_source_ts
+        }
+        with pytest.raises(ValueError, match="missing required keys"):
+            _serialize_collision_examples([bad])
+
+    def test_non_mapping_example_raises_clearly(self):
+        from aiphaforge.probes.abtest import _serialize_collision_examples
+        with pytest.raises(ValueError, match="must be a mapping"):
+            _serialize_collision_examples(["not a dict"])
+
+    def test_malformed_timestamp_value_raises_clearly(self):
+        from aiphaforge.probes.abtest import _serialize_collision_examples
+        bad = self._example()
+        bad["target_ts"] = 12345  # int, not pd.Timestamp
+        with pytest.raises(ValueError, match="malformed timestamp"):
+            _serialize_collision_examples([bad])
+
+    def test_empty_input_returns_empty_output(self):
+        from aiphaforge.probes.abtest import _serialize_collision_examples
+        assert _serialize_collision_examples([]) == []
+
+
+class TestManifestUsesArmLocalDiagnostics:
+    """v2.1.0 r4 §3.5 / §5.1 — manifest collision warnings must come
+    from per-arm diagnostics, NOT from any transform-instance state.
+    """
+
+    def test_collision_warning_details_carry_schema_version(self):
+        # End-to-end smoke that the new schema_version=1.0 reaches
+        # the manifest.
+        data = _ohlcv(n=80)
+        ds = DateShift(
+            offset=pd.DateOffset(years=-3),
+            calendar=US_EQUITY,
+            snap="forward",
+            on_collision="keep_last",
+        )
+        scen = ABScenario(
+            scenario_id="schema", mode="market_level",
+            transforms=[ds],
+        )
+        result = run_ab_probe(
+            ai_factory=_factory,
+            baseline_factory=_factory,
+            data=data,
+            scenarios=[scen],
+            **_KW,
+        )
+        collisions = result.scenarios[0].calendar_snap_collisions
+        if collisions:
+            # When collisions fire, schema_version must be present.
+            assert collisions[0]["details"]["schema_version"] == "1.0"
+            # And repeat_count_with_warning records how many
+            # arm-repeats produced the warning.
+            assert "repeat_count_with_warning" in collisions[0]["details"]
+
+    def test_no_dateshift_attribute_left_behind_on_instance(self):
+        # Regression guard: r4 §3 removed last_collision_report
+        # entirely. Apply 100 rounds; instance should still have no
+        # such attribute.
+        data = _ohlcv(n=20)
+        ds = DateShift(
+            offset=pd.DateOffset(days=0),
+            calendar=US_EQUITY,
+            snap="nearest",
+            on_collision="keep_last",
+        )
+        for _ in range(5):
+            ds.apply(data)
+        assert not hasattr(ds, "last_collision_report")

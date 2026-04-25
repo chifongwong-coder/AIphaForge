@@ -19,7 +19,17 @@ from __future__ import annotations
 import hashlib
 import warnings
 from dataclasses import asdict
-from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Mapping,
+    Optional,
+    Sequence,
+    Union,
+)
 
 import numpy as np
 import pandas as pd
@@ -1517,29 +1527,70 @@ def _build_calendar_detectability_warnings(
     return warnings_out
 
 
+_REQUIRED_COLLISION_EXAMPLE_KEYS = (
+    "target_ts", "source_ts", "kept_source_ts", "dropped_source_ts",
+)
+
+
 def _serialize_collision_examples(
     examples: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """Stringify the in-memory pd.Timestamp objects in the collision
-    report's ``examples`` list so the manifest is JSON-safe.
+    """Stringify the in-memory pd.Timestamp objects in a collision
+    diagnostic's ``examples`` list so the manifest is JSON-safe.
 
-    Plan §4.4 / §6.2 r3-final defect #4 fix: in-memory the
-    DateShift report holds pd.Timestamp; the manifest serializer
-    converts to YYYY-MM-DD strings here.
+    Plan r4-final §5.2: examples cap at 10 groups, each with the
+    canonical schema-1.0 keys (``target_ts``, ``source_ts``,
+    ``kept_source_ts``, ``dropped_source_ts``). A malformed entry
+    raises ``ValueError`` at the serializer boundary rather than
+    propagating an ``AttributeError`` deep in manifest construction.
+
+    Accepts pd.Timestamp OR string timestamp values for each field
+    — strings pass through untouched (for forward-compat with future
+    diagnostic schemas that may pre-stringify).
     """
     out = []
-    for ex in examples:
-        out.append({
-            "target_ts": ex["target_ts"].strftime("%Y-%m-%d"),
-            "source_ts": [
-                ts.strftime("%Y-%m-%d") for ts in ex["source_ts"]
-            ],
-            "kept_source_ts": ex["kept_source_ts"].strftime("%Y-%m-%d"),
-            "dropped_source_ts": [
-                ts.strftime("%Y-%m-%d") for ts in ex["dropped_source_ts"]
-            ],
-        })
+    for i, ex in enumerate(examples):
+        if not isinstance(ex, Mapping):
+            raise ValueError(
+                f"collision example #{i} must be a mapping, got "
+                f"{type(ex).__name__}"
+            )
+        missing = [k for k in _REQUIRED_COLLISION_EXAMPLE_KEYS if k not in ex]
+        if missing:
+            raise ValueError(
+                f"collision example #{i} missing required keys: "
+                f"{missing}"
+            )
+        try:
+            out.append({
+                "target_ts": _ts_to_iso(ex["target_ts"]),
+                "source_ts": [_ts_to_iso(t) for t in ex["source_ts"]],
+                "kept_source_ts": _ts_to_iso(ex["kept_source_ts"]),
+                "dropped_source_ts": [
+                    _ts_to_iso(t) for t in ex["dropped_source_ts"]
+                ],
+            })
+        except (AttributeError, TypeError) as exc:
+            raise ValueError(
+                f"collision example #{i} has malformed timestamp "
+                f"value: {exc}"
+            ) from exc
+        if len(out) >= 10:
+            # Hard cap at 10 per r4-final §5.2.
+            break
     return out
+
+
+def _ts_to_iso(value: Any) -> str:
+    """Coerce a pd.Timestamp / str to YYYY-MM-DD; reject other types."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, pd.Timestamp):
+        return value.strftime("%Y-%m-%d")
+    raise TypeError(
+        f"timestamp value must be pd.Timestamp or str, got "
+        f"{type(value).__name__}"
+    )
 
 
 def _build_collision_warnings_from_diagnostics(
