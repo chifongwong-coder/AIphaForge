@@ -429,6 +429,45 @@ class TestManifestUsesArmLocalDiagnostics:
             # arm-repeats produced the warning.
             assert "repeat_count_with_warning" in collisions[0]["details"]
 
+    def test_arm_aggregation_does_not_double_count(self):
+        # v2.1.1 fix: AI and baseline running on identical data must
+        # NOT produce a 2× inflated `collision_count`. The aggregator
+        # reports max-over-arms at top level + per-arm breakdown.
+        data = _ohlcv(n=80)
+        ds = DateShift(
+            offset=pd.DateOffset(years=-3),
+            calendar=US_EQUITY,
+            snap="forward",
+            on_collision="keep_last",
+        )
+        scen = ABScenario(
+            scenario_id="agg", mode="market_level",
+            transforms=[ds],
+        )
+        result = run_ab_probe(
+            ai_factory=_factory,
+            baseline_factory=_factory,
+            data=data,
+            scenarios=[scen],
+            **_KW,
+        )
+        collisions = result.scenarios[0].calendar_snap_collisions
+        if not collisions:
+            return  # No collision in this fixture; skip.
+        details = collisions[0]["details"]
+        # New v2.1.1 manifest fields.
+        assert "per_arm" in details
+        assert "ai" in details["per_arm"]
+        assert "baseline" in details["per_arm"]
+        assert "arms_with_warning" in details
+        # AI=baseline → max == per-arm value, NOT 2× per-arm.
+        ai_count = details["per_arm"]["ai"]["collision_count"]
+        baseline_count = details["per_arm"]["baseline"]["collision_count"]
+        assert details["collision_count"] == max(ai_count, baseline_count)
+        # When both arms produced a warning, arms_with_warning is 2.
+        if ai_count > 0 and baseline_count > 0:
+            assert details["arms_with_warning"] == 2
+
     def test_no_dateshift_attribute_left_behind_on_instance(self):
         # Regression guard: r4 §3 removed last_collision_report
         # entirely. Apply 100 rounds; instance should still have no

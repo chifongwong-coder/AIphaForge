@@ -1603,47 +1603,84 @@ def _build_collision_warnings_from_diagnostics(
 
     Aggregates per-arm diagnostics into one manifest entry per
     distinct ``(code, source, schema_version, on_collision)``
-    grouping. Counts are summed across repeats so a 10-repeat
-    scenario where every repeat dropped 17 rows reports
-    ``collision_count = 170`` plus
-    ``repeat_count_with_warning = 10``.
+    grouping.
 
-    AI and baseline produce independent diagnostics in v2.1.0
-    (identical inputs → identical reports), but they're collected
-    separately so future arm-divergent flows are well-defined.
+    v2.1.1: counts are reported as a max-over-arms (not a sum) so
+    AI and baseline running on identical data don't produce a 2×
+    inflated ``collision_count``. The per-arm breakdown is exposed
+    separately under ``per_arm`` for callers that need to see
+    arm-divergent patterns:
+
+    - ``collision_count`` / ``collision_group_count``: the maximum
+      across arms — represents the true row drops a single arm
+      experienced, not the sum across both arms.
+    - ``per_arm.ai.collision_count``, ``per_arm.baseline.collision_count``:
+      arm-local totals summed across repeats.
+    - ``arms_with_warning``: number of arms that produced at least
+      one diagnostic (1 or 2).
+    - ``repeat_count_with_warning``: total arm-repeat occurrences,
+      preserved for backward readability.
     """
-    all_diagnostics = list(ai_diagnostics) + list(baseline_diagnostics)
-    collision_diags = [
-        d for d in all_diagnostics
-        if d.code == "calendar_snap_collision_rows_dropped"
-    ]
-    if not collision_diags:
+    arm_diag_pairs: list[tuple[str, TransformDiagnostic]] = []
+    for d in ai_diagnostics:
+        if d.code == "calendar_snap_collision_rows_dropped":
+            arm_diag_pairs.append(("ai", d))
+    for d in baseline_diagnostics:
+        if d.code == "calendar_snap_collision_rows_dropped":
+            arm_diag_pairs.append(("baseline", d))
+    if not arm_diag_pairs:
         return []
 
-    # Group by (source, schema_version, on_collision). Within a
-    # group, sum counts and merge example sets (capped at 10 across
-    # the aggregate).
-    groups: Dict[tuple, list[TransformDiagnostic]] = {}
-    for d in collision_diags:
+    # Group by (source, schema_version, on_collision); within each
+    # group, split by arm so counts can be reported per-arm AND as a
+    # max-over-arms aggregate.
+    groups: Dict[tuple, Dict[str, list[TransformDiagnostic]]] = {}
+    for arm, d in arm_diag_pairs:
         details = d.details or {}
         key = (
             d.source,
             details.get("schema_version", "1.0"),
             details.get("on_collision"),
         )
-        groups.setdefault(key, []).append(d)
+        groups.setdefault(key, {"ai": [], "baseline": []})[arm].append(d)
 
     out: List[Dict[str, Any]] = []
-    for (source, schema_version, on_collision), diags in groups.items():
-        total_count = sum(
-            d.details.get("collision_count", 0) for d in diags
+    for (source, schema_version, on_collision), arm_diags in groups.items():
+        per_arm_summary: Dict[str, Dict[str, int]] = {}
+        for arm in ("ai", "baseline"):
+            diags = arm_diags[arm]
+            per_arm_summary[arm] = {
+                "collision_count": sum(
+                    d.details.get("collision_count", 0) for d in diags
+                ),
+                "collision_group_count": sum(
+                    d.details.get("collision_group_count", 0) for d in diags
+                ),
+                "repeat_count_with_warning": len(diags),
+            }
+        # Top-level counts: max across arms. AI=baseline in v2.1.x
+        # fixtures so this collapses to one arm's count, which is
+        # the true number of row drops the user saw — not 2× it.
+        max_count = max(
+            per_arm_summary["ai"]["collision_count"],
+            per_arm_summary["baseline"]["collision_count"],
         )
-        total_groups = sum(
-            d.details.get("collision_group_count", 0) for d in diags
+        max_groups = max(
+            per_arm_summary["ai"]["collision_group_count"],
+            per_arm_summary["baseline"]["collision_group_count"],
         )
+        arms_with_warning = sum(
+            1 for arm in ("ai", "baseline")
+            if per_arm_summary[arm]["repeat_count_with_warning"] > 0
+        )
+        total_repeat_count = (
+            per_arm_summary["ai"]["repeat_count_with_warning"]
+            + per_arm_summary["baseline"]["repeat_count_with_warning"]
+        )
+        all_diags = arm_diags["ai"] + arm_diags["baseline"]
         # Aggregate examples up to first 10 across the group.
         merged_examples: List[Dict[str, Any]] = []
-        for d in diags:
+        for d in all_diags:
             for ex in d.details.get("examples", []):
                 if len(merged_examples) >= 10:
                     break
@@ -1651,9 +1688,9 @@ def _build_collision_warnings_from_diagnostics(
             if len(merged_examples) >= 10:
                 break
         examples_truncated = (
-            sum(len(d.details.get("examples", [])) for d in diags) > 10
+            sum(len(d.details.get("examples", [])) for d in all_diags) > 10
             or any(
-                d.details.get("examples_truncated") for d in diags
+                d.details.get("examples_truncated") for d in all_diags
             )
         )
         out.append({
@@ -1663,19 +1700,22 @@ def _build_collision_warnings_from_diagnostics(
             "message": (
                 f"{source} calendar snapping produced duplicate "
                 f"target dates; on_collision={on_collision!r} dropped "
-                f"{total_count} source rows across "
-                f"{len(diags)} arm-repeat(s). This changes the "
-                "transformed sample length."
+                f"up to {max_count} source rows per arm across "
+                f"{arms_with_warning} arm(s) / {total_repeat_count} "
+                "arm-repeat(s). This changes the transformed sample "
+                "length."
             ),
             "details": {
                 "schema_version": schema_version,
                 "transform": source,
                 "on_collision": on_collision,
-                "collision_count": total_count,
-                "collision_group_count": total_groups,
+                "collision_count": max_count,
+                "collision_group_count": max_groups,
                 "examples": _serialize_collision_examples(merged_examples),
                 "examples_truncated": examples_truncated,
-                "repeat_count_with_warning": len(diags),
+                "arms_with_warning": arms_with_warning,
+                "repeat_count_with_warning": total_repeat_count,
+                "per_arm": per_arm_summary,
             },
         })
     return out
