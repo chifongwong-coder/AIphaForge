@@ -61,6 +61,12 @@ Issues = "https://github.com/chifongwong-coder/AIphaForge/issues"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+# v2.1: the calendars module ships its holiday data + license notice
+# as static files inside the package. importlib.resources reads them
+# at runtime; pandas_market_calendars is NOT a runtime dependency.
+"aiphaforge.calendars" = ["_data/holidays.json", "_data/LICENSE.holidays"]
+
 [tool.ruff]
 target-version = "py310"
 line-length = 120
