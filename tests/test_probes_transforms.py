@@ -113,6 +113,223 @@ class TestDateShift:
         np.testing.assert_array_equal(out["close"].to_numpy(), data["close"].to_numpy())
 
 
+class TestDateShiftCalendarMarker:
+    """v2.1 §4.1 / §5.3 r3-final: explicit marker protocol."""
+
+    def test_marker_attribute_present_and_true(self):
+        from typing import get_type_hints
+        # Class-level marker, value is True.
+        assert DateShift._aiphaforge_calendar_provider is True
+        # Annotation present (defect #1: ClassVar[Literal[True]]).
+        hints = get_type_hints(DateShift, include_extras=True)
+        assert "_aiphaforge_calendar_provider" in hints
+
+    def test_get_effective_calendar_returns_calendar(self):
+        from aiphaforge.calendars import US_EQUITY
+        ds = DateShift(offset=pd.DateOffset(years=-3), calendar=US_EQUITY)
+        assert ds.get_effective_calendar() is US_EQUITY
+
+    def test_get_effective_calendar_returns_none_when_unset(self):
+        ds = DateShift(offset=pd.DateOffset(years=-3))
+        assert ds.get_effective_calendar() is None
+
+
+class TestDateShiftSnap:
+    """v2.1 §4.2 — snap modes."""
+
+    def test_calendar_none_preserves_v2_0_behavior(self):
+        # Backward-compat: no calendar means no snap, no collision
+        # check, exact unshift_date round-trip.
+        ds = DateShift(offset=pd.DateOffset(years=-3))
+        ts = pd.Timestamp("2024-03-12")
+        assert ds.shift_date(ts) == pd.Timestamp("2021-03-12")
+        assert ds.unshift_date(ds.shift_date(ts)) == ts
+
+    def test_snap_forward_through_holiday(self):
+        from aiphaforge.calendars import US_EQUITY
+        ds = DateShift(
+            offset=pd.DateOffset(days=0),  # no offset, just snap
+            calendar=US_EQUITY,
+            snap="forward",
+        )
+        # 2024-12-25 (Wed, holiday) → 2024-12-26 (Thu)
+        assert ds.shift_date(pd.Timestamp("2024-12-25")) == pd.Timestamp("2024-12-26")
+
+    def test_snap_backward_through_holiday(self):
+        from aiphaforge.calendars import US_EQUITY
+        ds = DateShift(
+            offset=pd.DateOffset(days=0),
+            calendar=US_EQUITY,
+            snap="backward",
+        )
+        assert ds.shift_date(pd.Timestamp("2024-12-25")) == pd.Timestamp("2024-12-24")
+
+    def test_snap_error_raises(self):
+        from aiphaforge.calendars import US_EQUITY, CalendarSnapError
+        ds = DateShift(
+            offset=pd.DateOffset(days=0),
+            calendar=US_EQUITY,
+            snap="error",
+        )
+        with pytest.raises(CalendarSnapError):
+            ds.shift_date(pd.Timestamp("2024-12-25"))
+
+    def test_snap_nearest_picks_closer(self):
+        from aiphaforge.calendars import US_EQUITY
+        ds = DateShift(
+            offset=pd.DateOffset(days=0),
+            calendar=US_EQUITY,
+            snap="nearest",
+        )
+        # Saturday 2024-01-06: prev Fri 01-05 (1 day), next Mon 01-08
+        # (2 days). Nearest = backward.
+        assert ds.shift_date(pd.Timestamp("2024-01-06")) == pd.Timestamp("2024-01-05")
+
+    def test_invalid_snap_rejected(self):
+        from aiphaforge.calendars import US_EQUITY
+        with pytest.raises(ValueError, match="snap must be"):
+            DateShift(offset=0, calendar=US_EQUITY, snap="sideways")  # type: ignore[arg-type]
+
+
+class TestDateShiftCollision:
+    """v2.1 §4.3 / §4.4 — collision policy + structured report."""
+
+    def _frame_with_holiday_collision(self):
+        # Two consecutive trading days where the offset of -3 years
+        # lands them across Christmas 2021. With snap='forward',
+        # both 2021-12-23 (Thu) and 2021-12-24 (Fri, NYSE early
+        # close but full session in pandas_market_calendars) avoid
+        # collision. We need a different setup: shift backward by
+        # an offset that puts source 2024-12-25 (already a holiday
+        # would propagate) and 2024-12-26 onto a NYSE non-trading
+        # cluster.
+        # Simpler: build explicit input with two source dates that
+        # both forward-snap to the same target.
+        # Source 2018-12-22 (Sat) and 2018-12-25 (Tue, holiday).
+        # No offset; snap='forward'. 2018-12-22 → 2018-12-24 (Mon),
+        # 2018-12-25 → 2018-12-26 (Wed). No collision actually.
+        # Better: 2018-12-23 (Sun) and 2018-12-25 (Tue holiday).
+        # Both forward to 2018-12-24 and 2018-12-26 — still no
+        # collision. The narrow case is two holidays/weekends in a
+        # row that all snap to the SAME next trading day.
+        # 2024-11-28 (Thu Thanksgiving) + 2024-11-29 (Fri half-day,
+        # but treated as full holiday by NYSE). Both forward-snap
+        # to 2024-12-02 (Mon).
+        return pd.DataFrame(
+            {"open": [1.0, 2.0], "high": [1.5, 2.5],
+             "low": [0.5, 1.5], "close": [1.2, 2.2], "volume": [100, 200]},
+            index=pd.DatetimeIndex(["2024-11-28", "2024-11-29"]),
+        )
+
+    def test_collision_error_default(self):
+        from aiphaforge.calendars import US_EQUITY, CalendarSnapCollisionError
+        ds = DateShift(offset=pd.DateOffset(days=0), calendar=US_EQUITY, snap="forward")
+        df = self._frame_with_holiday_collision()
+        with pytest.raises(CalendarSnapCollisionError, match="duplicate target"):
+            ds.apply(df)
+        # And the report is None on a failed apply.
+        assert ds.last_collision_report is None
+
+    def test_collision_keep_first(self):
+        from aiphaforge.calendars import US_EQUITY
+        ds = DateShift(
+            offset=pd.DateOffset(days=0), calendar=US_EQUITY,
+            snap="forward", on_collision="keep_first",
+        )
+        df = self._frame_with_holiday_collision()
+        out = ds.apply(df)
+        assert out.index.is_unique
+        # First source row (2024-11-28 → 2024-12-02) survives.
+        assert out["close"].iloc[0] == 1.2
+
+    def test_collision_keep_last(self):
+        from aiphaforge.calendars import US_EQUITY
+        ds = DateShift(
+            offset=pd.DateOffset(days=0), calendar=US_EQUITY,
+            snap="forward", on_collision="keep_last",
+        )
+        df = self._frame_with_holiday_collision()
+        out = ds.apply(df)
+        assert out.index.is_unique
+        # Last source row (2024-11-29 → 2024-12-02) survives.
+        assert out["close"].iloc[0] == 2.2
+
+    def test_collision_report_has_required_fields(self):
+        from aiphaforge.calendars import US_EQUITY
+        ds = DateShift(
+            offset=pd.DateOffset(days=0), calendar=US_EQUITY,
+            snap="forward", on_collision="keep_last",
+        )
+        df = self._frame_with_holiday_collision()
+        ds.apply(df)
+        report = ds.last_collision_report
+        assert report is not None
+        for key in (
+            "transform", "on_collision", "collision_count",
+            "collision_group_count", "examples", "examples_truncated",
+        ):
+            assert key in report
+        assert report["transform"] == "DateShift"
+        assert report["on_collision"] == "keep_last"
+        assert report["collision_count"] == 1
+        assert report["collision_group_count"] == 1
+        # Examples preserve in-memory pd.Timestamp typing
+        # (defect #4 fix — JSON serializer in M5 stringifies).
+        ex = report["examples"][0]
+        assert isinstance(ex["target_ts"], pd.Timestamp)
+        assert isinstance(ex["kept_source_ts"], pd.Timestamp)
+        assert all(isinstance(t, pd.Timestamp) for t in ex["source_ts"])
+
+    def test_no_collision_clears_stale_report(self):
+        from aiphaforge.calendars import US_EQUITY
+        # First call: triggers collision.
+        ds = DateShift(
+            offset=pd.DateOffset(days=0), calendar=US_EQUITY,
+            snap="forward", on_collision="keep_first",
+        )
+        ds.apply(self._frame_with_holiday_collision())
+        assert ds.last_collision_report is not None
+        # Second call: clean frame, no collision. Report must reset.
+        clean = pd.DataFrame(
+            {"open": [1.0, 2.0], "high": [1.5, 2.5],
+             "low": [0.5, 1.5], "close": [1.2, 2.2], "volume": [100, 200]},
+            index=pd.bdate_range("2024-01-08", periods=2),
+        )
+        ds.apply(clean)
+        assert ds.last_collision_report is None
+
+    def test_invalid_collision_policy_rejected(self):
+        with pytest.raises(ValueError, match="on_collision must be"):
+            DateShift(offset=0, on_collision="merge_mean")  # type: ignore[arg-type]
+
+
+class TestDateShiftLossyUnshift:
+    """v2.1 §4.5 — best-effort lossy unshift contract."""
+
+    def test_unshift_inverse_when_no_calendar(self):
+        # Calendar-less case: exact inverse.
+        ds = DateShift(offset=pd.DateOffset(years=-5))
+        ts = pd.Timestamp("2024-03-12")
+        assert ds.unshift_date(ds.shift_date(ts)) == ts
+
+    def test_unshift_uses_opposite_snap(self):
+        # forward snap on apply → backward snap on unshift.
+        from aiphaforge.calendars import US_EQUITY
+        ds = DateShift(
+            offset=pd.DateOffset(days=0), calendar=US_EQUITY,
+            snap="forward",
+        )
+        # 2024-12-25 (holiday Wed) shift_date → 2024-12-26 (Thu).
+        # unshift_date snaps 2024-12-26 backward (no holiday, just
+        # offset reversal) → 2024-12-26 stays since it's a trading
+        # day. So result is 2024-12-26, not original 2024-12-25 —
+        # the lossy contract.
+        shifted = ds.shift_date(pd.Timestamp("2024-12-25"))
+        assert shifted == pd.Timestamp("2024-12-26")
+        # Unshift returns the same (it was already a trading day).
+        assert ds.unshift_date(shifted) == pd.Timestamp("2024-12-26")
+
+
 # ---------- PriceScale ----------
 
 class TestPriceScale:
