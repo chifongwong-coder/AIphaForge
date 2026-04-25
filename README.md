@@ -114,7 +114,9 @@ Daily-resolution trading-day primitive shipped as a self-contained `aiphaforge.c
 - **4 predefined exchange calendars**: `US_EQUITY` (NYSE-style), `CHINA_A_SHARE` (SSE), `CRYPTO_24_7` (every date a trading day), `US_FUTURES_ES` (CME equity futures). Holiday data covers 1990–2035, vendored from MIT-licensed `pandas_market_calendars` (NOT a runtime dependency — generated offline by `scripts/generate_holidays_json.py`)
 - **`DateShift(calendar=, snap=, on_collision=)`** wires the calendar into the existing memory-probe transform: `snap` chooses `"forward"` / `"backward"` / `"nearest"` / `"error"` for non-trading shifted dates, and `on_collision` handles duplicates after snap (`"error"` / `"keep_first"` / `"keep_last"`)
 - **`validate_ohlcv_integrity(calendar=)`** and **`TransformPipeline(calendar=)`** thread calendar conformance into the existing OHLC validators; calendar mismatches between explicit and inferred sources fail fast with `CalendarConflictError`
-- **Per-scenario manifest warnings**: `transform_detectability_warnings` (calendar-snap fingerprint caveat) and `calendar_snap_collisions` (when row-dropping policies fire) are serialised into the per-scenario A/B report so JSON readers see them
+- **Per-scenario manifest warnings**: `transform_detectability_warnings` (calendar-snap fingerprint caveat) and `calendar_snap_collisions` (when row-dropping policies fire — with per-arm breakdown so identical-arm fixtures don't double-count) are serialised into the per-scenario A/B report so JSON readers see them
+- **Per-call diagnostics** (v2.1): `TransformPipeline.apply_with_diagnostics()` returns a frozen `TransformApplyResult(data, diagnostics)` so callers can inspect collision diagnostics outside `run_ab_probe`. `apply()` keeps the v2.0 `pd.DataFrame` return type
+- **Vendor-attested provenance**: every predefined calendar's `.provenance` mapping carries the source package version, generation script SHA-256, `last_verified` date, and `next_refresh_target` (currently 2033-12-31) so audit consumers can trace every shipped holiday back to its generation step
 - **Daily resolution only**: no early-close / lunch-break / partial-holiday / intraday-session modelling — that's deferred to v2.2 alongside the Hook-based view-only broker-proxy wrapper
 
 ## Quick Start
@@ -395,7 +397,14 @@ scen = ABScenario(
             offset=pd.DateOffset(years=-3),
             calendar=US_EQUITY,
             snap="forward",        # holiday → next trading day
-            on_collision="keep_last",  # multi-year shift may collide
+            # Multi-year shifts WILL collide on NYSE: e.g. 2018-12-26
+            # and 2018-12-22 both forward-snap to 2015-12-28 (Mon)
+            # because 2015-12-25 was a Friday holiday. `keep_last`
+            # accepts the data loss and surfaces a structured
+            # collision warning into the per-scenario manifest. Use
+            # `"error"` (the default) for validation contexts where
+            # silent row drops are unacceptable.
+            on_collision="keep_last",
         ),
     ],
 )
@@ -405,6 +414,33 @@ scen = ABScenario(
 # transforms with an unrelated `.calendar` attribute are ignored.
 # Calendar conflicts (two DateShift with different calendars) fail
 # fast with `CalendarConflictError`.
+```
+
+For per-call diagnostics outside `run_ab_probe` (e.g. when applying a
+pipeline directly in user code), use `apply_with_diagnostics`:
+
+```python
+from aiphaforge.probes.transforms import (
+    DateShift, TransformPipeline, TransformApplyResult,
+)
+
+ds = DateShift(
+    offset=pd.DateOffset(years=-3),
+    calendar=US_EQUITY,
+    snap="forward",
+    on_collision="keep_last",
+)
+pipeline = TransformPipeline(transforms=[ds], mode="market_level")
+
+# Backward-compatible: apply() returns just the DataFrame
+out_df = pipeline.apply(data)
+
+# Opt-in: apply_with_diagnostics() returns a frozen result object
+result: TransformApplyResult = pipeline.apply_with_diagnostics(data)
+out_df = result.data
+for diag in result.diagnostics:
+    if diag.code == "calendar_snap_collision_rows_dropped":
+        print(f"dropped {diag.details['collision_count']} rows")
 ```
 
 ## Installation
