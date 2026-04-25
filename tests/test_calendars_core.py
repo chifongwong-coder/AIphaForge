@@ -544,3 +544,148 @@ class TestTradingCalendarHashabilityAndProvenance:
         assert cal.provenance is None
         # And still hashable.
         hash(cal)
+
+
+# ---------- v2.1.0 r4 stabilization §4: daily-resolution + tz fix ----------
+
+
+class TestDailyResolutionConformance:
+    """v2.1.0 stabilization (M9) — date-normalize-and-validate.
+
+    Plan r4-final §4: validation operates on date-normalized values
+    while preserving the local displayed date. NaT, intraday
+    duplicates, and tz-aware midnight-shifting are all rejected by
+    the calendar validator.
+    """
+
+    def _us_cal(self):
+        return TradingCalendar(
+            name="US",
+            weekend_days=frozenset({5, 6}),
+            holidays=frozenset({pd.Timestamp("2024-12-25")}),
+            coverage_start=pd.Timestamp("2024-01-01"),
+            coverage_end=pd.Timestamp("2024-12-31"),
+        )
+
+    def test_one_daily_bar_with_non_midnight_time_passes(self):
+        # Real vendor data often timestamps each daily bar at the
+        # session close (e.g. 16:00). One row per date with a
+        # non-midnight timestamp is a daily bar, not intraday.
+        idx = pd.DatetimeIndex([
+            "2024-01-08 16:00", "2024-01-09 16:00", "2024-01-10 16:00",
+        ])
+        result = self._us_cal().is_conformant(idx)
+        assert result.passed is True
+
+    def test_duplicate_normalized_dates_are_rejected(self):
+        # Two rows on the same calendar date is intraday; v2.1
+        # rejects with a clear error.
+        idx = pd.DatetimeIndex([
+            "2024-01-08 09:30", "2024-01-08 16:00",
+        ])
+        result = self._us_cal().is_conformant(idx)
+        assert result.passed is False
+        msg = result.errors[0]
+        assert "multiple rows per date" in msg
+        assert "2024-01-08" in msg
+        assert "intraday" in msg
+
+    def test_holiday_after_normalization_is_flagged(self):
+        # A non-midnight timestamp on a holiday still flags as a
+        # holiday: 2024-12-25 16:00 normalizes to 2024-12-25.
+        idx = pd.DatetimeIndex(["2024-12-24", "2024-12-25 16:00", "2024-12-26"])
+        result = self._us_cal().is_conformant(idx)
+        assert result.passed is False
+        # The holiday membership error mentions 2024-12-25.
+        assert any("2024-12-25" in e for e in result.errors)
+
+    def test_tz_aware_index_uses_local_date(self):
+        # 2024-12-25 23:30 ET previously normalized to 2024-12-26
+        # via UTC conversion (ET is UTC-5; 23:30 ET = 04:30 next-day
+        # UTC). r4-final §4.2 requires preserving the LOCAL date —
+        # so this should still flag as the holiday.
+        idx = pd.DatetimeIndex([
+            pd.Timestamp("2024-12-25 23:30", tz="America/New_York"),
+        ])
+        result = self._us_cal().is_conformant(idx)
+        assert result.passed is False
+        assert any("2024-12-25" in e for e in result.errors)
+
+    def test_tz_aware_clean_date_passes(self):
+        # Sanity: a tz-aware non-holiday date still passes.
+        idx = pd.DatetimeIndex([
+            pd.Timestamp("2024-01-08 16:00", tz="America/New_York"),
+        ])
+        result = self._us_cal().is_conformant(idx)
+        assert result.passed is True
+
+    def test_nat_in_index_is_rejected(self):
+        idx = pd.DatetimeIndex(["2024-01-08", pd.NaT, "2024-01-10"])
+        result = self._us_cal().is_conformant(idx)
+        assert result.passed is False
+        assert any("NaT" in e for e in result.errors)
+
+    def test_full_frame_not_sampled(self):
+        # Make a long index where exactly one date deep in the
+        # middle is a holiday. The validator must catch it.
+        idx = pd.bdate_range("2024-12-20", periods=10)
+        result = self._us_cal().is_conformant(idx)
+        # 2024-12-25 is in the bdate_range and is the holiday.
+        assert result.passed is False
+        assert any("2024-12-25" in e for e in result.errors)
+
+    def test_vectorized_path_handles_large_daily_index(self):
+        # 30-year daily index; vectorized path should be fast and
+        # correct. Smoke-only — exact timing isn't asserted, just
+        # completion under a generous bound.
+        import time
+        cal = TradingCalendar(
+            name="big",
+            weekend_days=frozenset({5, 6}),
+            holidays=frozenset(),  # no holidays
+            coverage_start=pd.Timestamp("1995-01-01"),
+            coverage_end=pd.Timestamp("2025-12-31"),
+        )
+        idx = pd.bdate_range("1995-01-02", "2024-12-31")
+        start = time.time()
+        result = cal.is_conformant(idx)
+        elapsed = time.time() - start
+        # Vectorized: should complete well under a second on any
+        # modern machine. The pre-M9 per-timestamp loop took ~21ms
+        # for the same input; we just want this to NOT take 5+s.
+        assert elapsed < 1.0, f"is_conformant too slow: {elapsed:.2f}s"
+        assert result.passed is True
+
+
+class TestTzAwareNormalizationFix:
+    """v2.1.0 r4 §4.2 tz fix — `_normalize_to_date` must NOT
+    UTC-convert. Verifies the M1/M2 normalization changed correctly.
+    """
+
+    def test_late_evening_et_stays_on_same_local_date(self):
+        # Pre-fix: tz_convert("UTC") shifted 23:30 ET (UTC-5) to
+        # 04:30 next-day UTC, giving the wrong date.
+        cal = TradingCalendar(
+            name="x",
+            weekend_days=frozenset({5, 6}),
+            holidays=frozenset({
+                pd.Timestamp("2024-12-25 23:30", tz="America/New_York"),
+            }),
+        )
+        h = next(iter(cal.holidays))
+        assert h.tzinfo is None
+        # 2024-12-25 ET wall-clock → keeps 2024-12-25.
+        assert h.date() == pd.Timestamp("2024-12-25").date()
+
+    def test_early_morning_tokyo_stays_on_same_local_date(self):
+        # 2024-12-26 03:00 JST = 2024-12-25 18:00 UTC. Pre-fix would
+        # have stored 2024-12-25. r4 stores 2024-12-26 (local date).
+        cal = TradingCalendar(
+            name="x",
+            weekend_days=frozenset({5, 6}),
+            holidays=frozenset({
+                pd.Timestamp("2024-12-26 03:00", tz="Asia/Tokyo"),
+            }),
+        )
+        h = next(iter(cal.holidays))
+        assert h.date() == pd.Timestamp("2024-12-26").date()
