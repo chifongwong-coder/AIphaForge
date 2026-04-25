@@ -443,3 +443,137 @@ class TestManifestUsesArmLocalDiagnostics:
         for _ in range(5):
             ds.apply(data)
         assert not hasattr(ds, "last_collision_report")
+
+
+# ---------- v2.1.0 r4 §6: calendar threading instrumentation (M11) ----------
+
+
+class TestCalendarThreadingInstrumentation:
+    """v2.1.0 stabilization (M11) — assert behavior, not just
+    "does not crash."
+
+    Plan r4-final §6: prove that `_run_scenario` builds an internal
+    `TransformPipeline` with the inferred effective calendar via
+    monkeypatching `TransformPipeline.__init__` and capturing the
+    `calendar=` kwarg.
+    """
+
+    def test_run_scenario_threads_inferred_calendar_into_internal_pipeline(
+        self, monkeypatch,
+    ):
+        from aiphaforge.probes.transforms import TransformPipeline
+
+        captured_calendars: list = []
+        original_init = TransformPipeline.__init__
+
+        def spy_init(self, *args, **kwargs):
+            captured_calendars.append(kwargs.get("calendar"))
+            return original_init(self, *args, **kwargs)
+
+        monkeypatch.setattr(TransformPipeline, "__init__", spy_init)
+
+        data = _ohlcv(n=20)
+        ds = DateShift(
+            offset=pd.DateOffset(days=0),
+            calendar=US_EQUITY,
+            snap="nearest",
+        )
+        scen = ABScenario(
+            scenario_id="threaded", mode="market_level",
+            transforms=[ds],
+        )
+        run_ab_probe(
+            ai_factory=_factory,
+            baseline_factory=_factory,
+            data=data,
+            scenarios=[scen],
+            **_KW,
+        )
+
+        # At least one constructed pipeline received calendar=US_EQUITY
+        # (by stable fingerprint, not object identity).
+        us_fp = US_EQUITY.stable_fingerprint()
+        matched = [
+            c for c in captured_calendars
+            if c is not None and c.stable_fingerprint() == us_fp
+        ]
+        assert matched, (
+            "no TransformPipeline was constructed with the inferred "
+            f"US_EQUITY calendar; captured: {captured_calendars}"
+        )
+
+    def test_user_transform_with_unrelated_calendar_attr_is_ignored(
+        self, monkeypatch,
+    ):
+        # Plan §5.3 r3-final foot-gun guard: a user transform with
+        # an unrelated `.calendar` attribute (lookback config, regime
+        # calendar, etc.) and NO `_aiphaforge_calendar_provider`
+        # marker must NOT cause the pipeline to receive that
+        # attribute as an effective calendar.
+        from aiphaforge.probes.transforms import TransformPipeline
+
+        class _UnrelatedCalendarAttr:
+            name = "Unrelated"
+            category = "level"
+            supports_view_only = True
+            supports_market_level = True
+            order_invertible = True
+            stochastic = False
+            calendar = "lookback-window-config"  # NOT a TradingCalendar
+
+            def apply(self, data, *, seed=None):
+                return data
+
+        captured_calendars: list = []
+        original_init = TransformPipeline.__init__
+
+        def spy_init(self, *args, **kwargs):
+            captured_calendars.append(kwargs.get("calendar"))
+            return original_init(self, *args, **kwargs)
+
+        monkeypatch.setattr(TransformPipeline, "__init__", spy_init)
+
+        data = _ohlcv(n=20)
+        scen = ABScenario(
+            scenario_id="unrelated", mode="market_level",
+            transforms=[_UnrelatedCalendarAttr()],
+        )
+        run_ab_probe(
+            ai_factory=_factory,
+            baseline_factory=_factory,
+            data=data,
+            scenarios=[scen],
+            **_KW,
+        )
+
+        # The unrelated string attribute must NOT have been routed
+        # into any pipeline's calendar kwarg.
+        for cal in captured_calendars:
+            assert cal != "lookback-window-config"
+        # All captures must be None (no calendar-aware transform in
+        # this scenario).
+        assert all(c is None for c in captured_calendars), (
+            f"unexpected non-None calendar captured: {captured_calendars}"
+        )
+
+    def test_conflicting_calendar_aware_transforms_fail_fast_in_run_scenario(self):
+        # The conflict detection from M4 must fire from the
+        # _run_scenario pre-check pipeline, not just from
+        # standalone TransformPipeline construction. This was already
+        # tested in TestCalendarConflictFailsFast above; M11 keeps
+        # it here as a stabilization invariant.
+        data = _ohlcv(n=20)
+        ds_us = DateShift(offset=0, calendar=US_EQUITY)
+        ds_cn = DateShift(offset=0, calendar=CHINA_A_SHARE)
+        scen = ABScenario(
+            scenario_id="conflict_m11", mode="market_level",
+            transforms=[ds_us, ds_cn],
+        )
+        with pytest.raises(CalendarConflictError):
+            run_ab_probe(
+                ai_factory=_factory,
+                baseline_factory=_factory,
+                data=data,
+                scenarios=[scen],
+                **_KW,
+            )
