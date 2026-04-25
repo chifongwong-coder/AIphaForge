@@ -61,6 +61,89 @@ def _import_calendar_collision_error():
     from aiphaforge.calendars.core import CalendarSnapCollisionError
     return CalendarSnapCollisionError
 
+
+def _import_calendar_conflict_error():
+    """Lazy import of CalendarConflictError; same cycle reasoning."""
+    from aiphaforge.calendars.core import CalendarConflictError
+    return CalendarConflictError
+
+
+def _import_calendar_provider_protocol_error():
+    """Lazy import of CalendarProviderProtocolError; same cycle."""
+    from aiphaforge.calendars.core import CalendarProviderProtocolError
+    return CalendarProviderProtocolError
+
+
+def _effective_calendar_from_transforms(
+    transforms: Sequence[Any],
+) -> Optional["TradingCalendar"]:
+    """Infer the effective calendar from a transform sequence.
+
+    Plan §5.4 r3-final: only transforms with the explicit
+    ``_aiphaforge_calendar_provider = True`` class attribute AND a
+    working ``get_effective_calendar()`` method participate. User
+    transforms with an unrelated ``.calendar`` attribute are ignored
+    — bare duck-typing would silently route accidental attributes
+    into scenario validation and recreate the foot-gun this design
+    eliminates.
+
+    Returns:
+        The single calendar all participating transforms agree on,
+        or ``None`` if no transform participates.
+
+    Raises:
+        CalendarProviderProtocolError: a transform declares the
+            marker but does not implement ``get_effective_calendar``,
+            or that call raises an exception.
+        CalendarConflictError: two participating transforms supply
+            calendars that differ by ``stable_fingerprint()``.
+    """
+    calendars: list[Any] = []
+    for transform in transforms:
+        if not getattr(transform, "_aiphaforge_calendar_provider", False):
+            continue
+        provider = getattr(transform, "get_effective_calendar", None)
+        if provider is None:
+            CalendarProviderProtocolError = (
+                _import_calendar_provider_protocol_error()
+            )
+            raise CalendarProviderProtocolError(
+                f"{type(transform).__name__} declares "
+                "_aiphaforge_calendar_provider=True but does not "
+                "implement get_effective_calendar()."
+            )
+        try:
+            calendar = provider()
+        except Exception as exc:
+            # Wrap so users get a clear protocol-violation error
+            # rather than a bare AttributeError or similar deep in
+            # the stack (defect #2 fix from r3 review).
+            CalendarProviderProtocolError = (
+                _import_calendar_provider_protocol_error()
+            )
+            raise CalendarProviderProtocolError(
+                f"{type(transform).__name__}.get_effective_calendar() "
+                f"raised {type(exc).__name__}: {exc}"
+            ) from exc
+        if calendar is not None:
+            calendars.append(calendar)
+
+    if not calendars:
+        return None
+
+    first = calendars[0]
+    for calendar in calendars[1:]:
+        # Plan §5.2: match by tuple equality (value-based), not
+        # object identity. Two separately-constructed identical
+        # calendars match.
+        if calendar.stable_fingerprint() != first.stable_fingerprint():
+            CalendarConflictError = _import_calendar_conflict_error()
+            raise CalendarConflictError(
+                f"Two distinct effective calendars inferred from "
+                f"transforms: {first.name!r} vs {calendar.name!r}."
+            )
+    return first
+
 TransformCategory = Literal["metadata", "level", "series"]
 
 
@@ -700,12 +783,22 @@ class IntegrityCheckResult:
     errors: list[str]
 
 
-def validate_ohlcv_integrity(data: pd.DataFrame) -> IntegrityCheckResult:
+def validate_ohlcv_integrity(
+    data: pd.DataFrame,
+    *,
+    calendar: Optional["TradingCalendar"] = None,
+) -> IntegrityCheckResult:
     """Validate OHLC integrity over the FULL frame (no sampling).
 
     Per plan §2.4: validation is performed on the **full transformed
     frame**, not on a sampled subset. Even a single bad bar in a
     million invalidates the dataset.
+
+    v2.1 ``calendar=`` (default ``None`` preserves v2.0 contract):
+        when set, runs ``calendar.is_conformant`` on the index and
+        appends any conformance failures to the returned errors list
+        with the same bounded formatting (first 10 dates plus an
+        "and K more" tail).
     """
     errors: list[str] = []
 
@@ -755,6 +848,13 @@ def validate_ohlcv_integrity(data: pd.DataFrame) -> IntegrityCheckResult:
                 f"column '{col}' has {int((arr <= 0).sum())} non-positive values"
             )
 
+    # v2.1 calendar conformance (after the v2.0 invariants so the
+    # error list has structural problems first, then calendar.)
+    if calendar is not None:
+        cal_result = calendar.is_conformant(data.index)
+        if not cal_result.passed:
+            errors.extend(cal_result.errors)
+
     return IntegrityCheckResult(passed=not errors, errors=errors)
 
 
@@ -780,6 +880,12 @@ class TransformPipeline:
     agent_contract: Optional[
         Literal["signal_only", "market_orders_only", "price_orders_allowed"]
     ] = None
+    # v2.1 §5.2: optional explicit calendar passed through to the
+    # final integrity validator. If callers also include calendar-
+    # aware transforms (e.g. DateShift) and the inferred effective
+    # calendar disagrees with this explicit one, __post_init__
+    # raises CalendarConflictError.
+    calendar: Optional["TradingCalendar"] = None
 
     def __post_init__(self):
         # Validate each transform declares the expected attributes.
@@ -820,6 +926,23 @@ class TransformPipeline:
                         "requires agent_contract='signal_only' or "
                         "'market_orders_only'"
                     )
+
+        # v2.1 §5.2: if both an explicit calendar and an inferred
+        # effective calendar exist, they must match by stable
+        # fingerprint. This catches the case where a user passes
+        # `TransformPipeline(calendar=cal_a)` with a transform that
+        # also provides `cal_b`. Allow either source individually.
+        inferred = _effective_calendar_from_transforms(self.transforms)
+        if self.calendar is not None and inferred is not None:
+            if self.calendar.stable_fingerprint() != inferred.stable_fingerprint():
+                CalendarConflictError = _import_calendar_conflict_error()
+                raise CalendarConflictError(
+                    f"TransformPipeline.calendar={self.calendar.name!r} "
+                    f"disagrees with calendar inferred from transforms "
+                    f"({inferred.name!r}). Calendars must match by "
+                    "stable_fingerprint() (value equality, not object "
+                    "identity)."
+                )
 
     @property
     def stochastic(self) -> bool:
@@ -864,7 +987,12 @@ class TransformPipeline:
                     f"sub_seed={sub_seed}: {e}"
                 ) from e
 
-        result = validate_ohlcv_integrity(out)
+        # v2.1: thread the pipeline's effective calendar (explicit
+        # or inferred) through to the validator.
+        effective_cal = self.calendar
+        if effective_cal is None:
+            effective_cal = _effective_calendar_from_transforms(self.transforms)
+        result = validate_ohlcv_integrity(out, calendar=effective_cal)
         if not result.passed:
             # Identify the last-applied transform so the user knows
             # which stage produced the invalid frame.

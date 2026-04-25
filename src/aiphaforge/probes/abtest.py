@@ -39,7 +39,10 @@ from aiphaforge.probes.models import (
     UnsupportedScenarioError,
 )
 from aiphaforge.probes.scoring import _merge_provider_config
-from aiphaforge.probes.transforms import TransformPipeline
+from aiphaforge.probes.transforms import (
+    TransformPipeline,
+    _effective_calendar_from_transforms,
+)
 from aiphaforge.results import BacktestResult
 from aiphaforge.strategies import (
     BaseStrategy,
@@ -211,8 +214,13 @@ def _run_one_arm(
             )
         return engine.run(data)
 
+    # v2.1: thread the inferred effective calendar so the pipeline's
+    # final integrity validator runs calendar conformance. This is
+    # the user-observable A/B execution path.
+    effective_calendar = _effective_calendar_from_transforms(transforms)
     pipeline = TransformPipeline(
         transforms=list(transforms), mode=mode,
+        calendar=effective_calendar,
     )
 
     if mode == "market_level":
@@ -1073,12 +1081,16 @@ def _run_scenario(
     """Run one ABScenario across n_repeat repeats."""
 
     # Pre-check: TransformPipeline construction validates mode and
-    # invertibility via the agent_contract gate.
+    # invertibility via the agent_contract gate. v2.1: also threads
+    # the inferred effective calendar so calendar conflicts (e.g.
+    # two DateShift transforms with different calendars) fail fast
+    # before the per-repeat work begins.
     if scenario.transforms:
         TransformPipeline(
             transforms=list(scenario.transforms),
             mode=scenario.mode,
             agent_contract=agent_contract,
+            calendar=_effective_calendar_from_transforms(scenario.transforms),
         )
 
     is_stochastic_pipeline = any(
