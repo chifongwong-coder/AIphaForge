@@ -395,6 +395,50 @@ class TestSerializeCollisionExamples:
         assert _serialize_collision_examples([]) == []
 
 
+class TestV2_1_1CollisionSourceDateRoundTrip:
+    """v2.1.1 #5 regression: corrected source dates survive the full
+    serializer + manifest aggregator path. Catches regressions where
+    DateShift produces correct in-memory diagnostics but the
+    aggregator/serializer reintroduces the bug.
+    """
+
+    def test_corrected_source_dates_reach_manifest(self):
+        # Same fixture as the unit test in test_probes_transforms.py.
+        data = pd.DataFrame(
+            {"open": [1.0, 2.0], "high": [1.5, 2.5],
+             "low": [0.5, 1.5], "close": [1.2, 2.2],
+             "volume": [100, 200]},
+            index=pd.DatetimeIndex(["2024-11-28", "2024-11-29"]),
+        )
+        ds = DateShift(
+            offset=pd.DateOffset(days=0), calendar=US_EQUITY,
+            snap="forward", on_collision="keep_last",
+        )
+        scen = ABScenario(
+            scenario_id="audit", mode="market_level",
+            transforms=[ds],
+        )
+        result = run_ab_probe(
+            ai_factory=_factory,
+            baseline_factory=_factory,
+            data=data,
+            scenarios=[scen],
+            **_KW,
+        )
+        collisions = result.scenarios[0].calendar_snap_collisions
+        assert collisions, "expected at least one collision warning"
+        details = collisions[0]["details"]
+        assert details["examples"], "examples list should be populated"
+        ex = details["examples"][0]
+        # JSON-serialized dates: YYYY-MM-DD strings.
+        assert ex["target_ts"] == "2024-11-29"
+        # Source dates correctly identified as the original input
+        # rows in input order — not the snapped target repeated.
+        assert ex["source_ts"] == ["2024-11-28", "2024-11-29"]
+        assert ex["kept_source_ts"] == "2024-11-29"
+        assert ex["dropped_source_ts"] == ["2024-11-28"]
+
+
 class TestManifestUsesArmLocalDiagnostics:
     """v2.1.0 r4 §3.5 / §5.1 — manifest collision warnings must come
     from per-arm diagnostics, NOT from any transform-instance state.

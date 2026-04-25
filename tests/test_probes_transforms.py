@@ -331,6 +331,100 @@ class TestDateShiftCollision:
         assert isinstance(out, pd.DataFrame)
         assert out.index.is_unique
 
+    # ---- v2.1.1 #5 regression tests for collision source-date fix ----
+    # Per docs/plans/v2.1-collision-source-date-defect-triage.md.
+    # The previous implementation reconstructed source dates via
+    # `idx[p] - self.offset` against the snapped index, collapsing
+    # every collision-group source to a single date. The fix indexes
+    # into the captured pre-snap source_index. Tests assert VALUES,
+    # not just isinstance, because the original tests only checked
+    # types and missed the bug.
+
+    def _collision_frame(self):
+        # 2024-11-28 (Thanksgiving Thu, NYSE holiday) and
+        # 2024-11-29 (Black Friday, full session per
+        # pandas_market_calendars). With snap='forward', 11-28
+        # snaps to 11-29 → both rows collide on 2024-11-29.
+        return pd.DataFrame(
+            {"open": [1.0, 2.0], "high": [1.5, 2.5],
+             "low": [0.5, 1.5], "close": [1.2, 2.2],
+             "volume": [100, 200]},
+            index=pd.DatetimeIndex(["2024-11-28", "2024-11-29"]),
+        )
+
+    def test_v2_1_1_collision_example_keep_last_reports_real_source_dates(self):
+        from aiphaforge.calendars import US_EQUITY
+        ds = DateShift(
+            offset=pd.DateOffset(days=0), calendar=US_EQUITY,
+            snap="forward", on_collision="keep_last",
+        )
+        result = ds.apply_with_diagnostics(self._collision_frame())
+        ex = result.diagnostics[0].details["examples"][0]
+        # Target: the snapped trading day (Black Friday).
+        assert ex["target_ts"] == pd.Timestamp("2024-11-29")
+        # Source: the actual pre-snap input rows in input order.
+        assert ex["source_ts"] == [
+            pd.Timestamp("2024-11-28"), pd.Timestamp("2024-11-29"),
+        ]
+        # keep_last → last in input order survives.
+        assert ex["kept_source_ts"] == pd.Timestamp("2024-11-29")
+        assert ex["dropped_source_ts"] == [pd.Timestamp("2024-11-28")]
+
+    def test_v2_1_1_collision_example_keep_first_reports_real_source_dates(self):
+        # Mirror of the keep_last test: same input, opposite policy.
+        from aiphaforge.calendars import US_EQUITY
+        ds = DateShift(
+            offset=pd.DateOffset(days=0), calendar=US_EQUITY,
+            snap="forward", on_collision="keep_first",
+        )
+        result = ds.apply_with_diagnostics(self._collision_frame())
+        ex = result.diagnostics[0].details["examples"][0]
+        assert ex["target_ts"] == pd.Timestamp("2024-11-29")
+        assert ex["source_ts"] == [
+            pd.Timestamp("2024-11-28"), pd.Timestamp("2024-11-29"),
+        ]
+        # keep_first → first in input order survives.
+        assert ex["kept_source_ts"] == pd.Timestamp("2024-11-28")
+        assert ex["dropped_source_ts"] == [pd.Timestamp("2024-11-29")]
+
+    def test_v2_1_1_collision_example_with_nonzero_offset(self):
+        # Stronger test: with a non-zero offset the buggy
+        # ``idx[p] - self.offset`` would coincidentally still NOT
+        # match the real source dates. Verifies the fix indexes
+        # source_index directly, not via inverse math.
+        from aiphaforge.calendars import US_EQUITY
+        # Source: 2018-12-22 (Sat) and 2018-12-26 (Wed). Shifted
+        # by years=-3: 2015-12-22 (Tue, trading day) and 2015-12-26
+        # (Sat → snap forward to 2015-12-28 Mon). No collision in
+        # that case. Use a different setup: source 2024-11-28
+        # (Thu, holiday) and 2024-11-29 (Fri) shifted -1y → 2023-11-28
+        # (Tue, trading) and 2023-11-29 (Wed, trading). No collision.
+        # Pick source dates whose -1y projection collides:
+        # 2024-12-25 (Wed, holiday) and 2024-12-26 (Thu) shifted -1y
+        # → 2023-12-25 (Mon, holiday → snap forward to 2023-12-26)
+        # and 2023-12-26 (Tue). Both → 2023-12-26 (Tue) = collision.
+        df = pd.DataFrame(
+            {"open": [1.0, 2.0], "high": [1.5, 2.5],
+             "low": [0.5, 1.5], "close": [1.2, 2.2],
+             "volume": [100, 200]},
+            index=pd.DatetimeIndex(["2024-12-25", "2024-12-26"]),
+        )
+        ds = DateShift(
+            offset=pd.DateOffset(years=-1), calendar=US_EQUITY,
+            snap="forward", on_collision="keep_last",
+        )
+        result = ds.apply_with_diagnostics(df)
+        ex = result.diagnostics[0].details["examples"][0]
+        # Target: the snapped collision date in 2023.
+        assert ex["target_ts"] == pd.Timestamp("2023-12-26")
+        # Source: the REAL pre-shift, pre-snap dates in 2024.
+        assert ex["source_ts"] == [
+            pd.Timestamp("2024-12-25"), pd.Timestamp("2024-12-26"),
+        ]
+        # keep_last keeps the second input row.
+        assert ex["kept_source_ts"] == pd.Timestamp("2024-12-26")
+        assert ex["dropped_source_ts"] == [pd.Timestamp("2024-12-25")]
+
     def test_invalid_collision_policy_rejected(self):
         with pytest.raises(ValueError, match="on_collision must be"):
             DateShift(offset=0, on_collision="merge_mean")  # type: ignore[arg-type]
