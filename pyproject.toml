@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aiphaforge"
-version = "2.0.1"
+version = "2.1.0"
 description = "A high-performance backtest engine for AI agent-driven quantitative trading"
 readme = "README.md"
 license = {text = "GPL-3.0-or-later"}
@@ -60,6 +60,12 @@ Issues = "https://github.com/chifongwong-coder/AIphaForge/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+# v2.1: the calendars module ships its holiday data + license notice
+# as static files inside the package. importlib.resources reads them
+# at runtime; pandas_market_calendars is NOT a runtime dependency.
+"aiphaforge.calendars" = ["_data/holidays.json", "_data/LICENSE.holidays"]
 
 [tool.ruff]
 target-version = "py310"

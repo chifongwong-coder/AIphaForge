@@ -113,6 +113,223 @@ class TestDateShift:
         np.testing.assert_array_equal(out["close"].to_numpy(), data["close"].to_numpy())
 
 
+class TestDateShiftCalendarMarker:
+    """v2.1 §4.1 / §5.3 r3-final: explicit marker protocol."""
+
+    def test_marker_attribute_present_and_true(self):
+        from typing import get_type_hints
+        # Class-level marker, value is True.
+        assert DateShift._aiphaforge_calendar_provider is True
+        # Annotation present (defect #1: ClassVar[Literal[True]]).
+        hints = get_type_hints(DateShift, include_extras=True)
+        assert "_aiphaforge_calendar_provider" in hints
+
+    def test_get_effective_calendar_returns_calendar(self):
+        from aiphaforge.calendars import US_EQUITY
+        ds = DateShift(offset=pd.DateOffset(years=-3), calendar=US_EQUITY)
+        assert ds.get_effective_calendar() is US_EQUITY
+
+    def test_get_effective_calendar_returns_none_when_unset(self):
+        ds = DateShift(offset=pd.DateOffset(years=-3))
+        assert ds.get_effective_calendar() is None
+
+
+class TestDateShiftSnap:
+    """v2.1 §4.2 — snap modes."""
+
+    def test_calendar_none_preserves_v2_0_behavior(self):
+        # Backward-compat: no calendar means no snap, no collision
+        # check, exact unshift_date round-trip.
+        ds = DateShift(offset=pd.DateOffset(years=-3))
+        ts = pd.Timestamp("2024-03-12")
+        assert ds.shift_date(ts) == pd.Timestamp("2021-03-12")
+        assert ds.unshift_date(ds.shift_date(ts)) == ts
+
+    def test_snap_forward_through_holiday(self):
+        from aiphaforge.calendars import US_EQUITY
+        ds = DateShift(
+            offset=pd.DateOffset(days=0),  # no offset, just snap
+            calendar=US_EQUITY,
+            snap="forward",
+        )
+        # 2024-12-25 (Wed, holiday) → 2024-12-26 (Thu)
+        assert ds.shift_date(pd.Timestamp("2024-12-25")) == pd.Timestamp("2024-12-26")
+
+    def test_snap_backward_through_holiday(self):
+        from aiphaforge.calendars import US_EQUITY
+        ds = DateShift(
+            offset=pd.DateOffset(days=0),
+            calendar=US_EQUITY,
+            snap="backward",
+        )
+        assert ds.shift_date(pd.Timestamp("2024-12-25")) == pd.Timestamp("2024-12-24")
+
+    def test_snap_error_raises(self):
+        from aiphaforge.calendars import US_EQUITY, CalendarSnapError
+        ds = DateShift(
+            offset=pd.DateOffset(days=0),
+            calendar=US_EQUITY,
+            snap="error",
+        )
+        with pytest.raises(CalendarSnapError):
+            ds.shift_date(pd.Timestamp("2024-12-25"))
+
+    def test_snap_nearest_picks_closer(self):
+        from aiphaforge.calendars import US_EQUITY
+        ds = DateShift(
+            offset=pd.DateOffset(days=0),
+            calendar=US_EQUITY,
+            snap="nearest",
+        )
+        # Saturday 2024-01-06: prev Fri 01-05 (1 day), next Mon 01-08
+        # (2 days). Nearest = backward.
+        assert ds.shift_date(pd.Timestamp("2024-01-06")) == pd.Timestamp("2024-01-05")
+
+    def test_invalid_snap_rejected(self):
+        from aiphaforge.calendars import US_EQUITY
+        with pytest.raises(ValueError, match="snap must be"):
+            DateShift(offset=0, calendar=US_EQUITY, snap="sideways")  # type: ignore[arg-type]
+
+
+class TestDateShiftCollision:
+    """v2.1 §4.3 / §4.4 — collision policy + structured report."""
+
+    def _frame_with_holiday_collision(self):
+        # Two consecutive trading days where the offset of -3 years
+        # lands them across Christmas 2021. With snap='forward',
+        # both 2021-12-23 (Thu) and 2021-12-24 (Fri, NYSE early
+        # close but full session in pandas_market_calendars) avoid
+        # collision. We need a different setup: shift backward by
+        # an offset that puts source 2024-12-25 (already a holiday
+        # would propagate) and 2024-12-26 onto a NYSE non-trading
+        # cluster.
+        # Simpler: build explicit input with two source dates that
+        # both forward-snap to the same target.
+        # Source 2018-12-22 (Sat) and 2018-12-25 (Tue, holiday).
+        # No offset; snap='forward'. 2018-12-22 → 2018-12-24 (Mon),
+        # 2018-12-25 → 2018-12-26 (Wed). No collision actually.
+        # Better: 2018-12-23 (Sun) and 2018-12-25 (Tue holiday).
+        # Both forward to 2018-12-24 and 2018-12-26 — still no
+        # collision. The narrow case is two holidays/weekends in a
+        # row that all snap to the SAME next trading day.
+        # 2024-11-28 (Thu Thanksgiving) + 2024-11-29 (Fri half-day,
+        # but treated as full holiday by NYSE). Both forward-snap
+        # to 2024-12-02 (Mon).
+        return pd.DataFrame(
+            {"open": [1.0, 2.0], "high": [1.5, 2.5],
+             "low": [0.5, 1.5], "close": [1.2, 2.2], "volume": [100, 200]},
+            index=pd.DatetimeIndex(["2024-11-28", "2024-11-29"]),
+        )
+
+    def test_collision_error_default(self):
+        from aiphaforge.calendars import US_EQUITY, CalendarSnapCollisionError
+        ds = DateShift(offset=pd.DateOffset(days=0), calendar=US_EQUITY, snap="forward")
+        df = self._frame_with_holiday_collision()
+        with pytest.raises(CalendarSnapCollisionError, match="duplicate target"):
+            ds.apply(df)
+        # And the report is None on a failed apply.
+        assert ds.last_collision_report is None
+
+    def test_collision_keep_first(self):
+        from aiphaforge.calendars import US_EQUITY
+        ds = DateShift(
+            offset=pd.DateOffset(days=0), calendar=US_EQUITY,
+            snap="forward", on_collision="keep_first",
+        )
+        df = self._frame_with_holiday_collision()
+        out = ds.apply(df)
+        assert out.index.is_unique
+        # First source row (2024-11-28 → 2024-12-02) survives.
+        assert out["close"].iloc[0] == 1.2
+
+    def test_collision_keep_last(self):
+        from aiphaforge.calendars import US_EQUITY
+        ds = DateShift(
+            offset=pd.DateOffset(days=0), calendar=US_EQUITY,
+            snap="forward", on_collision="keep_last",
+        )
+        df = self._frame_with_holiday_collision()
+        out = ds.apply(df)
+        assert out.index.is_unique
+        # Last source row (2024-11-29 → 2024-12-02) survives.
+        assert out["close"].iloc[0] == 2.2
+
+    def test_collision_report_has_required_fields(self):
+        from aiphaforge.calendars import US_EQUITY
+        ds = DateShift(
+            offset=pd.DateOffset(days=0), calendar=US_EQUITY,
+            snap="forward", on_collision="keep_last",
+        )
+        df = self._frame_with_holiday_collision()
+        ds.apply(df)
+        report = ds.last_collision_report
+        assert report is not None
+        for key in (
+            "transform", "on_collision", "collision_count",
+            "collision_group_count", "examples", "examples_truncated",
+        ):
+            assert key in report
+        assert report["transform"] == "DateShift"
+        assert report["on_collision"] == "keep_last"
+        assert report["collision_count"] == 1
+        assert report["collision_group_count"] == 1
+        # Examples preserve in-memory pd.Timestamp typing
+        # (defect #4 fix — JSON serializer in M5 stringifies).
+        ex = report["examples"][0]
+        assert isinstance(ex["target_ts"], pd.Timestamp)
+        assert isinstance(ex["kept_source_ts"], pd.Timestamp)
+        assert all(isinstance(t, pd.Timestamp) for t in ex["source_ts"])
+
+    def test_no_collision_clears_stale_report(self):
+        from aiphaforge.calendars import US_EQUITY
+        # First call: triggers collision.
+        ds = DateShift(
+            offset=pd.DateOffset(days=0), calendar=US_EQUITY,
+            snap="forward", on_collision="keep_first",
+        )
+        ds.apply(self._frame_with_holiday_collision())
+        assert ds.last_collision_report is not None
+        # Second call: clean frame, no collision. Report must reset.
+        clean = pd.DataFrame(
+            {"open": [1.0, 2.0], "high": [1.5, 2.5],
+             "low": [0.5, 1.5], "close": [1.2, 2.2], "volume": [100, 200]},
+            index=pd.bdate_range("2024-01-08", periods=2),
+        )
+        ds.apply(clean)
+        assert ds.last_collision_report is None
+
+    def test_invalid_collision_policy_rejected(self):
+        with pytest.raises(ValueError, match="on_collision must be"):
+            DateShift(offset=0, on_collision="merge_mean")  # type: ignore[arg-type]
+
+
+class TestDateShiftLossyUnshift:
+    """v2.1 §4.5 — best-effort lossy unshift contract."""
+
+    def test_unshift_inverse_when_no_calendar(self):
+        # Calendar-less case: exact inverse.
+        ds = DateShift(offset=pd.DateOffset(years=-5))
+        ts = pd.Timestamp("2024-03-12")
+        assert ds.unshift_date(ds.shift_date(ts)) == ts
+
+    def test_unshift_uses_opposite_snap(self):
+        # forward snap on apply → backward snap on unshift.
+        from aiphaforge.calendars import US_EQUITY
+        ds = DateShift(
+            offset=pd.DateOffset(days=0), calendar=US_EQUITY,
+            snap="forward",
+        )
+        # 2024-12-25 (holiday Wed) shift_date → 2024-12-26 (Thu).
+        # unshift_date snaps 2024-12-26 backward (no holiday, just
+        # offset reversal) → 2024-12-26 stays since it's a trading
+        # day. So result is 2024-12-26, not original 2024-12-25 —
+        # the lossy contract.
+        shifted = ds.shift_date(pd.Timestamp("2024-12-25"))
+        assert shifted == pd.Timestamp("2024-12-26")
+        # Unshift returns the same (it was already a trading day).
+        assert ds.unshift_date(shifted) == pd.Timestamp("2024-12-26")
+
+
 # ---------- PriceScale ----------
 
 class TestPriceScale:
@@ -536,3 +753,359 @@ class TestTransformPipeline:
 
         with pytest.raises(ValueError, match="missing required attribute"):
             TransformPipeline([_Bad()], mode="market_level")
+
+
+# ---------- v2.1 M4: validator + pipeline calendar wiring ----------
+
+
+class TestValidatorCalendar:
+    """v2.1 §5.1 — validate_ohlcv_integrity(calendar=)."""
+
+    def test_no_calendar_kwarg_preserves_v2_0_behavior(self):
+        # Bit-identical v2.0 baseline: validator without calendar
+        # accepts a clean bdate_range.
+        from aiphaforge.probes.transforms import validate_ohlcv_integrity
+        df = _ohlcv()
+        r1 = validate_ohlcv_integrity(df)
+        r2 = validate_ohlcv_integrity(df, calendar=None)
+        assert r1.passed == r2.passed
+        assert r1.errors == r2.errors
+
+    def test_calendar_flags_holiday_in_index(self):
+        from aiphaforge.calendars import US_EQUITY
+        from aiphaforge.probes.transforms import validate_ohlcv_integrity
+        # bdate_range from 2024-12-23 includes 12-24, 12-25 (NYSE
+        # holiday), 12-26.
+        idx = pd.bdate_range("2024-12-23", periods=5)
+        df = pd.DataFrame(
+            {"open": 1.0, "high": 1.0, "low": 1.0,
+             "close": 1.0, "volume": 1.0},
+            index=idx,
+        )
+        result = validate_ohlcv_integrity(df, calendar=US_EQUITY)
+        assert result.passed is False
+        assert any("2024-12-25" in e for e in result.errors)
+
+
+class TestPipelineCalendar:
+    """v2.1 §5.2 — TransformPipeline.calendar=."""
+
+    def test_explicit_calendar_threads_to_validator(self):
+        from aiphaforge.calendars import US_EQUITY
+        # Hand-build a frame with Christmas in the index; the
+        # pipeline's final validator should reject it.
+        idx = pd.bdate_range("2024-12-23", periods=5)
+        df = pd.DataFrame(
+            {"open": 1.0, "high": 1.0, "low": 1.0,
+             "close": 1.0, "volume": 1.0},
+            index=idx,
+        )
+        # Use a noop transform list; the pipeline still runs the
+        # final validator after applying zero transforms.
+        pipeline = TransformPipeline(
+            transforms=[], mode="market_level", calendar=US_EQUITY,
+        )
+        with pytest.raises(ValueError, match="2024-12-25"):
+            pipeline.apply(df)
+
+    def test_inferred_calendar_threads_to_validator(self):
+        # When a transform supplies a calendar but the pipeline
+        # itself does not, the pipeline.apply() validator still
+        # uses the inferred calendar — this test proves it by
+        # using snap='nearest' to repair the index AND letting the
+        # snap+validator both succeed on a clean post-snap frame.
+        from aiphaforge.calendars import US_EQUITY
+        # Clean frame without holiday-adjacent collision potential.
+        idx = pd.bdate_range("2024-01-08", periods=5)
+        df = pd.DataFrame(
+            {"open": 1.0, "high": 1.0, "low": 1.0,
+             "close": 1.0, "volume": 1.0},
+            index=idx,
+        )
+        ds = DateShift(
+            offset=pd.DateOffset(days=0),
+            calendar=US_EQUITY,
+            snap="nearest",
+        )
+        pipeline = TransformPipeline(
+            transforms=[ds], mode="market_level",
+        )
+        # No exception → pipeline.apply ran, snap was a no-op,
+        # validator passed against the inferred US_EQUITY calendar.
+        out = pipeline.apply(df)
+        assert len(out) == 5
+
+    def test_pipeline_apply_calendar_rejects_holiday_index(self):
+        # Direct: calendar threading rejects a frame whose index
+        # contains a holiday after applying a no-op DateShift.
+        from aiphaforge.calendars import US_EQUITY
+        idx = pd.DatetimeIndex([
+            "2024-12-23", "2024-12-24", "2024-12-26", "2024-12-27",
+        ])
+        df = pd.DataFrame(
+            {"open": 1.0, "high": 1.0, "low": 1.0,
+             "close": 1.0, "volume": 1.0},
+            index=idx,
+        )
+        # Pipeline built with no DateShift but with explicit
+        # calendar — validator runs at apply.
+        pipeline = TransformPipeline(
+            transforms=[], mode="market_level", calendar=US_EQUITY,
+        )
+        # Clean — no holidays in index, validator passes.
+        pipeline.apply(df)
+
+        # Now add a holiday to the index.
+        bad_idx = idx.append(pd.DatetimeIndex(["2024-12-25"])).sort_values()
+        bad_df = df.reindex(bad_idx, fill_value=1.0)
+        with pytest.raises(ValueError, match="2024-12-25"):
+            pipeline.apply(bad_df)
+
+    def test_explicit_vs_inferred_calendar_conflict_raises(self):
+        from aiphaforge.calendars import (
+            CHINA_A_SHARE,
+            US_EQUITY,
+            CalendarConflictError,
+        )
+        ds = DateShift(offset=0, calendar=CHINA_A_SHARE)
+        with pytest.raises(CalendarConflictError, match="disagrees"):
+            TransformPipeline(
+                transforms=[ds], mode="market_level",
+                calendar=US_EQUITY,
+            )
+
+    def test_separately_constructed_identical_calendars_match(self):
+        # Plan §5.2: stable_fingerprint() value-equality, NOT object
+        # identity.
+        from aiphaforge.calendars import US_EQUITY, TradingCalendar
+        # Build a copy with the same fields.
+        copy_us = TradingCalendar(
+            name=US_EQUITY.name,
+            weekend_days=US_EQUITY.weekend_days,
+            holidays=US_EQUITY.holidays,
+            coverage_start=US_EQUITY.coverage_start,
+            coverage_end=US_EQUITY.coverage_end,
+        )
+        assert copy_us is not US_EQUITY
+        ds = DateShift(offset=0, calendar=copy_us)
+        # Pipeline should accept the explicit US_EQUITY (singleton)
+        # alongside the copy (separate instance) — they fingerprint
+        # equal.
+        TransformPipeline(
+            transforms=[ds], mode="market_level",
+            calendar=US_EQUITY,
+        )
+
+
+class TestEffectiveCalendarInference:
+    """v2.1 §5.3 / §5.4 — explicit marker protocol."""
+
+    def test_dateshift_marker_routes_calendar(self):
+        from aiphaforge.calendars import US_EQUITY
+        from aiphaforge.probes.transforms import (
+            _effective_calendar_from_transforms,
+        )
+        ds = DateShift(offset=0, calendar=US_EQUITY)
+        result = _effective_calendar_from_transforms([ds])
+        assert result is US_EQUITY
+
+    def test_no_calendar_returns_none(self):
+        from aiphaforge.probes.transforms import (
+            _effective_calendar_from_transforms,
+        )
+        ds = DateShift(offset=0)  # no calendar
+        ps = PriceScale(factor=2.0)
+        assert _effective_calendar_from_transforms([ds, ps]) is None
+
+    def test_user_transform_with_unrelated_calendar_attr_is_ignored(self):
+        # Defect-prevention test: a user transform with a `.calendar`
+        # attribute but no `_aiphaforge_calendar_provider` marker
+        # must NOT be picked up. This is the exact foot-gun the r2
+        # review flagged.
+        from aiphaforge.probes.transforms import (
+            _effective_calendar_from_transforms,
+        )
+
+        class _LookbackTransform:
+            name = "Lookback"
+            category = "level"
+            supports_view_only = True
+            supports_market_level = True
+            order_invertible = True
+            stochastic = False
+            calendar = "some-unrelated-config"  # NOT a TradingCalendar
+
+            def apply(self, data, *, seed=None):
+                return data
+
+        result = _effective_calendar_from_transforms([_LookbackTransform()])
+        assert result is None  # the unrelated attribute was ignored
+
+    def test_marker_without_method_raises_protocol_error(self):
+        from aiphaforge.calendars import CalendarProviderProtocolError
+        from aiphaforge.probes.transforms import (
+            _effective_calendar_from_transforms,
+        )
+
+        class _BadProvider:
+            name = "Bad"
+            category = "metadata"
+            supports_view_only = True
+            supports_market_level = True
+            order_invertible = True
+            stochastic = False
+            _aiphaforge_calendar_provider = True
+            # NO get_effective_calendar method
+
+            def apply(self, data, *, seed=None):
+                return data
+
+        with pytest.raises(
+            CalendarProviderProtocolError,
+            match="does not implement get_effective_calendar",
+        ):
+            _effective_calendar_from_transforms([_BadProvider()])
+
+    def test_provider_method_raises_wrapped(self):
+        # Defect #2 fix: a get_effective_calendar() that raises
+        # internally must surface as CalendarProviderProtocolError,
+        # NOT as the bare exception.
+        from aiphaforge.calendars import CalendarProviderProtocolError
+        from aiphaforge.probes.transforms import (
+            _effective_calendar_from_transforms,
+        )
+
+        class _RaisingProvider:
+            name = "Raising"
+            category = "metadata"
+            supports_view_only = True
+            supports_market_level = True
+            order_invertible = True
+            stochastic = False
+            _aiphaforge_calendar_provider = True
+
+            def get_effective_calendar(self):
+                raise RuntimeError("internal config missing")
+
+            def apply(self, data, *, seed=None):
+                return data
+
+        with pytest.raises(
+            CalendarProviderProtocolError,
+            match="raised RuntimeError",
+        ):
+            _effective_calendar_from_transforms([_RaisingProvider()])
+
+    def test_two_distinct_calendars_raise_conflict(self):
+        from aiphaforge.calendars import (
+            CHINA_A_SHARE,
+            US_EQUITY,
+            CalendarConflictError,
+        )
+        from aiphaforge.probes.transforms import (
+            _effective_calendar_from_transforms,
+        )
+        ds_us = DateShift(offset=0, calendar=US_EQUITY)
+        ds_cn = DateShift(offset=0, calendar=CHINA_A_SHARE)
+        with pytest.raises(CalendarConflictError, match="distinct"):
+            _effective_calendar_from_transforms([ds_us, ds_cn])
+
+    def test_two_identical_calendars_pass(self):
+        from aiphaforge.calendars import US_EQUITY, TradingCalendar
+        from aiphaforge.probes.transforms import (
+            _effective_calendar_from_transforms,
+        )
+        copy_us = TradingCalendar(
+            name=US_EQUITY.name,
+            weekend_days=US_EQUITY.weekend_days,
+            holidays=US_EQUITY.holidays,
+            coverage_start=US_EQUITY.coverage_start,
+            coverage_end=US_EQUITY.coverage_end,
+        )
+        ds_a = DateShift(offset=0, calendar=US_EQUITY)
+        ds_b = DateShift(offset=0, calendar=copy_us)
+        # Returns the first one but no conflict raised.
+        result = _effective_calendar_from_transforms([ds_a, ds_b])
+        assert result is US_EQUITY
+
+
+class TestRunScenarioCalendarThreadThrough:
+    """v2.1 §5.5 — _run_scenario passes inferred calendar into the
+    internal TransformPipeline.
+    """
+
+    def test_run_ab_probe_with_dateshift_calendar_does_not_crash(self):
+        # Smoke: a scenario containing DateShift(calendar=US_EQUITY)
+        # runs end-to-end through run_ab_probe without unrelated
+        # errors. Calendar threading happens inside _run_scenario
+        # (verified by deeper inspection in the M5 e2e file).
+        from aiphaforge.calendars import US_EQUITY
+        from aiphaforge.probes import (
+            ABScenario,
+            MACrossBaseline,
+            run_ab_probe,
+        )
+        from tests.conftest import make_probe_ohlcv as _ohlcv_p
+
+        # Use a clean fixture starting after holidays to avoid
+        # tripping the calendar validator on the raw arm.
+        data = _ohlcv_p(n=40)
+
+        ds = DateShift(
+            offset=pd.DateOffset(years=-1),
+            calendar=US_EQUITY,
+            snap="forward",
+            on_collision="keep_last",
+        )
+        scen = ABScenario(
+            scenario_id="cal_shift", mode="market_level",
+            transforms=[ds],
+        )
+
+        result = run_ab_probe(
+            ai_factory=lambda: MACrossBaseline(short=5, long=20),
+            baseline_factory=lambda: MACrossBaseline(short=5, long=20),
+            data=data,
+            scenarios=[scen],
+            n_repeat=2, seeds=[0, 1],
+            metrics=("total_return",),
+            min_valid_repeats=1,
+            engine_kwargs={"include_benchmark": False},
+        )
+        # The scenario report exists and the canonical determinism
+        # block from v2.0.1 r5 is intact.
+        assert len(result.scenarios) == 1
+        assert "determinism_check" in result.manifest
+        assert result.manifest["determinism_check"]["schema_version"] == "2.0.1"
+
+    def test_run_ab_probe_with_conflicting_calendars_fails_fast(self):
+        from aiphaforge.calendars import (
+            CHINA_A_SHARE,
+            US_EQUITY,
+            CalendarConflictError,
+        )
+        from aiphaforge.probes import (
+            ABScenario,
+            MACrossBaseline,
+            run_ab_probe,
+        )
+        from tests.conftest import make_probe_ohlcv as _ohlcv_p
+
+        data = _ohlcv_p(n=20)
+        ds_us = DateShift(offset=0, calendar=US_EQUITY)
+        ds_cn = DateShift(offset=0, calendar=CHINA_A_SHARE)
+        scen = ABScenario(
+            scenario_id="conflict", mode="market_level",
+            transforms=[ds_us, ds_cn],
+        )
+        with pytest.raises(CalendarConflictError):
+            run_ab_probe(
+                ai_factory=lambda: MACrossBaseline(short=5, long=20),
+                baseline_factory=lambda: MACrossBaseline(short=5, long=20),
+                data=data,
+                scenarios=[scen],
+                n_repeat=2, seeds=[0, 1],
+                metrics=("total_return",),
+                min_valid_repeats=1,
+                engine_kwargs={"include_benchmark": False},
+            )

@@ -440,7 +440,25 @@ class MetricDropSummary:
 
 @dataclass
 class ScenarioABReport:
-    """Per-scenario A/B report."""
+    """Per-scenario A/B report.
+
+    The free-text ``warnings`` list carries human-readable messages
+    suitable for printing. v2.1 adds two structured manifest fields
+    so JSON consumers (LLM-eval reviewers, audit trails) get
+    machine-readable diagnostics:
+
+    - ``transform_detectability_warnings``: caveats about how the
+      scenario's transforms could leak fingerprints into the agent's
+      view (e.g. ``calendar_snap_fingerprint`` for calendar-aware
+      DateShift). Plan §6.1 r3-final.
+    - ``calendar_snap_collisions``: collision report when a
+      DateShift with a non-error ``on_collision`` policy actually
+      dropped rows. Plan §6.2 r3-final. List of dicts with ``code``,
+      ``severity``, ``message``, ``details``.
+
+    Both lists default empty and stay empty for v2.0 / v2.0.1 /
+    v2.0.2 callers.
+    """
 
     scenario_id: str
     mode: Literal["view_only", "market_level"]
@@ -449,6 +467,12 @@ class ScenarioABReport:
     metric_summaries: dict[str, MetricDropSummary]
     per_repeat_table: Optional["pd.DataFrame"]
     warnings: list[str] = field(default_factory=list)
+    transform_detectability_warnings: list[dict[str, Any]] = field(
+        default_factory=list,
+    )
+    calendar_snap_collisions: list[dict[str, Any]] = field(
+        default_factory=list,
+    )
 
 
 @dataclass

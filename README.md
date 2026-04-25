@@ -108,6 +108,15 @@ A screening and inspection toolkit for measuring training-data leakage in LLM-dr
 - **Anti-gaming protection**: `max_range_width` cap demotes "predict everything" interval answers to `miss`; auto-injected `transform_detectability_warning` for transforms an LLM may behaviorally react to; capacity-parity check for AI vs baseline turnover mismatch
 - **User-attested manifest**: `provider_config` recommended-keys list (`model`, `snapshot_id`, `temperature`, `prompt_template_hash`, `tool_policy`, …) for cross-paper comparability — engine never verifies these claims, the user owns the publication-grade attestation
 
+### Trading Calendar
+Daily-resolution trading-day primitive shipped as a self-contained `aiphaforge.calendars` package. Note: the module name is **plural** (`calendars`) to avoid shadowing the Python stdlib `calendar`.
+- **`TradingCalendar`** dataclass with `is_trading_day` / `next_trading_day` / `prev_trading_day` / `snap` / `is_conformant` and a `stable_fingerprint` for cross-instance value-equality
+- **4 predefined exchange calendars**: `US_EQUITY` (NYSE-style), `CHINA_A_SHARE` (SSE), `CRYPTO_24_7` (every date a trading day), `US_FUTURES_ES` (CME equity futures). Holiday data covers 1990–2035, vendored from MIT-licensed `pandas_market_calendars` (NOT a runtime dependency — generated offline by `scripts/generate_holidays_json.py`)
+- **`DateShift(calendar=, snap=, on_collision=)`** wires the calendar into the existing memory-probe transform: `snap` chooses `"forward"` / `"backward"` / `"nearest"` / `"error"` for non-trading shifted dates, and `on_collision` handles duplicates after snap (`"error"` / `"keep_first"` / `"keep_last"`)
+- **`validate_ohlcv_integrity(calendar=)`** and **`TransformPipeline(calendar=)`** thread calendar conformance into the existing OHLC validators; calendar mismatches between explicit and inferred sources fail fast with `CalendarConflictError`
+- **Per-scenario manifest warnings**: `transform_detectability_warnings` (calendar-snap fingerprint caveat) and `calendar_snap_collisions` (when row-dropping policies fire) are serialised into the per-scenario A/B report so JSON readers see them
+- **Daily resolution only**: no early-close / lunch-break / partial-holiday / intraday-session modelling — that's deferred to v2.2 alongside the Hook-based view-only broker-proxy wrapper
+
 ## Quick Start
 
 ### Strategy One-Line Backtest
@@ -359,6 +368,43 @@ for sc in result.scenarios:
         print(f"{sc.scenario_id} {m}: excess_drop ~ {s.mean_excess_drop}")
     for w in sc.warnings:
         print(f"  warning: {w}")
+```
+
+### Trading Calendar (v2.1)
+
+Daily-resolution only — no early closes, no intraday sessions.
+
+```python
+from aiphaforge.calendars import US_EQUITY, TradingCalendar
+import pandas as pd
+
+# Membership + boundary helpers
+US_EQUITY.is_trading_day(pd.Timestamp("2024-12-25"))   # False (Christmas)
+US_EQUITY.next_trading_day(pd.Timestamp("2024-12-25")) # 2024-12-26
+US_EQUITY.snap(pd.Timestamp("2024-01-06"), "nearest")  # 2024-01-05 (Fri)
+
+# Calendar-aware DateShift for the A/B memory probe
+from aiphaforge.probes import ABScenario
+from aiphaforge.probes.transforms import DateShift
+
+scen = ABScenario(
+    scenario_id="us_back_3y",
+    mode="market_level",
+    transforms=[
+        DateShift(
+            offset=pd.DateOffset(years=-3),
+            calendar=US_EQUITY,
+            snap="forward",        # holiday → next trading day
+            on_collision="keep_last",  # multi-year shift may collide
+        ),
+    ],
+)
+
+# `_run_scenario` infers the calendar from the transform via the
+# explicit `_aiphaforge_calendar_provider` marker protocol; user
+# transforms with an unrelated `.calendar` attribute are ignored.
+# Calendar conflicts (two DateShift with different calendars) fail
+# fast with `CalendarConflictError`.
 ```
 
 ## Installation

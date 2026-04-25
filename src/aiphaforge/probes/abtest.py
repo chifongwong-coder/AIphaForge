@@ -39,7 +39,10 @@ from aiphaforge.probes.models import (
     UnsupportedScenarioError,
 )
 from aiphaforge.probes.scoring import _merge_provider_config
-from aiphaforge.probes.transforms import TransformPipeline
+from aiphaforge.probes.transforms import (
+    TransformPipeline,
+    _effective_calendar_from_transforms,
+)
 from aiphaforge.results import BacktestResult
 from aiphaforge.strategies import (
     BaseStrategy,
@@ -211,8 +214,13 @@ def _run_one_arm(
             )
         return engine.run(data)
 
+    # v2.1: thread the inferred effective calendar so the pipeline's
+    # final integrity validator runs calendar conformance. This is
+    # the user-observable A/B execution path.
+    effective_calendar = _effective_calendar_from_transforms(transforms)
     pipeline = TransformPipeline(
         transforms=list(transforms), mode=mode,
+        calendar=effective_calendar,
     )
 
     if mode == "market_level":
@@ -1073,12 +1081,16 @@ def _run_scenario(
     """Run one ABScenario across n_repeat repeats."""
 
     # Pre-check: TransformPipeline construction validates mode and
-    # invertibility via the agent_contract gate.
+    # invertibility via the agent_contract gate. v2.1: also threads
+    # the inferred effective calendar so calendar conflicts (e.g.
+    # two DateShift transforms with different calendars) fail fast
+    # before the per-repeat work begins.
     if scenario.transforms:
         TransformPipeline(
             transforms=list(scenario.transforms),
             mode=scenario.mode,
             agent_contract=agent_contract,
+            calendar=_effective_calendar_from_transforms(scenario.transforms),
         )
 
     is_stochastic_pipeline = any(
@@ -1426,6 +1438,12 @@ def _run_scenario(
             "enable_ai_noise_control=True (control is vacuous)."
         )
 
+    # v2.1 §6.1 / §6.2: structured manifest warnings.
+    detectability_warnings = _build_calendar_detectability_warnings(
+        scenario.transforms,
+    )
+    collision_warnings = _build_collision_warnings(scenario.transforms)
+
     report = ScenarioABReport(
         scenario_id=scenario.scenario_id,
         mode=scenario.mode,
@@ -1434,8 +1452,103 @@ def _run_scenario(
         metric_summaries=metric_summaries,
         per_repeat_table=per_repeat_table,
         warnings=warning_list,
+        transform_detectability_warnings=detectability_warnings,
+        calendar_snap_collisions=collision_warnings,
     )
     return report, transformed_ai, transformed_baseline
+
+
+def _build_calendar_detectability_warnings(
+    transforms: Sequence[Any],
+) -> List[Dict[str, Any]]:
+    """Plan §6.1 r3-final — calendar_snap_fingerprint warning.
+
+    Fires when any DateShift in the scenario has a calendar AND
+    snap != "error" (i.e. the snap can rewrite dates and produce
+    fingerprintable post-holiday clustering).
+    """
+    warnings_out: List[Dict[str, Any]] = []
+    for t in transforms:
+        if (
+            getattr(t, "name", None) == "DateShift"
+            and getattr(t, "calendar", None) is not None
+            and getattr(t, "snap", None) != "error"
+        ):
+            warnings_out.append({
+                "code": "calendar_snap_fingerprint",
+                "severity": "info",
+                "source": "DateShift",
+                "message": (
+                    "Calendar snapping can create post-holiday "
+                    "Monday/Tuesday clustering. A frontier LLM may "
+                    "detect the transformed calendar rather than "
+                    "recall the original series. Interpret behavior "
+                    "changes as a possible false-positive pathway."
+                ),
+            })
+    return warnings_out
+
+
+def _serialize_collision_examples(
+    examples: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Stringify the in-memory pd.Timestamp objects in the collision
+    report's ``examples`` list so the manifest is JSON-safe.
+
+    Plan §4.4 / §6.2 r3-final defect #4 fix: in-memory the
+    DateShift report holds pd.Timestamp; the manifest serializer
+    converts to YYYY-MM-DD strings here.
+    """
+    out = []
+    for ex in examples:
+        out.append({
+            "target_ts": ex["target_ts"].strftime("%Y-%m-%d"),
+            "source_ts": [
+                ts.strftime("%Y-%m-%d") for ts in ex["source_ts"]
+            ],
+            "kept_source_ts": ex["kept_source_ts"].strftime("%Y-%m-%d"),
+            "dropped_source_ts": [
+                ts.strftime("%Y-%m-%d") for ts in ex["dropped_source_ts"]
+            ],
+        })
+    return out
+
+
+def _build_collision_warnings(
+    transforms: Sequence[Any],
+) -> List[Dict[str, Any]]:
+    """Plan §6.2 r3-final — calendar_snap_collision_rows_dropped.
+
+    Reads ``last_collision_report`` populated by DateShift.apply
+    when a non-error collision policy actually dropped rows.
+    """
+    out: List[Dict[str, Any]] = []
+    for t in transforms:
+        report = getattr(t, "last_collision_report", None)
+        if not report:
+            continue
+        details = {
+            "transform": report["transform"],
+            "on_collision": report["on_collision"],
+            "collision_count": report["collision_count"],
+            "collision_group_count": report["collision_group_count"],
+            "examples": _serialize_collision_examples(report["examples"]),
+            "examples_truncated": report["examples_truncated"],
+        }
+        out.append({
+            "code": "calendar_snap_collision_rows_dropped",
+            "severity": "warning",
+            "source": report["transform"],
+            "message": (
+                f"{report['transform']} calendar snapping produced "
+                f"duplicate target dates; on_collision="
+                f"{report['on_collision']!r} dropped "
+                f"{report['collision_count']} source rows. "
+                "This changes the transformed sample length."
+            ),
+            "details": details,
+        })
+    return out
 
 
 __all__ = [

@@ -25,7 +25,15 @@ See `docs/plans/v2.0-plan.md` §2 for the full contract.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Optional, Protocol, Sequence
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    ClassVar,
+    Literal,
+    Optional,
+    Protocol,
+    Sequence,
+)
 
 import numpy as np
 import pandas as pd
@@ -35,6 +43,106 @@ from aiphaforge.significance import (
     _block_bootstrap_indices,
     _reconstruct_ohlcv,
 )
+
+if TYPE_CHECKING:
+    # Calendar types live in aiphaforge.calendars (v2.1). They are
+    # loaded lazily via TYPE_CHECKING because calendars/core.py
+    # imports IntegrityCheckResult from THIS module — avoiding a
+    # cyclic import at module-load time.
+    from aiphaforge.calendars.core import TradingCalendar
+
+
+def _import_calendar_collision_error():
+    """Lazy import of CalendarSnapCollisionError to avoid the cycle.
+
+    Called only when DateShift._resolve_collisions actually needs to
+    raise. Module-load-time has no calendars import.
+    """
+    from aiphaforge.calendars.core import CalendarSnapCollisionError
+    return CalendarSnapCollisionError
+
+
+def _import_calendar_conflict_error():
+    """Lazy import of CalendarConflictError; same cycle reasoning."""
+    from aiphaforge.calendars.core import CalendarConflictError
+    return CalendarConflictError
+
+
+def _import_calendar_provider_protocol_error():
+    """Lazy import of CalendarProviderProtocolError; same cycle."""
+    from aiphaforge.calendars.core import CalendarProviderProtocolError
+    return CalendarProviderProtocolError
+
+
+def _effective_calendar_from_transforms(
+    transforms: Sequence[Any],
+) -> Optional["TradingCalendar"]:
+    """Infer the effective calendar from a transform sequence.
+
+    Plan §5.4 r3-final: only transforms with the explicit
+    ``_aiphaforge_calendar_provider = True`` class attribute AND a
+    working ``get_effective_calendar()`` method participate. User
+    transforms with an unrelated ``.calendar`` attribute are ignored
+    — bare duck-typing would silently route accidental attributes
+    into scenario validation and recreate the foot-gun this design
+    eliminates.
+
+    Returns:
+        The single calendar all participating transforms agree on,
+        or ``None`` if no transform participates.
+
+    Raises:
+        CalendarProviderProtocolError: a transform declares the
+            marker but does not implement ``get_effective_calendar``,
+            or that call raises an exception.
+        CalendarConflictError: two participating transforms supply
+            calendars that differ by ``stable_fingerprint()``.
+    """
+    calendars: list[Any] = []
+    for transform in transforms:
+        if not getattr(transform, "_aiphaforge_calendar_provider", False):
+            continue
+        provider = getattr(transform, "get_effective_calendar", None)
+        if provider is None:
+            CalendarProviderProtocolError = (
+                _import_calendar_provider_protocol_error()
+            )
+            raise CalendarProviderProtocolError(
+                f"{type(transform).__name__} declares "
+                "_aiphaforge_calendar_provider=True but does not "
+                "implement get_effective_calendar()."
+            )
+        try:
+            calendar = provider()
+        except Exception as exc:
+            # Wrap so users get a clear protocol-violation error
+            # rather than a bare AttributeError or similar deep in
+            # the stack (defect #2 fix from r3 review).
+            CalendarProviderProtocolError = (
+                _import_calendar_provider_protocol_error()
+            )
+            raise CalendarProviderProtocolError(
+                f"{type(transform).__name__}.get_effective_calendar() "
+                f"raised {type(exc).__name__}: {exc}"
+            ) from exc
+        if calendar is not None:
+            calendars.append(calendar)
+
+    if not calendars:
+        return None
+
+    first = calendars[0]
+    for calendar in calendars[1:]:
+        # Plan §5.2: match by tuple equality (value-based), not
+        # object identity. Two separately-constructed identical
+        # calendars match.
+        if calendar.stable_fingerprint() != first.stable_fingerprint():
+            CalendarConflictError = _import_calendar_conflict_error()
+            raise CalendarConflictError(
+                f"Two distinct effective calendars inferred from "
+                f"transforms: {first.name!r} vs {calendar.name!r}."
+            )
+    return first
 
 TransformCategory = Literal["metadata", "level", "series"]
 
@@ -182,6 +290,27 @@ class DateShift:
     are NOT addressed by this transform — the price path is
     unchanged so behavioral fingerprints survive. See plan §2.6
     "Known detectability caveat".
+
+    v2.1 calendar integration:
+        Pass a ``TradingCalendar`` plus ``snap`` and
+        ``on_collision`` policies to make shifted dates land on
+        trading days. See ``docs/plans/v2.1-plan.md`` §4 (r3-final).
+
+        - ``snap``: ``"forward"`` (default) snaps non-trading
+          shifted dates to the next trading day; ``"backward"`` to
+          previous; ``"nearest"`` to closest (ties forward);
+          ``"error"`` raises ``CalendarSnapError``.
+        - ``on_collision``: when calendar snapping maps multiple
+          source dates onto the same target trading day,
+          ``"error"`` (default) raises
+          ``CalendarSnapCollisionError``; ``"keep_first"`` /
+          ``"keep_last"`` drop the duplicates and expose a
+          structured collision report via
+          ``last_collision_report`` for the manifest.
+
+        ``unshift_date`` is exact when ``calendar=None`` (the v2.0
+        contract). With a calendar set it is best-effort and lossy
+        — see the docstring on the method.
     """
 
     name = "DateShift"
@@ -191,21 +320,220 @@ class DateShift:
     order_invertible = True
     stochastic = False
 
-    def __init__(self, offset):
+    # Marker for the v2.1 calendar-aware-transform protocol
+    # (plan §4.1 / §5.3 r3-final). Annotated as ClassVar[Literal[True]]
+    # so static type checkers can verify Protocol conformance.
+    _aiphaforge_calendar_provider: ClassVar[Literal[True]] = True
+
+    def __init__(
+        self,
+        offset,
+        *,
+        calendar: Optional["TradingCalendar"] = None,
+        snap: Literal["forward", "backward", "nearest", "error"] = "forward",
+        on_collision: Literal["error", "keep_first", "keep_last"] = "error",
+    ):
+        if snap not in ("forward", "backward", "nearest", "error"):
+            raise ValueError(
+                f"snap must be 'forward'/'backward'/'nearest'/'error', "
+                f"got {snap!r}"
+            )
+        if on_collision not in ("error", "keep_first", "keep_last"):
+            raise ValueError(
+                f"on_collision must be 'error'/'keep_first'/'keep_last', "
+                f"got {on_collision!r}"
+            )
         self.offset = offset
+        self.calendar = calendar
+        self.snap = snap
+        self.on_collision = on_collision
+        # Populated by `apply` whenever a non-error collision policy
+        # actually drops rows. Held in-memory as native pd.Timestamp
+        # objects (plan §4.4 r3-final defect #4 fix); the JSON
+        # serializer in M5 stringifies for manifest output.
+        self.last_collision_report: Optional[dict[str, Any]] = None
+
+    # ---- v2.1 calendar-aware-transform protocol ----
+
+    def get_effective_calendar(self) -> Optional["TradingCalendar"]:
+        """Return the calendar this transform participates with.
+
+        Part of the v2.1 explicit marker protocol used by
+        ``_effective_calendar_from_transforms`` (M4) — never bare
+        attribute access.
+        """
+        return self.calendar
+
+    # ---- shift / unshift ----
 
     def shift_date(self, ts: pd.Timestamp) -> pd.Timestamp:
-        return ts + self.offset
+        """Apply offset, then snap if a calendar is configured.
+
+        Scalar input; returns a single timestamp. Collision policy
+        does not apply at scalar resolution (no duplicate to detect).
+        """
+        shifted = ts + self.offset
+        if self.calendar is None:
+            return shifted
+        return self.calendar.snap(shifted, self.snap)
 
     def unshift_date(self, ts: pd.Timestamp) -> pd.Timestamp:
-        return ts - self.offset
+        """Reverse a previously-applied shift.
+
+        With ``calendar=None`` (the v2.0 contract), this is exact.
+
+        With ``calendar`` set, this is **best-effort and lossy**:
+        multiple source dates can snap to the same trading day
+        under the forward path, and ``unshift_date`` cannot recover
+        which source produced a given output. The implementation
+        subtracts the offset and re-snaps in the OPPOSITE direction
+        (forward snap on apply → backward snap on unshift), which is
+        the closest reversible mapping.
+
+        Users requiring exact invertibility must avoid calendar
+        snapping. v2.2 may add a stricter per-run mapping table
+        (``{shifted_ts -> original_ts}``) for view-only broker-proxy
+        routing — v2.1 deliberately does NOT promise that contract.
+        """
+        unshifted = ts - self.offset
+        if self.calendar is None:
+            return unshifted
+        opposite = {
+            "forward": "backward",
+            "backward": "forward",
+            "nearest": "nearest",
+            "error": "error",
+        }[self.snap]
+        return self.calendar.snap(unshifted, opposite)
+
+    # ---- frame-level apply ----
 
     def apply(
         self, data: pd.DataFrame, *, seed: Optional[int] = None,
     ) -> pd.DataFrame:
         out = data.copy()
         out.index = out.index + self.offset
+
+        if self.calendar is not None:
+            # Snap each shifted date according to the configured
+            # snap policy. Vectorise via a list comprehension; the
+            # snap is pure-Python per element but daily-frequency
+            # frames are small enough that this is fine.
+            snapped = pd.DatetimeIndex([
+                self.calendar.snap(ts, self.snap) for ts in out.index
+            ])
+            out.index = snapped
+
+            # Detect duplicates introduced by snapping and dispatch
+            # on collision policy.
+            if not snapped.is_unique:
+                out = self._resolve_collisions(out)
+            else:
+                # No collisions; clear stale report from prior call.
+                self.last_collision_report = None
+        else:
+            self.last_collision_report = None
+
         return out
+
+    # ---- collision resolution ----
+
+    def _resolve_collisions(self, out: pd.DataFrame) -> pd.DataFrame:
+        """Apply ``on_collision`` policy to a frame whose index has
+        duplicates after snapping.
+
+        Builds a structured report capped at 10 collision groups
+        (plan §4.4) and stashes it on ``self.last_collision_report``
+        so M5's manifest serializer can include it in the per-scenario
+        warning entry.
+        """
+        # Find duplicate target timestamps, preserving original input
+        # order so keep_first / keep_last semantics are well-defined.
+        idx = out.index
+        # Group source rows by target timestamp.
+        groups: dict[pd.Timestamp, list[int]] = {}
+        for pos, ts in enumerate(idx):
+            groups.setdefault(ts, []).append(pos)
+
+        collision_groups = [
+            (target_ts, positions)
+            for target_ts, positions in groups.items()
+            if len(positions) > 1
+        ]
+
+        if not collision_groups:
+            self.last_collision_report = None
+            return out
+
+        if self.on_collision == "error":
+            # Build an error message naming the first few collisions.
+            preview = ", ".join(
+                target_ts.strftime("%Y-%m-%d")
+                for target_ts, _ in collision_groups[:5]
+            )
+            extra = (
+                f" and {len(collision_groups) - 5} more"
+                if len(collision_groups) > 5
+                else ""
+            )
+            CalendarSnapCollisionError = _import_calendar_collision_error()
+            raise CalendarSnapCollisionError(
+                f"DateShift produced {len(collision_groups)} duplicate "
+                f"target dates after snapping (preview: {preview}{extra}). "
+                "Pass on_collision='keep_first' or 'keep_last' to drop "
+                "duplicates explicitly."
+            )
+
+        # keep_first / keep_last: build the row-position mask.
+        # Note: groups[target_ts] already follows original input order
+        # because we enumerated `idx` in order.
+        keep_positions: set[int] = set()
+        dropped_count = 0
+        for target_ts, positions in groups.items():
+            if len(positions) == 1:
+                keep_positions.add(positions[0])
+                continue
+            if self.on_collision == "keep_first":
+                keep_positions.add(positions[0])
+            else:  # keep_last
+                keep_positions.add(positions[-1])
+            dropped_count += len(positions) - 1
+
+        keep_mask = [pos in keep_positions for pos in range(len(idx))]
+        # The source frame `data` was the input to apply(); we already
+        # set `out.index = snapped` so we slice `out` using the
+        # row mask. Original-index reconstruction for the report uses
+        # `idx[pos] - self.offset` which is the source-side timestamp
+        # before snap (close enough for collision diagnostics).
+        kept = out.iloc[keep_mask]
+
+        # Build the structured report (plan §4.4). Cap examples at 10.
+        examples_capped = collision_groups[:10]
+        examples = []
+        for target_ts, positions in examples_capped:
+            source_timestamps = [idx[p] - self.offset for p in positions]
+            if self.on_collision == "keep_first":
+                kept_source = source_timestamps[0]
+                dropped_source = source_timestamps[1:]
+            else:
+                kept_source = source_timestamps[-1]
+                dropped_source = source_timestamps[:-1]
+            examples.append({
+                "target_ts": target_ts,
+                "source_ts": list(source_timestamps),
+                "kept_source_ts": kept_source,
+                "dropped_source_ts": list(dropped_source),
+            })
+
+        self.last_collision_report = {
+            "transform": "DateShift",
+            "on_collision": self.on_collision,
+            "collision_count": dropped_count,
+            "collision_group_count": len(collision_groups),
+            "examples": examples,
+            "examples_truncated": len(collision_groups) > 10,
+        }
+        return kept
 
 
 # ---------- Level transforms ----------
@@ -455,12 +783,22 @@ class IntegrityCheckResult:
     errors: list[str]
 
 
-def validate_ohlcv_integrity(data: pd.DataFrame) -> IntegrityCheckResult:
+def validate_ohlcv_integrity(
+    data: pd.DataFrame,
+    *,
+    calendar: Optional["TradingCalendar"] = None,
+) -> IntegrityCheckResult:
     """Validate OHLC integrity over the FULL frame (no sampling).
 
     Per plan §2.4: validation is performed on the **full transformed
     frame**, not on a sampled subset. Even a single bad bar in a
     million invalidates the dataset.
+
+    v2.1 ``calendar=`` (default ``None`` preserves v2.0 contract):
+        when set, runs ``calendar.is_conformant`` on the index and
+        appends any conformance failures to the returned errors list
+        with the same bounded formatting (first 10 dates plus an
+        "and K more" tail).
     """
     errors: list[str] = []
 
@@ -510,6 +848,13 @@ def validate_ohlcv_integrity(data: pd.DataFrame) -> IntegrityCheckResult:
                 f"column '{col}' has {int((arr <= 0).sum())} non-positive values"
             )
 
+    # v2.1 calendar conformance (after the v2.0 invariants so the
+    # error list has structural problems first, then calendar.)
+    if calendar is not None:
+        cal_result = calendar.is_conformant(data.index)
+        if not cal_result.passed:
+            errors.extend(cal_result.errors)
+
     return IntegrityCheckResult(passed=not errors, errors=errors)
 
 
@@ -535,6 +880,12 @@ class TransformPipeline:
     agent_contract: Optional[
         Literal["signal_only", "market_orders_only", "price_orders_allowed"]
     ] = None
+    # v2.1 §5.2: optional explicit calendar passed through to the
+    # final integrity validator. If callers also include calendar-
+    # aware transforms (e.g. DateShift) and the inferred effective
+    # calendar disagrees with this explicit one, __post_init__
+    # raises CalendarConflictError.
+    calendar: Optional["TradingCalendar"] = None
 
     def __post_init__(self):
         # Validate each transform declares the expected attributes.
@@ -575,6 +926,23 @@ class TransformPipeline:
                         "requires agent_contract='signal_only' or "
                         "'market_orders_only'"
                     )
+
+        # v2.1 §5.2: if both an explicit calendar and an inferred
+        # effective calendar exist, they must match by stable
+        # fingerprint. This catches the case where a user passes
+        # `TransformPipeline(calendar=cal_a)` with a transform that
+        # also provides `cal_b`. Allow either source individually.
+        inferred = _effective_calendar_from_transforms(self.transforms)
+        if self.calendar is not None and inferred is not None:
+            if self.calendar.stable_fingerprint() != inferred.stable_fingerprint():
+                CalendarConflictError = _import_calendar_conflict_error()
+                raise CalendarConflictError(
+                    f"TransformPipeline.calendar={self.calendar.name!r} "
+                    f"disagrees with calendar inferred from transforms "
+                    f"({inferred.name!r}). Calendars must match by "
+                    "stable_fingerprint() (value equality, not object "
+                    "identity)."
+                )
 
     @property
     def stochastic(self) -> bool:
@@ -619,7 +987,12 @@ class TransformPipeline:
                     f"sub_seed={sub_seed}: {e}"
                 ) from e
 
-        result = validate_ohlcv_integrity(out)
+        # v2.1: thread the pipeline's effective calendar (explicit
+        # or inferred) through to the validator.
+        effective_cal = self.calendar
+        if effective_cal is None:
+            effective_cal = _effective_calendar_from_transforms(self.transforms)
+        result = validate_ohlcv_integrity(out, calendar=effective_cal)
         if not result.passed:
             # Identify the last-applied transform so the user knows
             # which stage produced the invalid frame.
