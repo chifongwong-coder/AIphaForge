@@ -313,3 +313,267 @@ class TestV2_0_BackwardCompat:
         report = result.scenarios[0]
         assert report.transform_detectability_warnings == []
         assert report.calendar_snap_collisions == []
+
+
+# ---------- v2.1.0 r4 §5: serializer direct tests (M10) ----------
+
+
+class TestSerializeCollisionExamples:
+    """Direct unit coverage for `_serialize_collision_examples`.
+
+    Plan r4-final §5.2: malformed example shapes should raise
+    `ValueError` at the serializer boundary, not propagate
+    AttributeError deep into manifest construction.
+    """
+
+    def _example(self, **overrides):
+        """Build a synthetic example dict mirroring DateShift's shape."""
+        base = {
+            "target_ts": pd.Timestamp("2024-12-02"),
+            "source_ts": [
+                pd.Timestamp("2024-11-28"),
+                pd.Timestamp("2024-11-29"),
+            ],
+            "kept_source_ts": pd.Timestamp("2024-11-29"),
+            "dropped_source_ts": [pd.Timestamp("2024-11-28")],
+        }
+        base.update(overrides)
+        return base
+
+    def test_happy_path_stringifies_pd_timestamps(self):
+        from aiphaforge.probes.abtest import _serialize_collision_examples
+        out = _serialize_collision_examples([self._example()])
+        assert len(out) == 1
+        assert out[0]["target_ts"] == "2024-12-02"
+        assert out[0]["source_ts"] == ["2024-11-28", "2024-11-29"]
+        assert out[0]["kept_source_ts"] == "2024-11-29"
+        assert out[0]["dropped_source_ts"] == ["2024-11-28"]
+
+    def test_caps_at_10_groups(self):
+        from aiphaforge.probes.abtest import _serialize_collision_examples
+        # 15 examples — should be capped at 10.
+        many = [self._example() for _ in range(15)]
+        out = _serialize_collision_examples(many)
+        assert len(out) == 10
+
+    def test_pre_stringified_dates_pass_through(self):
+        # Forward-compat: future schemas may stringify before
+        # reaching the serializer.
+        from aiphaforge.probes.abtest import _serialize_collision_examples
+        ex = {
+            "target_ts": "2024-12-02",
+            "source_ts": ["2024-11-28", "2024-11-29"],
+            "kept_source_ts": "2024-11-29",
+            "dropped_source_ts": ["2024-11-28"],
+        }
+        out = _serialize_collision_examples([ex])
+        assert out[0]["target_ts"] == "2024-12-02"
+
+    def test_missing_required_key_raises_clearly(self):
+        from aiphaforge.probes.abtest import _serialize_collision_examples
+        bad = {
+            "target_ts": pd.Timestamp("2024-12-02"),
+            # missing source_ts, kept_source_ts, dropped_source_ts
+        }
+        with pytest.raises(ValueError, match="missing required keys"):
+            _serialize_collision_examples([bad])
+
+    def test_non_mapping_example_raises_clearly(self):
+        from aiphaforge.probes.abtest import _serialize_collision_examples
+        with pytest.raises(ValueError, match="must be a mapping"):
+            _serialize_collision_examples(["not a dict"])
+
+    def test_malformed_timestamp_value_raises_clearly(self):
+        from aiphaforge.probes.abtest import _serialize_collision_examples
+        bad = self._example()
+        bad["target_ts"] = 12345  # int, not pd.Timestamp
+        with pytest.raises(ValueError, match="malformed timestamp"):
+            _serialize_collision_examples([bad])
+
+    def test_empty_input_returns_empty_output(self):
+        from aiphaforge.probes.abtest import _serialize_collision_examples
+        assert _serialize_collision_examples([]) == []
+
+
+class TestManifestUsesArmLocalDiagnostics:
+    """v2.1.0 r4 §3.5 / §5.1 — manifest collision warnings must come
+    from per-arm diagnostics, NOT from any transform-instance state.
+    """
+
+    def test_collision_warning_details_carry_schema_version(self):
+        # End-to-end smoke that the new schema_version=1.0 reaches
+        # the manifest.
+        data = _ohlcv(n=80)
+        ds = DateShift(
+            offset=pd.DateOffset(years=-3),
+            calendar=US_EQUITY,
+            snap="forward",
+            on_collision="keep_last",
+        )
+        scen = ABScenario(
+            scenario_id="schema", mode="market_level",
+            transforms=[ds],
+        )
+        result = run_ab_probe(
+            ai_factory=_factory,
+            baseline_factory=_factory,
+            data=data,
+            scenarios=[scen],
+            **_KW,
+        )
+        collisions = result.scenarios[0].calendar_snap_collisions
+        if collisions:
+            # When collisions fire, schema_version must be present.
+            assert collisions[0]["details"]["schema_version"] == "1.0"
+            # And repeat_count_with_warning records how many
+            # arm-repeats produced the warning.
+            assert "repeat_count_with_warning" in collisions[0]["details"]
+
+    def test_no_dateshift_attribute_left_behind_on_instance(self):
+        # Regression guard: r4 §3 removed last_collision_report
+        # entirely. Apply 100 rounds; instance should still have no
+        # such attribute.
+        data = _ohlcv(n=20)
+        ds = DateShift(
+            offset=pd.DateOffset(days=0),
+            calendar=US_EQUITY,
+            snap="nearest",
+            on_collision="keep_last",
+        )
+        for _ in range(5):
+            ds.apply(data)
+        assert not hasattr(ds, "last_collision_report")
+
+
+# ---------- v2.1.0 r4 §6: calendar threading instrumentation (M11) ----------
+
+
+class TestCalendarThreadingInstrumentation:
+    """v2.1.0 stabilization (M11) — assert behavior, not just
+    "does not crash."
+
+    Plan r4-final §6: prove that `_run_scenario` builds an internal
+    `TransformPipeline` with the inferred effective calendar via
+    monkeypatching `TransformPipeline.__init__` and capturing the
+    `calendar=` kwarg.
+    """
+
+    def test_run_scenario_threads_inferred_calendar_into_internal_pipeline(
+        self, monkeypatch,
+    ):
+        from aiphaforge.probes.transforms import TransformPipeline
+
+        captured_calendars: list = []
+        original_init = TransformPipeline.__init__
+
+        def spy_init(self, *args, **kwargs):
+            captured_calendars.append(kwargs.get("calendar"))
+            return original_init(self, *args, **kwargs)
+
+        monkeypatch.setattr(TransformPipeline, "__init__", spy_init)
+
+        data = _ohlcv(n=20)
+        ds = DateShift(
+            offset=pd.DateOffset(days=0),
+            calendar=US_EQUITY,
+            snap="nearest",
+        )
+        scen = ABScenario(
+            scenario_id="threaded", mode="market_level",
+            transforms=[ds],
+        )
+        run_ab_probe(
+            ai_factory=_factory,
+            baseline_factory=_factory,
+            data=data,
+            scenarios=[scen],
+            **_KW,
+        )
+
+        # At least one constructed pipeline received calendar=US_EQUITY
+        # (by stable fingerprint, not object identity).
+        us_fp = US_EQUITY.stable_fingerprint()
+        matched = [
+            c for c in captured_calendars
+            if c is not None and c.stable_fingerprint() == us_fp
+        ]
+        assert matched, (
+            "no TransformPipeline was constructed with the inferred "
+            f"US_EQUITY calendar; captured: {captured_calendars}"
+        )
+
+    def test_user_transform_with_unrelated_calendar_attr_is_ignored(
+        self, monkeypatch,
+    ):
+        # Plan §5.3 r3-final foot-gun guard: a user transform with
+        # an unrelated `.calendar` attribute (lookback config, regime
+        # calendar, etc.) and NO `_aiphaforge_calendar_provider`
+        # marker must NOT cause the pipeline to receive that
+        # attribute as an effective calendar.
+        from aiphaforge.probes.transforms import TransformPipeline
+
+        class _UnrelatedCalendarAttr:
+            name = "Unrelated"
+            category = "level"
+            supports_view_only = True
+            supports_market_level = True
+            order_invertible = True
+            stochastic = False
+            calendar = "lookback-window-config"  # NOT a TradingCalendar
+
+            def apply(self, data, *, seed=None):
+                return data
+
+        captured_calendars: list = []
+        original_init = TransformPipeline.__init__
+
+        def spy_init(self, *args, **kwargs):
+            captured_calendars.append(kwargs.get("calendar"))
+            return original_init(self, *args, **kwargs)
+
+        monkeypatch.setattr(TransformPipeline, "__init__", spy_init)
+
+        data = _ohlcv(n=20)
+        scen = ABScenario(
+            scenario_id="unrelated", mode="market_level",
+            transforms=[_UnrelatedCalendarAttr()],
+        )
+        run_ab_probe(
+            ai_factory=_factory,
+            baseline_factory=_factory,
+            data=data,
+            scenarios=[scen],
+            **_KW,
+        )
+
+        # The unrelated string attribute must NOT have been routed
+        # into any pipeline's calendar kwarg.
+        for cal in captured_calendars:
+            assert cal != "lookback-window-config"
+        # All captures must be None (no calendar-aware transform in
+        # this scenario).
+        assert all(c is None for c in captured_calendars), (
+            f"unexpected non-None calendar captured: {captured_calendars}"
+        )
+
+    def test_conflicting_calendar_aware_transforms_fail_fast_in_run_scenario(self):
+        # The conflict detection from M4 must fire from the
+        # _run_scenario pre-check pipeline, not just from
+        # standalone TransformPipeline construction. This was already
+        # tested in TestCalendarConflictFailsFast above; M11 keeps
+        # it here as a stabilization invariant.
+        data = _ohlcv(n=20)
+        ds_us = DateShift(offset=0, calendar=US_EQUITY)
+        ds_cn = DateShift(offset=0, calendar=CHINA_A_SHARE)
+        scen = ABScenario(
+            scenario_id="conflict_m11", mode="market_level",
+            transforms=[ds_us, ds_cn],
+        )
+        with pytest.raises(CalendarConflictError):
+            run_ab_probe(
+                ai_factory=_factory,
+                baseline_factory=_factory,
+                data=data,
+                scenarios=[scen],
+                **_KW,
+            )

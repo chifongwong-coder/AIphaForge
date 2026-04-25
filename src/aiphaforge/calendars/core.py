@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import hashlib
 import warnings
+from copy import deepcopy
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Iterable, Literal, Mapping, Optional
 
 import pandas as pd
@@ -79,16 +81,21 @@ _VALID_DAYOFWEEK = frozenset(range(7))
 def _normalize_to_date(ts: Optional[pd.Timestamp]) -> Optional[pd.Timestamp]:
     """Coerce input to a tz-naive, time-zero ``pd.Timestamp`` or None.
 
-    Inputs that are already date-only and tz-naive pass through; tz-
-    aware inputs are converted to UTC-naive and then date-normalized;
-    inputs with a non-zero time component are floored to the day.
+    Strips timezone WITHOUT UTC conversion, preserving the LOCAL
+    displayed date (r4-final §4.2). The previous implementation
+    used ``tz_convert("UTC").tz_localize(None)`` which shifted the
+    date for tz-aware inputs near midnight (e.g.
+    ``2024-12-25 23:30 ET`` mapped to ``2024-12-26``). v2.1 is
+    daily resolution — the date the user wrote is the date we keep.
+
+    Full exchange-session timezone modeling is deferred to v2.2.
     """
     if ts is None:
         return None
     out = pd.Timestamp(ts)
     if out.tzinfo is not None:
-        # Strip tz: the calendar lives in date space, not wall-clock.
-        out = out.tz_convert("UTC").tz_localize(None)
+        # Strip tz, preserving the wall-clock local date.
+        out = out.tz_localize(None)
     return out.normalize()
 
 
@@ -117,15 +124,43 @@ def _holidays_hash(holidays: frozenset[pd.Timestamp]) -> str:
     return h.hexdigest()[:16]
 
 
+def _freeze_provenance(
+    value: Optional[Mapping[str, Any]],
+) -> Optional[Mapping[str, Any]]:
+    """Deep-copy + wrap a provenance dict in a MappingProxyType.
+
+    Two reasons to do both:
+
+    - **Deep-copy** so a caller mutating their original dict after
+      construction does NOT silently rewrite the calendar's
+      provenance.
+    - **MappingProxyType** wrap so consumers reading the calendar
+      can't accidentally mutate the metadata either.
+
+    Returns ``None`` for ``None`` input. Nested values inside the
+    provenance need not themselves be deeply immutable — they are
+    metadata only, excluded from equality and hashing.
+    """
+    if value is None:
+        return None
+    return MappingProxyType(deepcopy(dict(value)))
+
+
 def _format_offending_dates(
-    dates: list[pd.Timestamp],
+    dates: list[Any],
     *,
     cap: int = 10,
 ) -> str:
-    """Bounded human-readable date list (plan §2.4 r3)."""
+    """Bounded human-readable date list (plan §2.4 r3).
+
+    Accepts ``pd.Timestamp`` OR ``numpy.datetime64`` (the latter is
+    what ``pd.unique`` returns from a normalized index). Both are
+    coerced to ``pd.Timestamp`` for formatting.
+    """
     if not dates:
         return ""
-    sorted_dates = sorted(dates)
+    coerced = [pd.Timestamp(d) for d in dates]
+    sorted_dates = sorted(coerced)
     shown = sorted_dates[:cap]
     omitted = len(sorted_dates) - len(shown)
     body = ", ".join(d.strftime("%Y-%m-%d") for d in shown)
@@ -171,7 +206,16 @@ class TradingCalendar:
     holidays: frozenset[pd.Timestamp]
     coverage_start: Optional[pd.Timestamp] = None
     coverage_end: Optional[pd.Timestamp] = None
-    provenance: Optional[Mapping[str, Any]] = None
+    # Metadata only. Excluded from equality and hashing per plan
+    # r4-final §2.1 — keeping `provenance: dict` in the auto-generated
+    # `__hash__` made every predefined calendar unhashable. Wrapped
+    # in a MappingProxyType in __post_init__ so callers can't mutate
+    # it after construction either.
+    provenance: Optional[Mapping[str, Any]] = field(
+        default=None,
+        compare=False,
+        hash=False,
+    )
     _warning_keys_seen: set[str] = field(
         default_factory=set,
         init=False,
@@ -207,6 +251,14 @@ class TradingCalendar:
         normalized_end = _normalize_to_date(self.coverage_end)
         if normalized_end != self.coverage_end:
             object.__setattr__(self, "coverage_end", normalized_end)
+
+        # Freeze provenance: deep-copy + MappingProxyType wrap so
+        # later caller mutation of the original dict cannot rewrite
+        # the calendar's visible provenance, and consumers reading
+        # the field cannot mutate it either. r4-final §2.2.
+        object.__setattr__(
+            self, "provenance", _freeze_provenance(self.provenance),
+        )
 
     # ---- core membership ----
 
@@ -321,21 +373,84 @@ class TradingCalendar:
         """Return ``IntegrityCheckResult`` describing whether every
         date in ``index`` is a trading day under this calendar.
 
-        Offending dates are listed in the ``errors`` string, capped
+        v2.1.0 r4 §4.2 daily-resolution rules:
+
+        1. Reject ``NaT`` values.
+        2. Date-normalize each timestamp (tz-stripped, midnight-floored)
+           — preserving the LOCAL displayed date, no UTC conversion.
+        3. Reject duplicate dates after normalization. v2.1 does not
+           model intraday sessions, so two rows on the same calendar
+           date are not permitted by the calendar validator.
+        4. Run weekend / holiday membership on the unique normalized
+           dates (vectorized via pandas).
+
+        Offending dates are listed in the ``errors`` strings, capped
         at the first 10 dates with ``... and K more`` per plan §2.4.
+        The original input index is not mutated — normalization is
+        for checking only.
         """
-        offending: list[pd.Timestamp] = []
-        for ts in index:
-            if not self.is_trading_day(ts):
-                offending.append(_normalize_to_date(ts))
-        if not offending:
-            return IntegrityCheckResult(passed=True, errors=[])
-        msg = (
-            f"calendar {self.name!r} non-conformant on "
-            f"{len(offending)} dates: "
-            + _format_offending_dates(offending, cap=10)
-        )
-        return IntegrityCheckResult(passed=False, errors=[msg])
+        idx = pd.DatetimeIndex(index)
+        errors: list[str] = []
+
+        # 1. NaT rejection.
+        if idx.isna().any():
+            n_nat = int(idx.isna().sum())
+            errors.append(
+                f"calendar {self.name!r}: index contains {n_nat} NaT "
+                "values; calendar validation requires real timestamps."
+            )
+
+        # 2. Strip tz preserving local date, then floor to midnight.
+        if idx.tz is not None:
+            idx_naive = idx.tz_localize(None)
+        else:
+            idx_naive = idx
+        try:
+            normalized = idx_naive.normalize()
+        except Exception:
+            # If normalization fails for any reason (e.g. non-monotonic
+            # exotic input), surface the failure rather than masking it.
+            errors.append(
+                f"calendar {self.name!r}: failed to normalize index to "
+                "calendar dates."
+            )
+            return IntegrityCheckResult(passed=not errors, errors=errors)
+
+        # 3. Duplicate-after-normalization rejection (daily resolution).
+        if not normalized.is_unique:
+            dup_mask = normalized.duplicated(keep=False)
+            dup_dates = pd.unique(normalized[dup_mask])
+            errors.append(
+                f"calendar {self.name!r}: daily-resolution calendar "
+                f"received multiple rows per date on {len(dup_dates)} "
+                "dates: "
+                + _format_offending_dates(list(dup_dates), cap=10)
+                + ". v2.1 does not model intraday sessions; pass one "
+                "row per trading day."
+            )
+            # Don't proceed to the membership check — duplicates are a
+            # structural problem first.
+            return IntegrityCheckResult(passed=False, errors=errors)
+
+        # 4. Vectorized weekend + holiday membership.
+        weekend_mask = normalized.dayofweek.isin(self.weekend_days)
+        holiday_index = pd.DatetimeIndex(self.holidays) if self.holidays else None
+        if holiday_index is not None and len(holiday_index):
+            holiday_mask = normalized.isin(holiday_index)
+        else:
+            holiday_mask = pd.Series(
+                [False] * len(normalized), index=range(len(normalized)),
+            ).to_numpy()
+        offending_mask = weekend_mask | holiday_mask
+        if offending_mask.any():
+            offending = list(normalized[offending_mask])
+            errors.append(
+                f"calendar {self.name!r} non-conformant on "
+                f"{len(offending)} dates: "
+                + _format_offending_dates(offending, cap=10)
+            )
+
+        return IntegrityCheckResult(passed=not errors, errors=errors)
 
     # ---- fingerprint ----
 

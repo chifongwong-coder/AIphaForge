@@ -19,7 +19,17 @@ from __future__ import annotations
 import hashlib
 import warnings
 from dataclasses import asdict
-from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Mapping,
+    Optional,
+    Sequence,
+    Union,
+)
 
 import numpy as np
 import pandas as pd
@@ -40,6 +50,7 @@ from aiphaforge.probes.models import (
 )
 from aiphaforge.probes.scoring import _merge_provider_config
 from aiphaforge.probes.transforms import (
+    TransformDiagnostic,
     TransformPipeline,
     _effective_calendar_from_transforms,
 )
@@ -186,8 +197,12 @@ def _run_one_arm(
     mode: str,
     seed: Optional[int],
     engine_kwargs: Optional[Dict[str, Any]] = None,
-) -> BacktestResult:
+) -> tuple[BacktestResult, tuple[TransformDiagnostic, ...]]:
     """Run a single arm of the A/B at one transform pipeline.
+
+    Returns ``(BacktestResult, diagnostics)``. v2.1.0 r4 §3:
+    diagnostics are per-call so manifest builders can attribute them
+    to a specific arm/repeat without sharing mutable transform state.
 
     For ``market_level`` mode the transformed data is the engine's
     market. For ``view_only`` mode the agent sees the transformed
@@ -195,7 +210,8 @@ def _run_one_arm(
     this requires a Strategy-based factory in v2.0 because the
     Hook-driven broker-proxy wrapper is deferred to v2.0.x.
 
-    Empty ``transforms`` runs the raw arm (no transformation).
+    Empty ``transforms`` runs the raw arm (no transformation, no
+    diagnostics).
     """
     agent = factory()
     engine = _engine_for(engine_kwargs)
@@ -212,7 +228,7 @@ def _run_one_arm(
             engine.set_signals(
                 pd.Series(np.nan, index=data.index, dtype=float)
             )
-        return engine.run(data)
+        return engine.run(data), ()
 
     # v2.1: thread the inferred effective calendar so the pipeline's
     # final integrity validator runs calendar conformance. This is
@@ -224,7 +240,8 @@ def _run_one_arm(
     )
 
     if mode == "market_level":
-        transformed = pipeline.apply(data, seed=seed)
+        apply_result = pipeline.apply_with_diagnostics(data, seed=seed)
+        transformed = apply_result.data
         if isinstance(agent, BaseStrategy):
             engine.set_strategy(agent)
         else:
@@ -232,7 +249,7 @@ def _run_one_arm(
             engine.set_signals(
                 pd.Series(np.nan, index=transformed.index, dtype=float)
             )
-        return engine.run(transformed)
+        return engine.run(transformed), apply_result.diagnostics
 
     # view_only mode.
     if not isinstance(agent, BaseStrategy):
@@ -242,7 +259,8 @@ def _run_one_arm(
             "For v2.0, view_only is supported only for Strategy-based "
             "agents (factories returning BaseStrategy subclasses)."
         )
-    view = pipeline.apply(data, seed=seed)
+    apply_result = pipeline.apply_with_diagnostics(data, seed=seed)
+    view = apply_result.data
     signals = agent.generate_signals(view)
     # Transforms like DateShift change the index; align signals back
     # to the real-data index so the engine can fill at real bars.
@@ -271,7 +289,7 @@ def _run_one_arm(
                 )
             s.index = data.index
     engine.set_signals(signals)
-    return engine.run(data)
+    return engine.run(data), apply_result.diagnostics
 
 
 # ---------- v2.0.1 r5: determinism check ----------
@@ -412,11 +430,13 @@ def _check_agent_determinism(
     rel_tol = resolved_config.determinism_rel_tol or 0.0
 
     try:
-        r1 = _run_one_arm(
+        # Determinism check ignores diagnostics — it's a seed-replay
+        # question, not a transform-warning question.
+        r1, _ = _run_one_arm(
             factory, data, transforms=transforms, mode=mode,
             seed=seed, engine_kwargs=engine_kwargs,
         )
-        r2 = _run_one_arm(
+        r2, _ = _run_one_arm(
             factory, data, transforms=transforms, mode=mode,
             seed=seed, engine_kwargs=engine_kwargs,
         )
@@ -1109,13 +1129,20 @@ def _run_scenario(
 
     parity_warning: Optional[str] = None
 
+    # v2.1.0 r4 §3.5 — collect arm-local diagnostics across repeats.
+    # Manifest builders read from these tuples, never from mutable
+    # transform-instance state. AI and baseline are kept separate so
+    # cross-arm aliasing is structurally impossible.
+    ai_test_diagnostics: list[TransformDiagnostic] = []
+    baseline_test_diagnostics: list[TransformDiagnostic] = []
+
     for r, seed_r in enumerate(seeds_used):
-        # Raw arms.
-        ai_raw = _run_one_arm(
+        # Raw arms (no transforms → no diagnostics).
+        ai_raw, _ = _run_one_arm(
             ai_factory, data, transforms=[], mode=scenario.mode,
             seed=seed_r, engine_kwargs=engine_kwargs,
         )
-        baseline_raw = _run_one_arm(
+        baseline_raw, _ = _run_one_arm(
             baseline_factory, data, transforms=[], mode=scenario.mode,
             seed=seed_r, engine_kwargs=engine_kwargs,
         )
@@ -1127,14 +1154,16 @@ def _run_scenario(
         # Test arms (transformed). For stochastic pipelines, AI and
         # baseline share the same seed so the transform realization
         # is identical within the repeat.
-        ai_test = _run_one_arm(
+        ai_test, ai_test_diags = _run_one_arm(
             ai_factory, data, transforms=scenario.transforms,
             mode=scenario.mode, seed=seed_r, engine_kwargs=engine_kwargs,
         )
-        baseline_test = _run_one_arm(
+        baseline_test, baseline_test_diags = _run_one_arm(
             baseline_factory, data, transforms=scenario.transforms,
             mode=scenario.mode, seed=seed_r, engine_kwargs=engine_kwargs,
         )
+        ai_test_diagnostics.extend(ai_test_diags)
+        baseline_test_diagnostics.extend(baseline_test_diags)
 
         for m in metrics:
             raw_records[m]["ai_raw"].append(_extract_metric(ai_raw, m))
@@ -1154,12 +1183,14 @@ def _run_scenario(
             child_a, child_b = np.random.SeedSequence(seed_r).spawn(2)
             sub_a = int(child_a.generate_state(1)[0])
             sub_b = int(child_b.generate_state(1)[0])
-            ai_test_a = _run_one_arm(
+            # Noise control discards diagnostics — it's a same-arm
+            # variability measurement, not a per-arm warning surface.
+            ai_test_a, _ = _run_one_arm(
                 ai_factory, data, transforms=scenario.transforms,
                 mode=scenario.mode, seed=sub_a,
                 engine_kwargs=engine_kwargs,
             )
-            ai_test_b = _run_one_arm(
+            ai_test_b, _ = _run_one_arm(
                 ai_factory, data, transforms=scenario.transforms,
                 mode=scenario.mode, seed=sub_b,
                 engine_kwargs=engine_kwargs,
@@ -1438,11 +1469,18 @@ def _run_scenario(
             "enable_ai_noise_control=True (control is vacuous)."
         )
 
-    # v2.1 §6.1 / §6.2: structured manifest warnings.
+    # v2.1 §6.1 / r4-final §3.5: structured manifest warnings.
+    # Detectability warnings are static metadata about the scenario's
+    # transforms; collision warnings come from per-arm diagnostics
+    # collected during the test-arm runs (no shared mutable state).
     detectability_warnings = _build_calendar_detectability_warnings(
         scenario.transforms,
     )
-    collision_warnings = _build_collision_warnings(scenario.transforms)
+    collision_warnings = _build_collision_warnings_from_diagnostics(
+        ai_diagnostics=ai_test_diagnostics,
+        baseline_diagnostics=baseline_test_diagnostics,
+        n_repeat=n_repeat,
+    )
 
     report = ScenarioABReport(
         scenario_id=scenario.scenario_id,
@@ -1489,64 +1527,156 @@ def _build_calendar_detectability_warnings(
     return warnings_out
 
 
+_REQUIRED_COLLISION_EXAMPLE_KEYS = (
+    "target_ts", "source_ts", "kept_source_ts", "dropped_source_ts",
+)
+
+
 def _serialize_collision_examples(
     examples: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """Stringify the in-memory pd.Timestamp objects in the collision
-    report's ``examples`` list so the manifest is JSON-safe.
+    """Stringify the in-memory pd.Timestamp objects in a collision
+    diagnostic's ``examples`` list so the manifest is JSON-safe.
 
-    Plan §4.4 / §6.2 r3-final defect #4 fix: in-memory the
-    DateShift report holds pd.Timestamp; the manifest serializer
-    converts to YYYY-MM-DD strings here.
+    Plan r4-final §5.2: examples cap at 10 groups, each with the
+    canonical schema-1.0 keys (``target_ts``, ``source_ts``,
+    ``kept_source_ts``, ``dropped_source_ts``). A malformed entry
+    raises ``ValueError`` at the serializer boundary rather than
+    propagating an ``AttributeError`` deep in manifest construction.
+
+    Accepts pd.Timestamp OR string timestamp values for each field
+    — strings pass through untouched (for forward-compat with future
+    diagnostic schemas that may pre-stringify).
     """
     out = []
-    for ex in examples:
-        out.append({
-            "target_ts": ex["target_ts"].strftime("%Y-%m-%d"),
-            "source_ts": [
-                ts.strftime("%Y-%m-%d") for ts in ex["source_ts"]
-            ],
-            "kept_source_ts": ex["kept_source_ts"].strftime("%Y-%m-%d"),
-            "dropped_source_ts": [
-                ts.strftime("%Y-%m-%d") for ts in ex["dropped_source_ts"]
-            ],
-        })
+    for i, ex in enumerate(examples):
+        if not isinstance(ex, Mapping):
+            raise ValueError(
+                f"collision example #{i} must be a mapping, got "
+                f"{type(ex).__name__}"
+            )
+        missing = [k for k in _REQUIRED_COLLISION_EXAMPLE_KEYS if k not in ex]
+        if missing:
+            raise ValueError(
+                f"collision example #{i} missing required keys: "
+                f"{missing}"
+            )
+        try:
+            out.append({
+                "target_ts": _ts_to_iso(ex["target_ts"]),
+                "source_ts": [_ts_to_iso(t) for t in ex["source_ts"]],
+                "kept_source_ts": _ts_to_iso(ex["kept_source_ts"]),
+                "dropped_source_ts": [
+                    _ts_to_iso(t) for t in ex["dropped_source_ts"]
+                ],
+            })
+        except (AttributeError, TypeError) as exc:
+            raise ValueError(
+                f"collision example #{i} has malformed timestamp "
+                f"value: {exc}"
+            ) from exc
+        if len(out) >= 10:
+            # Hard cap at 10 per r4-final §5.2.
+            break
     return out
 
 
-def _build_collision_warnings(
-    transforms: Sequence[Any],
-) -> List[Dict[str, Any]]:
-    """Plan §6.2 r3-final — calendar_snap_collision_rows_dropped.
+def _ts_to_iso(value: Any) -> str:
+    """Coerce a pd.Timestamp / str to YYYY-MM-DD; reject other types."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, pd.Timestamp):
+        return value.strftime("%Y-%m-%d")
+    raise TypeError(
+        f"timestamp value must be pd.Timestamp or str, got "
+        f"{type(value).__name__}"
+    )
 
-    Reads ``last_collision_report`` populated by DateShift.apply
-    when a non-error collision policy actually dropped rows.
+
+def _build_collision_warnings_from_diagnostics(
+    *,
+    ai_diagnostics: Sequence[TransformDiagnostic],
+    baseline_diagnostics: Sequence[TransformDiagnostic],
+    n_repeat: int,
+) -> List[Dict[str, Any]]:
+    """Plan r4-final §3.5 / §6.2 — calendar_snap_collision_rows_dropped.
+
+    Aggregates per-arm diagnostics into one manifest entry per
+    distinct ``(code, source, schema_version, on_collision)``
+    grouping. Counts are summed across repeats so a 10-repeat
+    scenario where every repeat dropped 17 rows reports
+    ``collision_count = 170`` plus
+    ``repeat_count_with_warning = 10``.
+
+    AI and baseline produce independent diagnostics in v2.1.0
+    (identical inputs → identical reports), but they're collected
+    separately so future arm-divergent flows are well-defined.
     """
+    all_diagnostics = list(ai_diagnostics) + list(baseline_diagnostics)
+    collision_diags = [
+        d for d in all_diagnostics
+        if d.code == "calendar_snap_collision_rows_dropped"
+    ]
+    if not collision_diags:
+        return []
+
+    # Group by (source, schema_version, on_collision). Within a
+    # group, sum counts and merge example sets (capped at 10 across
+    # the aggregate).
+    groups: Dict[tuple, list[TransformDiagnostic]] = {}
+    for d in collision_diags:
+        details = d.details or {}
+        key = (
+            d.source,
+            details.get("schema_version", "1.0"),
+            details.get("on_collision"),
+        )
+        groups.setdefault(key, []).append(d)
+
     out: List[Dict[str, Any]] = []
-    for t in transforms:
-        report = getattr(t, "last_collision_report", None)
-        if not report:
-            continue
-        details = {
-            "transform": report["transform"],
-            "on_collision": report["on_collision"],
-            "collision_count": report["collision_count"],
-            "collision_group_count": report["collision_group_count"],
-            "examples": _serialize_collision_examples(report["examples"]),
-            "examples_truncated": report["examples_truncated"],
-        }
+    for (source, schema_version, on_collision), diags in groups.items():
+        total_count = sum(
+            d.details.get("collision_count", 0) for d in diags
+        )
+        total_groups = sum(
+            d.details.get("collision_group_count", 0) for d in diags
+        )
+        # Aggregate examples up to first 10 across the group.
+        merged_examples: List[Dict[str, Any]] = []
+        for d in diags:
+            for ex in d.details.get("examples", []):
+                if len(merged_examples) >= 10:
+                    break
+                merged_examples.append(ex)
+            if len(merged_examples) >= 10:
+                break
+        examples_truncated = (
+            sum(len(d.details.get("examples", [])) for d in diags) > 10
+            or any(
+                d.details.get("examples_truncated") for d in diags
+            )
+        )
         out.append({
             "code": "calendar_snap_collision_rows_dropped",
             "severity": "warning",
-            "source": report["transform"],
+            "source": source,
             "message": (
-                f"{report['transform']} calendar snapping produced "
-                f"duplicate target dates; on_collision="
-                f"{report['on_collision']!r} dropped "
-                f"{report['collision_count']} source rows. "
-                "This changes the transformed sample length."
+                f"{source} calendar snapping produced duplicate "
+                f"target dates; on_collision={on_collision!r} dropped "
+                f"{total_count} source rows across "
+                f"{len(diags)} arm-repeat(s). This changes the "
+                "transformed sample length."
             ),
-            "details": details,
+            "details": {
+                "schema_version": schema_version,
+                "transform": source,
+                "on_collision": on_collision,
+                "collision_count": total_count,
+                "collision_group_count": total_groups,
+                "examples": _serialize_collision_examples(merged_examples),
+                "examples_truncated": examples_truncated,
+                "repeat_count_with_warning": len(diags),
+            },
         })
     return out
 

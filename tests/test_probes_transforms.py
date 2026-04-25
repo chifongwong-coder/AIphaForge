@@ -227,8 +227,10 @@ class TestDateShiftCollision:
         df = self._frame_with_holiday_collision()
         with pytest.raises(CalendarSnapCollisionError, match="duplicate target"):
             ds.apply(df)
-        # And the report is None on a failed apply.
-        assert ds.last_collision_report is None
+        # v2.1.0 r4 §3: no instance-state side effect to assert here;
+        # last_collision_report has been removed entirely. The
+        # raised exception is the only signal.
+        assert not hasattr(ds, "last_collision_report")
 
     def test_collision_keep_first(self):
         from aiphaforge.calendars import US_EQUITY
@@ -254,49 +256,80 @@ class TestDateShiftCollision:
         # Last source row (2024-11-29 → 2024-12-02) survives.
         assert out["close"].iloc[0] == 2.2
 
-    def test_collision_report_has_required_fields(self):
+    def test_collision_diagnostic_has_required_fields(self):
+        # v2.1.0 r4 §3.4: collision report shape moves from
+        # `last_collision_report` (instance state) to a per-call
+        # diagnostic returned by `apply_with_diagnostics`.
         from aiphaforge.calendars import US_EQUITY
         ds = DateShift(
             offset=pd.DateOffset(days=0), calendar=US_EQUITY,
             snap="forward", on_collision="keep_last",
         )
         df = self._frame_with_holiday_collision()
-        ds.apply(df)
-        report = ds.last_collision_report
-        assert report is not None
+        result = ds.apply_with_diagnostics(df)
+        # Exactly one collision diagnostic for this single-collision
+        # input.
+        diags = [
+            d for d in result.diagnostics
+            if d.code == "calendar_snap_collision_rows_dropped"
+        ]
+        assert len(diags) == 1
+        d = diags[0]
+        assert d.source == "DateShift"
+        assert d.severity == "warning"
+        # Plan §3.4 details schema with schema_version="1.0".
         for key in (
-            "transform", "on_collision", "collision_count",
-            "collision_group_count", "examples", "examples_truncated",
+            "schema_version", "transform", "on_collision",
+            "collision_count", "collision_group_count",
+            "examples", "examples_truncated",
         ):
-            assert key in report
-        assert report["transform"] == "DateShift"
-        assert report["on_collision"] == "keep_last"
-        assert report["collision_count"] == 1
-        assert report["collision_group_count"] == 1
-        # Examples preserve in-memory pd.Timestamp typing
-        # (defect #4 fix — JSON serializer in M5 stringifies).
-        ex = report["examples"][0]
+            assert key in d.details, f"missing detail key {key}"
+        assert d.details["schema_version"] == "1.0"
+        assert d.details["transform"] == "DateShift"
+        assert d.details["on_collision"] == "keep_last"
+        assert d.details["collision_count"] == 1
+        assert d.details["collision_group_count"] == 1
+        # Examples preserve in-memory pd.Timestamp typing; the
+        # manifest serializer (M10) stringifies for JSON output.
+        ex = d.details["examples"][0]
         assert isinstance(ex["target_ts"], pd.Timestamp)
         assert isinstance(ex["kept_source_ts"], pd.Timestamp)
         assert all(isinstance(t, pd.Timestamp) for t in ex["source_ts"])
 
-    def test_no_collision_clears_stale_report(self):
+    def test_no_collision_yields_empty_diagnostics(self):
+        # v2.1.0 r4 §3: clean apply produces no collision diagnostic.
+        # No instance-state field to "clear" — there isn't one.
         from aiphaforge.calendars import US_EQUITY
-        # First call: triggers collision.
         ds = DateShift(
             offset=pd.DateOffset(days=0), calendar=US_EQUITY,
             snap="forward", on_collision="keep_first",
         )
-        ds.apply(self._frame_with_holiday_collision())
-        assert ds.last_collision_report is not None
-        # Second call: clean frame, no collision. Report must reset.
         clean = pd.DataFrame(
             {"open": [1.0, 2.0], "high": [1.5, 2.5],
              "low": [0.5, 1.5], "close": [1.2, 2.2], "volume": [100, 200]},
             index=pd.bdate_range("2024-01-08", periods=2),
         )
-        ds.apply(clean)
-        assert ds.last_collision_report is None
+        result = ds.apply_with_diagnostics(clean)
+        collision_diags = [
+            d for d in result.diagnostics
+            if d.code == "calendar_snap_collision_rows_dropped"
+        ]
+        assert collision_diags == []
+        # And there's no last_collision_report attribute to leak
+        # state across calls.
+        assert not hasattr(ds, "last_collision_report")
+
+    def test_apply_returns_dataframe_for_backward_compat(self):
+        # v2.0/v2.0.1/v2.0.2 callers expect plain pd.DataFrame from
+        # DateShift.apply. The new diagnostics API is opt-in.
+        from aiphaforge.calendars import US_EQUITY
+        ds = DateShift(
+            offset=pd.DateOffset(days=0), calendar=US_EQUITY,
+            snap="forward", on_collision="keep_last",
+        )
+        out = ds.apply(self._frame_with_holiday_collision())
+        assert isinstance(out, pd.DataFrame)
+        assert out.index.is_unique
 
     def test_invalid_collision_policy_rejected(self):
         with pytest.raises(ValueError, match="on_collision must be"):

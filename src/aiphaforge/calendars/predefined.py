@@ -61,15 +61,30 @@ def _build_calendar(
     # mirrors the JSON entry plus the global package metadata. Wrap
     # in a plain dict (immutable in spirit; the dataclass is frozen).
     provenance = {
+        # Global package-level metadata.
         "source": payload["provenance"]["source"],
         "source_license": payload["provenance"]["source_license"],
-        "source_calendar": cal_entry["source_calendar"],
-        "market_scope": cal_entry["market_scope"],
+        "source_url": payload["provenance"].get("source_url"),
         "source_package_version": payload["provenance"]["source_package_version"],
+        "generation_script": payload["provenance"].get("generation_script"),
+        "generation_script_sha256": payload["provenance"].get(
+            "generation_script_sha256",
+        ),
         "generated_at": payload["provenance"]["generated_at"],
+        # r4-final §2.4: instance consumers must not lose
+        # last_verified / next_refresh_target. Without these, a user
+        # auditing instance.provenance can't see the calendar's
+        # refresh cadence.
+        "last_verified": payload["provenance"].get("last_verified"),
+        "next_refresh_target": payload["provenance"].get(
+            "next_refresh_target",
+        ),
         "coverage_start": payload["provenance"]["coverage_start"],
         "coverage_end": payload["provenance"]["coverage_end"],
         "runtime_dependency": payload["provenance"]["runtime_dependency"],
+        # Calendar-local metadata.
+        "source_calendar": cal_entry["source_calendar"],
+        "market_scope": cal_entry["market_scope"],
     }
     if "known_limitations" in cal_entry:
         provenance["known_limitations"] = list(cal_entry["known_limitations"])

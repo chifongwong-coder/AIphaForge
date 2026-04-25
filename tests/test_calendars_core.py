@@ -410,3 +410,282 @@ class TestErrorClasses:
         # violations (it's what duck-typing failures usually surface
         # as in stdlib).
         assert issubclass(CalendarProviderProtocolError, TypeError)
+
+
+# ---------- v2.1.0 r4 stabilization §2: hashability + provenance ----------
+
+
+class TestTradingCalendarHashabilityAndProvenance:
+    """v2.1.0 stabilization (M7) — `hash(US_EQUITY)` raised TypeError
+    in the original M1/M2 implementation because `provenance: dict`
+    participated in the auto-generated `__hash__`. r4-final §2 fixes
+    this by marking the field `compare=False, hash=False` and freezing
+    it via MappingProxyType + deep-copy in __post_init__.
+    """
+
+    def test_predefined_calendars_are_hashable(self):
+        from aiphaforge.calendars import (
+            CHINA_A_SHARE,
+            CRYPTO_24_7,
+            US_EQUITY,
+            US_FUTURES_ES,
+        )
+        for cal in (US_EQUITY, CHINA_A_SHARE, CRYPTO_24_7, US_FUTURES_ES):
+            # Must not raise.
+            hash(cal)
+
+    def test_user_calendar_with_dict_provenance_is_hashable(self):
+        cal = TradingCalendar(
+            name="user",
+            weekend_days=frozenset({5, 6}),
+            holidays=frozenset(),
+            provenance={"src": "me", "nested": {"a": 1}},
+        )
+        hash(cal)  # must not raise
+
+    def test_calendar_usable_as_dict_key_and_set_member(self):
+        from aiphaforge.calendars import CHINA_A_SHARE, US_EQUITY
+        s = {US_EQUITY, CHINA_A_SHARE}
+        assert len(s) == 2
+        d = {US_EQUITY: "us", CHINA_A_SHARE: "cn"}
+        assert d[US_EQUITY] == "us"
+
+    def test_calendar_usable_as_lru_cache_arg(self):
+        # Real-world consumer pattern: memoize calendar-keyed
+        # computations.
+        from functools import lru_cache
+
+        from aiphaforge.calendars import US_EQUITY
+
+        @lru_cache(maxsize=4)
+        def f(cal):
+            return cal.name
+
+        assert f(US_EQUITY) == "US_EQUITY"
+        assert f(US_EQUITY) == "US_EQUITY"  # cache hit, no TypeError
+
+    def test_provenance_does_not_affect_equality_or_hash(self):
+        cal_a = TradingCalendar(
+            name="x",
+            weekend_days=frozenset({5, 6}),
+            holidays=frozenset({pd.Timestamp("2024-12-25")}),
+            provenance={"src": "vendor_A"},
+        )
+        cal_b = TradingCalendar(
+            name="x",
+            weekend_days=frozenset({5, 6}),
+            holidays=frozenset({pd.Timestamp("2024-12-25")}),
+            provenance={"src": "vendor_B"},
+        )
+        # Same fields except provenance → equal AND same hash.
+        assert cal_a == cal_b
+        assert hash(cal_a) == hash(cal_b)
+
+    def test_warning_seen_set_does_not_affect_hash_or_fingerprint(self):
+        cal = _us_like_calendar()
+        h_before = hash(cal)
+        fp_before = cal.stable_fingerprint()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            cal.is_trading_day(pd.Timestamp("2020-06-15"))
+        assert cal._warning_keys_seen, "test setup: warning should have fired"
+        assert hash(cal) == h_before
+        assert cal.stable_fingerprint() == fp_before
+
+    def test_predefined_instance_provenance_contains_refresh_fields(self):
+        # r4-final §2.4: instance consumers must not lose
+        # last_verified or next_refresh_target.
+        from aiphaforge.calendars import US_EQUITY
+        prov = US_EQUITY.provenance
+        assert prov["last_verified"]
+        assert prov["next_refresh_target"] == "2033-12-31"
+        # Plus other documented fields per §2.4.
+        for key in (
+            "source", "source_license", "source_package_version",
+            "generation_script_sha256", "generated_at",
+            "coverage_start", "coverage_end",
+            "runtime_dependency", "source_calendar", "market_scope",
+        ):
+            assert key in prov, f"missing provenance key: {key}"
+
+    def test_provenance_is_immutable_after_construction(self):
+        cal = TradingCalendar(
+            name="x",
+            weekend_days=frozenset({5, 6}),
+            holidays=frozenset(),
+            provenance={"src": "me"},
+        )
+        with pytest.raises(TypeError):
+            cal.provenance["hacked"] = True  # type: ignore[index]
+
+    def test_caller_mutating_original_dict_does_not_rewrite_calendar(self):
+        # Critical safety: deep-copy must defend against caller-side
+        # mutation after construction.
+        src = {"src": "me", "nested": {"a": 1}}
+        cal = TradingCalendar(
+            name="x",
+            weekend_days=frozenset({5, 6}),
+            holidays=frozenset(),
+            provenance=src,
+        )
+        src["src"] = "mutated"
+        src["nested"]["a"] = 999
+        assert cal.provenance["src"] == "me"
+        # Deep copy: nested mutation also isolated.
+        assert cal.provenance["nested"]["a"] == 1
+
+    def test_provenance_none_is_preserved(self):
+        cal = TradingCalendar(
+            name="x",
+            weekend_days=frozenset({5, 6}),
+            holidays=frozenset(),
+            provenance=None,
+        )
+        assert cal.provenance is None
+        # And still hashable.
+        hash(cal)
+
+
+# ---------- v2.1.0 r4 stabilization §4: daily-resolution + tz fix ----------
+
+
+class TestDailyResolutionConformance:
+    """v2.1.0 stabilization (M9) — date-normalize-and-validate.
+
+    Plan r4-final §4: validation operates on date-normalized values
+    while preserving the local displayed date. NaT, intraday
+    duplicates, and tz-aware midnight-shifting are all rejected by
+    the calendar validator.
+    """
+
+    def _us_cal(self):
+        return TradingCalendar(
+            name="US",
+            weekend_days=frozenset({5, 6}),
+            holidays=frozenset({pd.Timestamp("2024-12-25")}),
+            coverage_start=pd.Timestamp("2024-01-01"),
+            coverage_end=pd.Timestamp("2024-12-31"),
+        )
+
+    def test_one_daily_bar_with_non_midnight_time_passes(self):
+        # Real vendor data often timestamps each daily bar at the
+        # session close (e.g. 16:00). One row per date with a
+        # non-midnight timestamp is a daily bar, not intraday.
+        idx = pd.DatetimeIndex([
+            "2024-01-08 16:00", "2024-01-09 16:00", "2024-01-10 16:00",
+        ])
+        result = self._us_cal().is_conformant(idx)
+        assert result.passed is True
+
+    def test_duplicate_normalized_dates_are_rejected(self):
+        # Two rows on the same calendar date is intraday; v2.1
+        # rejects with a clear error.
+        idx = pd.DatetimeIndex([
+            "2024-01-08 09:30", "2024-01-08 16:00",
+        ])
+        result = self._us_cal().is_conformant(idx)
+        assert result.passed is False
+        msg = result.errors[0]
+        assert "multiple rows per date" in msg
+        assert "2024-01-08" in msg
+        assert "intraday" in msg
+
+    def test_holiday_after_normalization_is_flagged(self):
+        # A non-midnight timestamp on a holiday still flags as a
+        # holiday: 2024-12-25 16:00 normalizes to 2024-12-25.
+        idx = pd.DatetimeIndex(["2024-12-24", "2024-12-25 16:00", "2024-12-26"])
+        result = self._us_cal().is_conformant(idx)
+        assert result.passed is False
+        # The holiday membership error mentions 2024-12-25.
+        assert any("2024-12-25" in e for e in result.errors)
+
+    def test_tz_aware_index_uses_local_date(self):
+        # 2024-12-25 23:30 ET previously normalized to 2024-12-26
+        # via UTC conversion (ET is UTC-5; 23:30 ET = 04:30 next-day
+        # UTC). r4-final §4.2 requires preserving the LOCAL date —
+        # so this should still flag as the holiday.
+        idx = pd.DatetimeIndex([
+            pd.Timestamp("2024-12-25 23:30", tz="America/New_York"),
+        ])
+        result = self._us_cal().is_conformant(idx)
+        assert result.passed is False
+        assert any("2024-12-25" in e for e in result.errors)
+
+    def test_tz_aware_clean_date_passes(self):
+        # Sanity: a tz-aware non-holiday date still passes.
+        idx = pd.DatetimeIndex([
+            pd.Timestamp("2024-01-08 16:00", tz="America/New_York"),
+        ])
+        result = self._us_cal().is_conformant(idx)
+        assert result.passed is True
+
+    def test_nat_in_index_is_rejected(self):
+        idx = pd.DatetimeIndex(["2024-01-08", pd.NaT, "2024-01-10"])
+        result = self._us_cal().is_conformant(idx)
+        assert result.passed is False
+        assert any("NaT" in e for e in result.errors)
+
+    def test_full_frame_not_sampled(self):
+        # Make a long index where exactly one date deep in the
+        # middle is a holiday. The validator must catch it.
+        idx = pd.bdate_range("2024-12-20", periods=10)
+        result = self._us_cal().is_conformant(idx)
+        # 2024-12-25 is in the bdate_range and is the holiday.
+        assert result.passed is False
+        assert any("2024-12-25" in e for e in result.errors)
+
+    def test_vectorized_path_handles_large_daily_index(self):
+        # 30-year daily index; vectorized path should be fast and
+        # correct. Smoke-only — exact timing isn't asserted, just
+        # completion under a generous bound.
+        import time
+        cal = TradingCalendar(
+            name="big",
+            weekend_days=frozenset({5, 6}),
+            holidays=frozenset(),  # no holidays
+            coverage_start=pd.Timestamp("1995-01-01"),
+            coverage_end=pd.Timestamp("2025-12-31"),
+        )
+        idx = pd.bdate_range("1995-01-02", "2024-12-31")
+        start = time.time()
+        result = cal.is_conformant(idx)
+        elapsed = time.time() - start
+        # Vectorized: should complete well under a second on any
+        # modern machine. The pre-M9 per-timestamp loop took ~21ms
+        # for the same input; we just want this to NOT take 5+s.
+        assert elapsed < 1.0, f"is_conformant too slow: {elapsed:.2f}s"
+        assert result.passed is True
+
+
+class TestTzAwareNormalizationFix:
+    """v2.1.0 r4 §4.2 tz fix — `_normalize_to_date` must NOT
+    UTC-convert. Verifies the M1/M2 normalization changed correctly.
+    """
+
+    def test_late_evening_et_stays_on_same_local_date(self):
+        # Pre-fix: tz_convert("UTC") shifted 23:30 ET (UTC-5) to
+        # 04:30 next-day UTC, giving the wrong date.
+        cal = TradingCalendar(
+            name="x",
+            weekend_days=frozenset({5, 6}),
+            holidays=frozenset({
+                pd.Timestamp("2024-12-25 23:30", tz="America/New_York"),
+            }),
+        )
+        h = next(iter(cal.holidays))
+        assert h.tzinfo is None
+        # 2024-12-25 ET wall-clock → keeps 2024-12-25.
+        assert h.date() == pd.Timestamp("2024-12-25").date()
+
+    def test_early_morning_tokyo_stays_on_same_local_date(self):
+        # 2024-12-26 03:00 JST = 2024-12-25 18:00 UTC. Pre-fix would
+        # have stored 2024-12-25. r4 stores 2024-12-26 (local date).
+        cal = TradingCalendar(
+            name="x",
+            weekend_days=frozenset({5, 6}),
+            holidays=frozenset({
+                pd.Timestamp("2024-12-26 03:00", tz="Asia/Tokyo"),
+            }),
+        )
+        h = next(iter(cal.holidays))
+        assert h.date() == pd.Timestamp("2024-12-26").date()

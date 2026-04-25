@@ -24,12 +24,13 @@ See `docs/plans/v2.0-plan.md` §2 for the full contract.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
     Any,
     ClassVar,
     Literal,
+    Mapping,
     Optional,
     Protocol,
     Sequence,
@@ -72,6 +73,44 @@ def _import_calendar_provider_protocol_error():
     """Lazy import of CalendarProviderProtocolError; same cycle."""
     from aiphaforge.calendars.core import CalendarProviderProtocolError
     return CalendarProviderProtocolError
+
+
+# ---------- v2.1.0 r4 stabilization (M8): per-call diagnostics ----------
+
+
+@dataclass(frozen=True)
+class TransformDiagnostic:
+    """One structured diagnostic produced by a transform's apply call.
+
+    Manifest warnings derive from these — never from mutable
+    transform-instance state. Plan r4-final §3.
+
+    ``code`` and ``source`` identify the diagnostic; ``severity`` is
+    one of ``"info"`` / ``"warning"`` / ``"error"``; ``details``
+    carries arbitrary JSON-shaped metadata (the manifest serializer
+    runs separately and is responsible for stringifying any in-memory
+    pd.Timestamp values).
+    """
+
+    code: str
+    source: str
+    severity: Literal["info", "warning", "error"]
+    message: str
+    details: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class TransformApplyResult:
+    """Result of applying a transform pipeline to a single arm.
+
+    ``data`` is the transformed frame; ``diagnostics`` is the tuple
+    of diagnostics emitted across all transforms during this apply.
+    Per-call so cross-arm aliasing (the M5/r3 footgun) is impossible
+    by construction.
+    """
+
+    data: pd.DataFrame
+    diagnostics: tuple[TransformDiagnostic, ...] = ()
 
 
 def _effective_calendar_from_transforms(
@@ -304,9 +343,11 @@ class DateShift:
           source dates onto the same target trading day,
           ``"error"`` (default) raises
           ``CalendarSnapCollisionError``; ``"keep_first"`` /
-          ``"keep_last"`` drop the duplicates and expose a
-          structured collision report via
-          ``last_collision_report`` for the manifest.
+          ``"keep_last"`` drop the duplicates and surface a
+          structured collision diagnostic via the per-call
+          :class:`TransformApplyResult` returned by
+          :meth:`apply_with_diagnostics`. The pipeline forwards
+          this diagnostic into the per-scenario manifest.
 
         ``unshift_date`` is exact when ``calendar=None`` (the v2.0
         contract). With a calendar set it is best-effort and lossy
@@ -347,11 +388,11 @@ class DateShift:
         self.calendar = calendar
         self.snap = snap
         self.on_collision = on_collision
-        # Populated by `apply` whenever a non-error collision policy
-        # actually drops rows. Held in-memory as native pd.Timestamp
-        # objects (plan §4.4 r3-final defect #4 fix); the JSON
-        # serializer in M5 stringifies for manifest output.
-        self.last_collision_report: Optional[dict[str, Any]] = None
+        # Note: M8 (r4-final) intentionally removed
+        # ``self.last_collision_report``. Collision diagnostics are
+        # per-call now — see :meth:`apply_with_diagnostics`. Mutable
+        # instance state was the root cause of the cross-arm aliasing
+        # foot-gun documented in v2.1 plan §15.2.
 
     # ---- v2.1 calendar-aware-transform protocol ----
 
@@ -411,8 +452,25 @@ class DateShift:
     def apply(
         self, data: pd.DataFrame, *, seed: Optional[int] = None,
     ) -> pd.DataFrame:
+        """Backward-compat wrapper around
+        :meth:`apply_with_diagnostics`. Returns just the frame so
+        v2.0/v2.0.1/v2.0.2 callers see no API change.
+        """
+        return self.apply_with_diagnostics(data, seed=seed).data
+
+    def apply_with_diagnostics(
+        self, data: pd.DataFrame, *, seed: Optional[int] = None,
+    ) -> "TransformApplyResult":
+        """Apply the shift; return frame + per-call diagnostics.
+
+        v2.1.0 r4 §3 contract: collision diagnostics are emitted in
+        the returned tuple, NOT stored on the transform instance.
+        Manifest builders read diagnostics from the per-arm result so
+        cross-arm or cross-repeat aliasing is structurally impossible.
+        """
         out = data.copy()
         out.index = out.index + self.offset
+        diagnostics: list[TransformDiagnostic] = []
 
         if self.calendar is not None:
             # Snap each shifted date according to the configured
@@ -424,33 +482,43 @@ class DateShift:
             ])
             out.index = snapped
 
-            # Detect duplicates introduced by snapping and dispatch
-            # on collision policy.
             if not snapped.is_unique:
-                out = self._resolve_collisions(out)
-            else:
-                # No collisions; clear stale report from prior call.
-                self.last_collision_report = None
-        else:
-            self.last_collision_report = None
+                out, collision_diag = self._resolve_collisions(out)
+                if collision_diag is not None:
+                    diagnostics.append(collision_diag)
 
-        return out
+        return TransformApplyResult(
+            data=out, diagnostics=tuple(diagnostics),
+        )
 
     # ---- collision resolution ----
 
-    def _resolve_collisions(self, out: pd.DataFrame) -> pd.DataFrame:
-        """Apply ``on_collision`` policy to a frame whose index has
-        duplicates after snapping.
+    def _resolve_collisions(
+        self, out: pd.DataFrame,
+    ) -> tuple[pd.DataFrame, Optional[TransformDiagnostic]]:
+        """Apply ``on_collision`` policy and emit a per-call
+        diagnostic.
 
-        Builds a structured report capped at 10 collision groups
-        (plan §4.4) and stashes it on ``self.last_collision_report``
-        so M5's manifest serializer can include it in the per-scenario
-        warning entry.
+        Returns ``(kept_frame, diagnostic_or_None)``. The diagnostic
+        is ``None`` when the collision policy is ``"error"`` (we
+        raise before returning) or when no rows were actually
+        dropped.
+
+        Diagnostic ``details`` shape (``schema_version="1.0"``):
+
+        - ``on_collision``: the active policy
+        - ``collision_count``: number of dropped rows
+        - ``collision_group_count``: number of distinct duplicate
+          target timestamps
+        - ``examples``: list (capped at 10) of
+          ``{target_ts, source_ts, kept_source_ts, dropped_source_ts}``;
+          values are pd.Timestamp in-memory and stringified by the
+          manifest serializer (M10).
+        - ``examples_truncated``: bool
         """
         # Find duplicate target timestamps, preserving original input
         # order so keep_first / keep_last semantics are well-defined.
         idx = out.index
-        # Group source rows by target timestamp.
         groups: dict[pd.Timestamp, list[int]] = {}
         for pos, ts in enumerate(idx):
             groups.setdefault(ts, []).append(pos)
@@ -462,11 +530,9 @@ class DateShift:
         ]
 
         if not collision_groups:
-            self.last_collision_report = None
-            return out
+            return out, None
 
         if self.on_collision == "error":
-            # Build an error message naming the first few collisions.
             preview = ", ".join(
                 target_ts.strftime("%Y-%m-%d")
                 for target_ts, _ in collision_groups[:5]
@@ -484,9 +550,6 @@ class DateShift:
                 "duplicates explicitly."
             )
 
-        # keep_first / keep_last: build the row-position mask.
-        # Note: groups[target_ts] already follows original input order
-        # because we enumerated `idx` in order.
         keep_positions: set[int] = set()
         dropped_count = 0
         for target_ts, positions in groups.items():
@@ -500,14 +563,8 @@ class DateShift:
             dropped_count += len(positions) - 1
 
         keep_mask = [pos in keep_positions for pos in range(len(idx))]
-        # The source frame `data` was the input to apply(); we already
-        # set `out.index = snapped` so we slice `out` using the
-        # row mask. Original-index reconstruction for the report uses
-        # `idx[pos] - self.offset` which is the source-side timestamp
-        # before snap (close enough for collision diagnostics).
         kept = out.iloc[keep_mask]
 
-        # Build the structured report (plan §4.4). Cap examples at 10.
         examples_capped = collision_groups[:10]
         examples = []
         for target_ts, positions in examples_capped:
@@ -525,15 +582,28 @@ class DateShift:
                 "dropped_source_ts": list(dropped_source),
             })
 
-        self.last_collision_report = {
-            "transform": "DateShift",
-            "on_collision": self.on_collision,
-            "collision_count": dropped_count,
-            "collision_group_count": len(collision_groups),
-            "examples": examples,
-            "examples_truncated": len(collision_groups) > 10,
-        }
-        return kept
+        diagnostic = TransformDiagnostic(
+            code="calendar_snap_collision_rows_dropped",
+            source="DateShift",
+            severity="warning",
+            message=(
+                f"DateShift calendar snapping produced "
+                f"{len(collision_groups)} duplicate target dates; "
+                f"on_collision={self.on_collision!r} dropped "
+                f"{dropped_count} source rows. This changes the "
+                "transformed sample length."
+            ),
+            details={
+                "schema_version": "1.0",
+                "transform": "DateShift",
+                "on_collision": self.on_collision,
+                "collision_count": dropped_count,
+                "collision_group_count": len(collision_groups),
+                "examples": examples,
+                "examples_truncated": len(collision_groups) > 10,
+            },
+        )
+        return kept, diagnostic
 
 
 # ---------- Level transforms ----------
@@ -959,12 +1029,30 @@ class TransformPipeline:
     ) -> pd.DataFrame:
         """Apply transforms in canonical stage order, then validate.
 
+        Backward-compatible v2.0/v2.0.1/v2.0.2 surface — returns the
+        transformed frame only. New v2.1.0 callers wanting per-call
+        diagnostics use :meth:`apply_with_diagnostics`.
+
         Stochastic transforms each receive a deterministically derived
         sub-seed from the given ``seed``. Sub-seeds are spawned in
         **canonical stage order**, not user input order, so two
         pipelines containing the same transforms in different
         user-supplied orders produce byte-identical output for the
         same outer seed.
+        """
+        return self.apply_with_diagnostics(data, seed=seed).data
+
+    def apply_with_diagnostics(
+        self, data: pd.DataFrame, *, seed: Optional[int] = None,
+    ) -> "TransformApplyResult":
+        """Apply transforms and collect per-call diagnostics.
+
+        Plan r4-final §3: manifest warnings derive from the returned
+        diagnostics tuple, never from mutable transform-instance
+        state. Each transform that opts in by implementing
+        ``apply_with_diagnostics`` (currently DateShift) contributes
+        its diagnostics; other transforms fall back to the bare
+        ``apply`` method and contribute nothing extra.
         """
         sorted_transforms = self._stage_sorted()
         rng_seq = np.random.SeedSequence(seed) if seed is not None else None
@@ -975,12 +1063,18 @@ class TransformPipeline:
         )
 
         out = data
+        diagnostics: list[TransformDiagnostic] = []
         for t, child in zip(sorted_transforms, children):
             sub_seed = (
                 int(child.generate_state(1)[0]) if child is not None else None
             )
             try:
-                out = t.apply(out, seed=sub_seed)
+                if hasattr(t, "apply_with_diagnostics"):
+                    sub_result = t.apply_with_diagnostics(out, seed=sub_seed)
+                    out = sub_result.data
+                    diagnostics.extend(sub_result.diagnostics)
+                else:
+                    out = t.apply(out, seed=sub_seed)
             except Exception as e:
                 raise type(e)(
                     f"transform '{t.name}' failed on outer seed={seed} "
@@ -1002,4 +1096,6 @@ class TransformPipeline:
                 f"'{last}' (outer seed={seed}): "
                 + "; ".join(result.errors)
             )
-        return out
+        return TransformApplyResult(
+            data=out, diagnostics=tuple(diagnostics),
+        )
