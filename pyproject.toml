@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aiphaforge"
-version = "2.1.1"
+version = "2.1.2"
 description = "A high-performance backtest engine for AI agent-driven quantitative trading"
 readme = "README.md"
 license = {text = "GPL-3.0-or-later"}

@@ -748,3 +748,61 @@ class TestReplayFingerprint:
             {"close": [100.0, 101.0], "tag": ["x", "Z"]}, index=idx,
         )
         assert _stable_view_fingerprint(a) != _stable_view_fingerprint(b)
+
+    def test_fingerprint_handles_pandas_string_extension_dtype(self):
+        # v2.1.2 regression: pandas 2.2+ may auto-infer
+        # ``StringDtype`` (an ExtensionDtype) for object columns
+        # when ``pd.options.future.infer_string`` is set. The
+        # numpy ``np.issubdtype(..., np.number)`` check raises
+        # ``TypeError`` on extension dtypes; the pandas-aware
+        # ``pd.api.types.is_numeric_dtype`` handles both.
+        # Force the StringDtype regardless of pandas defaults so
+        # this test reproduces the CI failure on every machine.
+        import pandas as pd
+        idx = pd.bdate_range("2024-01-01", periods=2)
+        df = pd.DataFrame(
+            {
+                "close": [100.0, 101.0],
+                "tag": pd.array(["a", "b"], dtype="string"),
+            },
+            index=idx,
+        )
+        assert isinstance(df["tag"].dtype, pd.StringDtype), (
+            "test setup: tag column should be StringDtype"
+        )
+        # Pre-fix: this raised TypeError. Now it returns a stable
+        # hash and reflects content changes.
+        fp1 = _stable_view_fingerprint(df)
+        fp2 = _stable_view_fingerprint(df.copy())
+        assert fp1 == fp2
+
+        df_changed = df.copy()
+        df_changed["tag"] = pd.array(["a", "Z"], dtype="string")
+        assert _stable_view_fingerprint(df_changed) != fp1
+
+    def test_fingerprint_handles_pandas_nullable_int_extension_dtype(self):
+        # v2.1.2: the same ``np.issubdtype(..., np.number)`` call
+        # also crashed on pandas nullable integer/float extension
+        # dtypes (``Int64``, ``Float64``). The pandas-aware
+        # ``pd.api.types.is_numeric_dtype`` correctly classifies
+        # them as numeric. Lock that path with a content-changes
+        # assertion so the numeric branch genuinely runs.
+        import pandas as pd
+        idx = pd.bdate_range("2024-01-01", periods=3)
+        df = pd.DataFrame(
+            {
+                "close": [100.0, 101.0, 102.0],
+                "qty": pd.array([1, 2, 3], dtype="Int64"),
+            },
+            index=idx,
+        )
+        assert isinstance(df["qty"].dtype, pd.Int64Dtype), (
+            "test setup: qty column should be Int64 extension dtype"
+        )
+        fp1 = _stable_view_fingerprint(df)
+        fp2 = _stable_view_fingerprint(df.copy())
+        assert fp1 == fp2
+
+        df_changed = df.copy()
+        df_changed["qty"] = pd.array([1, 2, 99], dtype="Int64")
+        assert _stable_view_fingerprint(df_changed) != fp1
