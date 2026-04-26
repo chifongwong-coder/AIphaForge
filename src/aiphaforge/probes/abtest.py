@@ -377,10 +377,17 @@ def _stable_view_fingerprint(view: pd.DataFrame) -> str:
     # raising.
     for col in view.columns:
         series = view[col]
-        if np.issubdtype(series.dtype, np.number):
+        # v2.1.2: use ``pd.api.types.is_numeric_dtype`` rather than
+        # ``np.issubdtype(..., np.number)``. The numpy check raises
+        # ``TypeError`` on pandas extension dtypes such as
+        # ``StringDtype`` (which pandas 2.2+ auto-infers for object
+        # columns under ``pd.options.future.infer_string``). The
+        # pandas helper handles both numpy and extension dtypes.
+        if pd.api.types.is_numeric_dtype(series.dtype):
             h.update(series.to_numpy(dtype=np.float64).tobytes())
         else:
-            # bool / object / datetime / str — encode the repr.
+            # bool / object / datetime / str / pandas extension —
+            # encode the repr.
             h.update(series.astype(str).str.encode("utf-8").sum())
         h.update(b";")
     return h.hexdigest()[:16]
