@@ -17,6 +17,14 @@ The engine never calls LLMs. Users run their LLM externally and submit
 typed answers / hook-driven decisions back into the probe runners.
 """
 
+from aiphaforge.probes._continuation import (
+    CONTINUATION_TEMPLATES,
+    ContinuationProbe,
+    ContinuationTemplate,
+    NextCloseContinuation,
+    NextRangeContinuation,
+    NextReturnContinuation,
+)
 from aiphaforge.probes._hash_utils import (
     attest_parsing,
     attest_prompt_template,
@@ -86,9 +94,12 @@ __all__ = [
     "ABProbeResult",
     "ABScenario",
     "BarRangePct",
+    "CONTINUATION_TEMPLATES",
     "CloseQuestion",
     "CloseVsOpen",
     "ContextSerializationSpec",
+    "ContinuationProbe",
+    "ContinuationTemplate",
     "DEFAULT_TEMPLATES",
     "ExemplarSpec",
     "GapVsPrevClose",
@@ -97,6 +108,9 @@ __all__ = [
     "LowQuestion",
     "MetricConfig",
     "MetricDropSummary",
+    "NextCloseContinuation",
+    "NextRangeContinuation",
+    "NextReturnContinuation",
     "OpenQuestion",
     "QAProbeReport",
     "QuestionPromptRecord",
