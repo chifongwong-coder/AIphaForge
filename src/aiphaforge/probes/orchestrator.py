@@ -16,7 +16,8 @@ import uuid
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Literal, Optional, Sequence, Union
+from types import MappingProxyType
+from typing import Any, Literal, Mapping, Optional, Sequence, Union
 
 import pandas as pd
 
@@ -488,6 +489,62 @@ _LEAKAGE_INDEX_CAVEAT = (
 )
 
 
+def _parser_used_distribution_is_non_degenerate(
+    parser_used_values: Sequence[str],
+) -> bool:
+    """v2.2.1 #12 Commit C: predicate per r7 §15.
+
+    Returns True iff the distribution contains at least TWO distinct
+    parser-path values (excluding 'unrecognized_parsed_answer_type'
+    which is the type-dispatch failure mode, not a parser path).
+
+    'raw_text_unparseable' IS counted — it's a failed text-parse
+    attempt and still represents LLM-nondeterminism signal.
+
+    Used to gate the informational note emission in
+    _maybe_emit_parser_used_drift_note.
+    """
+    successful = {
+        pu for pu in parser_used_values
+        if pu != "unrecognized_parsed_answer_type"
+    }
+    return len(successful) >= 2
+
+
+def _maybe_emit_parser_used_drift_note(
+    distribution_real: Optional[Mapping[str, int]],
+    distribution_anchor: Optional[Mapping[str, int]],
+    notes: list[str],
+) -> None:
+    """v2.2.1 #12 Commit C (per r7 §15): emit the informational
+    LLM-nondeterminism note iff EITHER side's distribution is
+    non-degenerate. The note text identifies which side(s)
+    drifted so paper readers can interpret without re-deriving.
+    """
+    drifted_sides: list[str] = []
+    if distribution_real is not None and (
+        _parser_used_distribution_is_non_degenerate(
+            list(distribution_real.keys())
+        )
+    ):
+        drifted_sides.append("real")
+    if distribution_anchor is not None and (
+        _parser_used_distribution_is_non_degenerate(
+            list(distribution_anchor.keys())
+        )
+    ):
+        drifted_sides.append("anchor")
+    if drifted_sides:
+        notes.append(
+            f"parser_used distribution is informational; LLM "
+            f"nondeterminism upstream affects both this distribution "
+            f"and bucket counts. Cross-run comparisons should "
+            f"disclose LLM sampling parameters (see "
+            f"KnowledgeCheckReport.manifest.provider_config). "
+            f"Non-degenerate side(s): {drifted_sides}."
+        )
+
+
 def _score_rank_attested(
     question_set: "QuestionSet",
     attested: AttestedAnswers,
@@ -792,6 +849,13 @@ class KnowledgeCheckReport:
     # etc.). None for non-rank probes.
     normalization_preset: Optional[str] = None
 
+    # v2.2.1 #12 Commit C: per-side Counter of parser_used values
+    # for rank probes. None for non-rank probes OR when anchor
+    # side absent. Wrapped in MappingProxyType in __post_init__
+    # to preserve frozen-dataclass immutability per r7 §2.6.
+    parser_used_distribution_real: Optional["Mapping[str, int]"] = None
+    parser_used_distribution_anchor: Optional["Mapping[str, int]"] = None
+
     # v2.2.1 #1: vol-scaling provenance keyed by (question_id, side).
     # side ∈ {"real", "anchor"}. None when no question used vol_scale
     # (e.g., all probes had vol_scale=None tolerance) or when no
@@ -814,6 +878,29 @@ class KnowledgeCheckReport:
                 "is_pillar_summary must remain False — "
                 "KnowledgeCheckReport is a single-pillar diagnostic, "
                 "not a cross-pillar verdict."
+            )
+        # v2.2.1 #12 Commit C: wrap per-side distributions in
+        # MappingProxyType so the frozen-dataclass immutability
+        # claim extends to these mapping fields. Use
+        # object.__setattr__ because frozen blocks direct
+        # assignment.
+        if (self.parser_used_distribution_real is not None
+                and not isinstance(
+                    self.parser_used_distribution_real,
+                    MappingProxyType,
+                )):
+            object.__setattr__(
+                self, "parser_used_distribution_real",
+                MappingProxyType(dict(self.parser_used_distribution_real)),
+            )
+        if (self.parser_used_distribution_anchor is not None
+                and not isinstance(
+                    self.parser_used_distribution_anchor,
+                    MappingProxyType,
+                )):
+            object.__setattr__(
+                self, "parser_used_distribution_anchor",
+                MappingProxyType(dict(self.parser_used_distribution_anchor)),
             )
 
 
@@ -1182,6 +1269,25 @@ def knowledge_check(
         )
         leakage_caveat = _LEAKAGE_INDEX_CAVEAT
 
+    # v2.2.1 #12 Commit C: surface per-side parser_used Counters
+    # (rank probes only) + emit drift note when distributions are
+    # non-degenerate.
+    parser_used_dist_real: Optional[Mapping[str, int]] = None
+    parser_used_dist_anchor: Optional[Mapping[str, int]] = None
+    if isinstance(probe, RankContinuationProbe):
+        if real_parser_counter is not None:
+            parser_used_dist_real = dict(real_parser_counter)
+        # anchor_parser_counter only exists when anchor branch ran;
+        # guard via `try` against NameError when anchor was None.
+        try:
+            if anchor_parser_counter is not None:
+                parser_used_dist_anchor = dict(anchor_parser_counter)
+        except NameError:
+            pass
+        _maybe_emit_parser_used_drift_note(
+            parser_used_dist_real, parser_used_dist_anchor, notes,
+        )
+
     return KnowledgeCheckReport(
         probe_kind=_probe_kind(probe),
         real_score=real_report,
@@ -1222,6 +1328,8 @@ def knowledge_check(
             if isinstance(probe, RankContinuationProbe)
             else None
         ),
+        parser_used_distribution_real=parser_used_dist_real,
+        parser_used_distribution_anchor=parser_used_dist_anchor,
         vol_scale_provenance=(
             vol_scale_provenance if vol_scale_provenance else None
         ),
