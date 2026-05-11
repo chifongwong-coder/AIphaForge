@@ -178,11 +178,20 @@ def sign_test_p(n_pos: int, n_neg: int) -> tuple[float, str]:
         z = (abs(n_pos - n / 2.0) - 0.5) / math.sqrt(n / 4.0)
         p = 2.0 * (1.0 - _phi(z))
         return float(max(0.0, min(1.0, p))), "normal_continuity_corrected"
-    # n >= 40 (or scipy unavailable for n<25 — same fallback)
-    if n >= 25:
-        z = abs(n_pos - n / 2.0) / math.sqrt(n / 4.0)
-    else:
-        z = abs(n_pos - n / 2.0) / math.sqrt(n / 4.0)
+    if n < 25:
+        # v2.2.1 #9: scipy unavailable for n<25 — fall through to
+        # continuity-corrected normal approximation (better small-
+        # sample coverage than uncorrected). r5/r6 had two
+        # identical branches; r7 removes the dead duplication and
+        # uses the correction.
+        z = (abs(n_pos - n / 2.0) - 0.5) / math.sqrt(n / 4.0)
+        p = 2.0 * (1.0 - _phi(z))
+        return (
+            float(max(0.0, min(1.0, p))),
+            "normal_continuity_corrected_fallback",
+        )
+    # n >= 40
+    z = abs(n_pos - n / 2.0) / math.sqrt(n / 4.0)
     p = 2.0 * (1.0 - _phi(z))
     return float(max(0.0, min(1.0, p))), "normal_approximation"
 

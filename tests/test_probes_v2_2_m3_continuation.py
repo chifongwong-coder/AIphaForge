@@ -117,6 +117,10 @@ class TestContinuationProbeBuild:
             assert pd.Timestamp(row["index"]) <= spec.timestamp
 
     def test_question_spec_no_lookahead_in_context(self):
+        # v2.2.1 #8: was `< spec.timestamp + Timedelta(days=1)` which
+        # let the next business day leak through (within 24h on a
+        # bdate index). Now `<= spec.timestamp` per the docstring of
+        # the sibling test test_question_spec_carries_context_window_in_metadata.
         data = _make_bars(n=60)
         probe = ContinuationProbe(
             symbol="AAPL", context_bars=15, forward_horizon=2,
@@ -127,9 +131,27 @@ class TestContinuationProbeBuild:
         for spec in qs:
             ctx = spec.metadata["context_window"]
             for row in ctx:
-                assert pd.Timestamp(row["index"]) < spec.timestamp + (
-                    pd.Timedelta(days=1)
-                )
+                assert pd.Timestamp(row["index"]) <= spec.timestamp
+
+    def test_continuation_context_unchanged_when_future_bar_mutated(self):
+        # v2.2.1 #8 companion: explicitly mutate a bar AFTER the
+        # anchor and assert the context window is unaffected.
+        data = _make_bars(n=60)
+        anchor = data.index[30]
+        probe = ContinuationProbe(
+            symbol="AAPL", context_bars=15, forward_horizon=1,
+            templates=[NextCloseContinuation],
+        )
+        qs_a = list(probe.build(data, [anchor]))
+        ctx_a = qs_a[0].metadata["context_window"]
+        # Mutate bar at index 35 (well past anchor at 30).
+        data_mod = data.copy()
+        data_mod.iloc[35, data_mod.columns.get_loc("close")] = 99999.0
+        qs_b = list(probe.build(data_mod, [anchor]))
+        ctx_b = qs_b[0].metadata["context_window"]
+        # Context windows should be identical.
+        for ra, rb in zip(ctx_a, ctx_b):
+            assert ra["close"] == rb["close"]
 
     def test_context_window_size_matches_context_bars_kwarg(self):
         data = _make_bars(n=60)

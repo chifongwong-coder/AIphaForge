@@ -85,10 +85,9 @@ def estimate_sigma(
     high = bars["high"].astype(float).to_numpy()
     low = bars["low"].astype(float).to_numpy()
     close = bars["close"].astype(float).to_numpy()
+    has_open = "open" in bars.columns
     open_ = (
-        bars["open"].astype(float).to_numpy()
-        if "open" in bars.columns
-        else close
+        bars["open"].astype(float).to_numpy() if has_open else close
     )
 
     provenance: dict[str, Any] = {
@@ -98,6 +97,19 @@ def estimate_sigma(
     }
 
     method_used = method
+
+    # v2.2.1 #10: when method='garman_klass' but `open` column is
+    # missing, GK silently falls back to using close (zeroing the
+    # log(C/O) overnight term). This produces a quietly biased σ
+    # with no provenance flag. r7 fix: fall back to Parkinson
+    # (which uses only intra-bar H/L and doesn't need open) and
+    # record the fallback in provenance.
+    if method == "garman_klass" and not has_open:
+        method_used = "parkinson"
+        provenance["garman_klass_missing_open_fallback"] = (
+            "open column missing; Garman-Klass requires log(C/O); "
+            "falling back to parkinson which uses only intra-bar H/L."
+        )
 
     # H==L fallback decision for parkinson / garman_klass.
     if method in ("parkinson", "garman_klass"):
