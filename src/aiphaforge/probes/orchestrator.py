@@ -15,7 +15,7 @@ import math
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Optional, Sequence, Union
+from typing import Any, Literal, Optional, Sequence, Union
 
 import pandas as pd
 
@@ -398,6 +398,76 @@ _PERSISTENCE_CAVEAT = (
     "with anchor_vs_real (LLM-vs-LLM). Interpret p-values within "
     "their respective comparison classes."
 )
+# v2.2.1 #7: hardcoded ordinal weighting for scalar_leakage_index.
+# Locked v2.2.1; changing requires __version__ bump per §14
+# stability commitment.
+_BUCKET_ORDINAL_WEIGHTS = {
+    "exact": 4.0, "near": 3.0, "rough": 2.0, "miss": 1.0, "invalid": 0.0,
+}
+_LEAKAGE_INDEX_CAVEAT = (
+    "scalar_leakage_index is a point estimate with hardcoded "
+    "ordinal weighting (exact=4, near=3, rough=2, miss=1, "
+    "invalid=0). Range [-4, +4]. SE accounts for paired correlation "
+    "via per-question differences. Approximate significance: |z| >= "
+    "1.96 corresponds to two-sided p < 0.05. For full inferential "
+    "rigor, see bucket_delta_tango_ci. COMPARABILITY: comparable "
+    "WITHIN a single probe type AND configuration. NOT comparable "
+    "across probe types or across ToleranceProfile configurations "
+    "even within the same probe type, because bucket calibration "
+    "differs (e.g., vol-scaled vs fixed-band exact thresholds map "
+    "to different actual band widths). SENTINEL Z: when _z is a "
+    "sentinel ('positive_infinite'/'negative_infinite'), the "
+    "underlying scalar_leakage_index magnitude is the comparable "
+    "quantity; sentinel equality across reports is NOT evidence "
+    "of equivalent effect size. SINGLE-RECORD DIAGNOSTIC: when N "
+    "== 1 for either side, drift cannot be detected from one "
+    "observation; rerun with N >= 2 if cross-run nondeterminism "
+    "signal is needed. Comparing across aiphaforge versions is "
+    "only valid when the weighting is unchanged — this version: "
+    "v2.2.1."
+)
+
+
+def _compute_scalar_leakage_index_and_z(
+    paired_bands: list[tuple[str, str]],
+) -> tuple[Optional[float], Optional[float], Union[
+    float, Literal["positive_infinite", "negative_infinite"], None
+]]:
+    """Compute (index, h0_se, z) from paired (real_band, anchor_band).
+
+    index = mean(d_i) where d_i = w(real_i) - w(anchor_i).
+    h0_se = sqrt(var(d_i, ddof=1) / N) — paired-difference SE.
+    z = index / h0_se when SE > eps; else typed sentinel.
+
+    All None when paired_bands is empty.
+    """
+    import math as _math
+    n = len(paired_bands)
+    if n == 0:
+        return None, None, None
+    diffs = [
+        _BUCKET_ORDINAL_WEIGHTS.get(rb, 0.0)
+        - _BUCKET_ORDINAL_WEIGHTS.get(ab, 0.0)
+        for rb, ab in paired_bands
+    ]
+    index = sum(diffs) / n
+    if n < 2:
+        # Single record: SE undefined. Index defined but SE/z None.
+        return float(index), None, None
+    mean = index
+    var = sum((d - mean) ** 2 for d in diffs) / (n - 1)
+    se = _math.sqrt(var / n)
+    eps_se = 1e-15
+    eps_index = 1e-12
+    if se > eps_se:
+        z: Union[float, str, None] = float(index / se)
+    elif abs(index) < eps_index:
+        z = None  # 0/0
+    elif index > 0:
+        z = "positive_infinite"
+    else:
+        z = "negative_infinite"
+    return float(index), float(se), z
 
 
 @dataclass(frozen=True)
@@ -443,11 +513,25 @@ class KnowledgeCheckReport:
     prompt_template_hash: str
     prompt_template_description: str
 
-    # Run-to-run drift support
-    report_uuid: str
-    wall_clock_utc: str
+    # v2.2.1 #7: scalar leakage index + paired SE + z (typed
+    # sentinel for SE==0). Range [-4, +4]. Point estimate; for
+    # inference use bucket_delta_tango_ci. Computed for ALL
+    # probe types (KnowledgeProbe, ContinuationProbe,
+    # RankContinuationProbe). None when no anchor.
+    scalar_leakage_index: Optional[float] = None
+    scalar_leakage_index_h0_se: Optional[float] = None
+    scalar_leakage_index_z: Union[
+        float,
+        Literal["positive_infinite", "negative_infinite"],
+        None,
+    ] = None
+    leakage_index_caveat: Optional[str] = None
 
-    notes: tuple[str, ...]
+    # Run-to-run drift support
+    report_uuid: str = ""
+    wall_clock_utc: str = ""
+
+    notes: tuple[str, ...] = ()
 
     is_pillar_summary: bool = False  # ENFORCED False
 
@@ -475,9 +559,6 @@ def knowledge_check(
     anchor_answers: Optional[AttestedAnswers] = None,
     manifest: Optional[dict[str, Any]] = None,
     provider_config: Optional[dict] = None,
-    n_anchor_bootstrap: int = 0,
-    bootstrap_seed: Optional[int] = None,
-    bootstrap_unit: str = "anchor",
     refusal_rate_threshold: float = 0.5,
     exemplar_pairs: Optional[Sequence[tuple[str, pd.Timestamp]]] = None,
 ) -> KnowledgeCheckReport:
@@ -487,14 +568,22 @@ def knowledge_check(
     produce the same report (UUID and wall_clock_utc aside, which
     are metadata not part of the diagnostic).
 
+    v2.2.1 #7: removed the unused ``n_anchor_bootstrap`` /
+    ``bootstrap_seed`` / ``bootstrap_unit`` parameters. The r5/r6
+    design moved away from a single ``score_minus_anchor`` scalar
+    to per-bucket Tango CIs + paired sign test; the bootstrap loop
+    was never implemented and the parameters shipped as misleading
+    API surface. Inferential primitives are now: per-bucket Tango
+    CIs (``bucket_delta_tango_ci``), paired sign test
+    (``paired_sign_test_p``), and the new scalar ``scalar_leakage_index``
+    + ``scalar_leakage_index_z`` per § 7.2.
+
     Refuses (raises ValueError) when:
       - provider_config is None or missing any required key.
       - anchor_answers without anchor (or vice versa).
       - parsing_schema_hash or prompt_template_hash mismatch between
         what the probe was built for and what AttestedAnswers carry
         (NOT enforced at this layer — the caller's responsibility).
-      - n_anchor_bootstrap > 0 without bootstrap_seed.
-      - n_anchor_bootstrap > 0 without anchor.
       - exemplar_pairs overlap with the test (symbol, timestamp) set.
     """
     # ---- validation ----
@@ -510,15 +599,6 @@ def knowledge_check(
             "anchor and anchor_answers must both be supplied or "
             "both omitted"
         )
-    if n_anchor_bootstrap > 0:
-        if anchor is None:
-            raise ValueError(
-                "n_anchor_bootstrap > 0 requires anchor"
-            )
-        if bootstrap_seed is None:
-            raise ValueError(
-                "n_anchor_bootstrap > 0 requires bootstrap_seed"
-            )
 
     # ---- exemplar disjointness on (symbol, timestamp) tuples ----
     if exemplar_pairs:
@@ -713,19 +793,8 @@ def knowledge_check(
             sign_test_n_neg = paired_neg
             sign_test_n_ties = paired_ties
 
-    if bootstrap_unit not in ("anchor", "question"):
-        raise ValueError(
-            f"bootstrap_unit must be 'anchor' or 'question'; "
-            f"got {bootstrap_unit!r}"
-        )
-    if bootstrap_unit == "question":
-        notes.append(
-            "bootstrap_unit=question selected; CI is anti-conservative — "
-            "true CI width depends on intra-anchor correlation among "
-            "questions and may be much narrower than nominal. See "
-            "plan §7.2.3 and consider bootstrap_unit='anchor' for "
-            "paper-grade inference."
-        )
+    # v2.2.1 #7: bootstrap_unit validation block removed (dead
+    # parameter — no bootstrap loop was ever implemented).
 
     # ---- persistence baseline (continuation only) ----
     persistence_report: Optional[QAProbeReport] = None
@@ -775,6 +844,24 @@ def knowledge_check(
 
     notes.insert(0, _NON_TRANSITIVITY_NOTE)
 
+    # v2.2.1 #7: scalar leakage index + paired SE + z. Computed
+    # only when anchor present AND validity is OK (paired bands
+    # available); else all None.
+    scalar_index: Optional[float] = None
+    scalar_index_se: Optional[float] = None
+    scalar_index_z: Union[
+        float,
+        Literal["positive_infinite", "negative_infinite"],
+        None,
+    ] = None
+    leakage_caveat: Optional[str] = None
+    if anchor_report is not None and anchor_validity == "OK":
+        # Reuse the qid-paired bands computed for Tango/sign-test.
+        scalar_index, scalar_index_se, scalar_index_z = (
+            _compute_scalar_leakage_index_and_z(paired)
+        )
+        leakage_caveat = _LEAKAGE_INDEX_CAVEAT
+
     return KnowledgeCheckReport(
         probe_kind=_probe_kind(probe),
         real_score=real_report,
@@ -806,6 +893,10 @@ def knowledge_check(
         parsing_schema_description=answers.parsing_schema_description,
         prompt_template_hash=answers.prompt_template_hash,
         prompt_template_description=answers.prompt_template_description,
+        scalar_leakage_index=scalar_index,
+        scalar_leakage_index_h0_se=scalar_index_se,
+        scalar_leakage_index_z=scalar_index_z,
+        leakage_index_caveat=leakage_caveat,
         report_uuid=str(uuid.uuid4()),
         wall_clock_utc=datetime.now(timezone.utc).isoformat(),
         notes=tuple(notes),

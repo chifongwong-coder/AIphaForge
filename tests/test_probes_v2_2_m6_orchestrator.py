@@ -360,30 +360,27 @@ class TestKnowledgeCheckBadCombos:
                 provider_config=_provider_config(),
             )
 
-    def test_n_bootstrap_without_seed_raises(self):
+    def test_n_bootstrap_kwargs_removed_in_v2_2_1(self):
+        # v2.2.1 #7: n_anchor_bootstrap / bootstrap_seed /
+        # bootstrap_unit removed from knowledge_check signature.
+        # The dead parameters were never wired to any actual
+        # bootstrap loop. Passing them now raises TypeError
+        # (unexpected keyword argument).
         data, probe, anchors, attested = self._setup()
-        anchor_data = build_synthetic_anchor(
-            data, seed=2, method="random_walk_volmatched",
-        )
-        anchor_qs = probe.build(anchor_data, anchors)
-        anchor_attested = _build_perfect_attested(anchor_qs)
-        with pytest.raises(ValueError, match="bootstrap_seed"):
+        with pytest.raises(TypeError, match="n_anchor_bootstrap"):
             knowledge_check(
                 probe, data, anchors, attested,
-                anchor=anchor_data, anchor_answers=anchor_attested,
                 provider_config=_provider_config(),
-                n_anchor_bootstrap=10,
-                bootstrap_seed=None,
+                n_anchor_bootstrap=10,  # type: ignore[call-arg]
             )
 
-    def test_n_bootstrap_without_anchor_raises(self):
+    def test_bootstrap_seed_kwarg_removed_in_v2_2_1(self):
         data, probe, anchors, attested = self._setup()
-        with pytest.raises(ValueError, match="anchor"):
+        with pytest.raises(TypeError, match="bootstrap_seed"):
             knowledge_check(
                 probe, data, anchors, attested,
                 provider_config=_provider_config(),
-                n_anchor_bootstrap=10,
-                bootstrap_seed=42,
+                bootstrap_seed=42,  # type: ignore[call-arg]
             )
 
     def test_overlapping_exemplar_pairs_raises(self):
