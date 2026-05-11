@@ -46,6 +46,7 @@ from aiphaforge.probes.models import (
     QuestionSpec,
     ScenarioABReport,
     ToleranceProfile,
+    VolScalingSpec,
 )
 from aiphaforge.probes.questions import (
     DEFAULT_TEMPLATES,
@@ -106,6 +107,7 @@ __all__ = [
     "ReturnSign",
     "ScenarioABReport",
     "ToleranceProfile",
+    "VolScalingSpec",
     "DEFAULT_METRIC_CONFIG",
     "DEFAULT_METRICS",
     "MACrossBaseline",

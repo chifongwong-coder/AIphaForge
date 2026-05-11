@@ -29,6 +29,49 @@ AgentContract = Literal[
 
 # ---------- Q&A probe ----------
 
+@dataclass(frozen=True)
+class VolScalingSpec:
+    """v2.2 (M2): scale numeric tolerance bands by realized volatility.
+
+    σ is the per-bar log-return volatility, estimated **causally**:
+
+    - Point-in-time questions: σ from bars ``< answer_timestamp``.
+    - Continuation questions: σ from bars
+      ``≤ context_window[-1].timestamp``. For ``forward_horizon > 1``,
+      σ is held fixed at the last context bar (decision-time σ).
+
+    See ``docs/plans/v2.2-plan-r6.md`` § 3.
+    """
+
+    window: int = 20
+    method: str = "auto"  # auto | parkinson | garman_klass | stdev_returns
+    near_factor: float = 1.0
+    rough_factor: float = 2.0
+    miss_floor_factor: float = 5.0
+    log_returns: bool = True
+
+    def __post_init__(self):
+        if not (
+            self.near_factor < self.rough_factor
+            <= self.miss_floor_factor
+        ):
+            raise ValueError(
+                f"VolScalingSpec band factors must be monotone: near "
+                f"({self.near_factor}) < rough ({self.rough_factor}) "
+                f"<= miss_floor ({self.miss_floor_factor})"
+            )
+        if self.window < 2:
+            raise ValueError(
+                f"VolScalingSpec.window must be >= 2; got {self.window}"
+            )
+        allowed = {"auto", "parkinson", "garman_klass", "stdev_returns"}
+        if self.method not in allowed:
+            raise ValueError(
+                f"VolScalingSpec.method={self.method!r} not in "
+                f"{sorted(allowed)}"
+            )
+
+
 @dataclass
 class ToleranceProfile:
     """Numeric scoring tolerance for a single question template.
@@ -39,6 +82,11 @@ class ToleranceProfile:
     Built-in numeric templates MUST set a non-None ``max_range_width``
     (recommended default: ``4 * rough_range_width``) so anti-gaming
     protection is on by default.
+
+    v2.2 (M2): optional ``vol_scale`` enables per-question
+    vol-scaled bands. The asset-class preset name (``preset_name``)
+    determines the default vol estimator when ``vol_scale.method``
+    is ``"auto"``.
     """
 
     absolute_floor: float
@@ -51,6 +99,8 @@ class ToleranceProfile:
     max_range_width: Optional[float] = None
     sign_sensitive: bool = False
     sign_epsilon: float = 0.0
+    vol_scale: Optional["VolScalingSpec"] = None
+    preset_name: Optional[str] = None  # set by classmethod presets
 
     # ---------- v2.0.1 per-asset-class presets ----------
     # Each asset class ships in two flavors:
@@ -72,6 +122,7 @@ class ToleranceProfile:
             exact_threshold=0.005, near_threshold=0.02, rough_threshold=0.05,
             exact_range_width=0.005, near_range_width=0.02,
             rough_range_width=0.05, max_range_width=0.20,
+            preset_name="us_equity_price",
         )
 
     @classmethod
@@ -82,6 +133,7 @@ class ToleranceProfile:
             exact_threshold=0.0001, near_threshold=0.005, rough_threshold=0.02,
             exact_range_width=0.0001, near_range_width=0.005,
             rough_range_width=0.02, max_range_width=0.08,
+            preset_name="us_equity_price_strict",
         )
 
     @classmethod
@@ -92,6 +144,7 @@ class ToleranceProfile:
             exact_threshold=0.01, near_threshold=0.05, rough_threshold=0.15,
             exact_range_width=0.01, near_range_width=0.05,
             rough_range_width=0.15, max_range_width=0.60,
+            preset_name="crypto_price",
         )
 
     @classmethod
@@ -102,6 +155,7 @@ class ToleranceProfile:
             exact_threshold=0.0005, near_threshold=0.01, rough_threshold=0.05,
             exact_range_width=0.0005, near_range_width=0.01,
             rough_range_width=0.05, max_range_width=0.20,
+            preset_name="crypto_price_strict",
         )
 
     @classmethod
@@ -112,6 +166,7 @@ class ToleranceProfile:
             exact_threshold=0.0025, near_threshold=0.01, rough_threshold=0.03,
             exact_range_width=0.0025, near_range_width=0.01,
             rough_range_width=0.03, max_range_width=0.12,
+            preset_name="futures_price",
         )
 
     @classmethod
@@ -122,6 +177,7 @@ class ToleranceProfile:
             exact_threshold=0.00005, near_threshold=0.0025, rough_threshold=0.01,
             exact_range_width=0.00005, near_range_width=0.0025,
             rough_range_width=0.01, max_range_width=0.04,
+            preset_name="futures_price_strict",
         )
 
     @classmethod
@@ -132,6 +188,7 @@ class ToleranceProfile:
             exact_threshold=0.05, near_threshold=0.15, rough_threshold=0.30,
             exact_range_width=0.05, near_range_width=0.15,
             rough_range_width=0.30, max_range_width=1.20,
+            preset_name="penny_stock_price",
         )
 
     @classmethod
@@ -142,6 +199,7 @@ class ToleranceProfile:
             exact_threshold=0.005, near_threshold=0.05, rough_threshold=0.15,
             exact_range_width=0.005, near_range_width=0.05,
             rough_range_width=0.15, max_range_width=0.60,
+            preset_name="penny_stock_price_strict",
         )
 
 
