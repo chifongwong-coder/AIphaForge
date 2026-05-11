@@ -37,6 +37,7 @@ from aiphaforge.probes.abtest import (
     MomentumBaseline,
     run_ab_probe,
 )
+from aiphaforge.probes.anchors import build_synthetic_anchor
 from aiphaforge.probes.models import (
     ABProbeResult,
     ABScenario,
@@ -130,6 +131,7 @@ __all__ = [
     "aggregate_scores",
     "attest_parsing",
     "attest_prompt_template",
+    "build_synthetic_anchor",
     "build_question_set",
     "build_question_sets_multi",
     "normalize_binary",
