@@ -191,12 +191,19 @@ class AnswerKeyRecord:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass
+@dataclass(frozen=True)
 class AnswerRecord:
     """User-submitted answer to a single question.
 
     The engine does not see the LLM prompt or reply text. It only
     consumes typed parsed answers plus a parse-status flag.
+
+    v2.2 (M1): switched to ``frozen=True`` so ``AttestedAnswers``'
+    immutability claim is real (was ``@dataclass`` mutable in v2.0).
+    No in-tree caller mutated AnswerRecord fields; the frozen switch
+    is non-breaking but the migration test
+    (``test_answer_record_no_in_tree_mutation``) is a one-shot
+    safety net for any indirect mutation we missed.
     """
 
     question_id: str
@@ -206,9 +213,14 @@ class AnswerRecord:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass
+@dataclass(frozen=True)
 class QuestionScore:
-    """Per-question scoring result."""
+    """Per-question scoring result.
+
+    v2.2 (M1): switched to ``frozen=True`` for the same reason as
+    AnswerRecord — needed for downstream containers to be reliably
+    immutable.
+    """
 
     question_id: str
     validity: Literal["valid", "invalid", "missing", "refusal"]
@@ -220,6 +232,125 @@ class QuestionScore:
     range_width_ratio: Optional[float]
     max_range_width_exceeded: Optional[bool]
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+# ---------- v2.2 M1: AttestedAnswers + closed-schema specs ----------
+
+
+@dataclass(frozen=True)
+class ContextSerializationSpec:
+    """Closed schema for context-window serialization.
+
+    Used in ``attest_prompt_template`` to canonicalize the bytes
+    a user shows to the LLM. Unknown keys are not allowed; reject-on-
+    construction prevents silent extension that would invisibly
+    change ``prompt_template_hash`` semantics.
+
+    See ``docs/plans/v2.2-plan-r6.md`` § 2.3.3.
+    """
+
+    format: str  # csv | json | markdown_table
+    columns: tuple[str, ...]
+    timestamp_format: str  # iso_utc_seconds | iso_utc_minutes | epoch_seconds
+    timestamp_timezone: str  # IANA tz; "UTC" required v2.2
+    price_precision: int
+    volume_precision: int
+    nan_rendering: str  # empty | literal_nan | skip_row
+    line_terminator: str  # lf | crlf
+    decimal_separator: str  # "." | ","
+    rounding_mode: str  # half_even | half_up
+    trailing_zero_policy: str  # preserve | strip
+    scientific_notation_threshold: Optional[float]
+    negative_format: str  # minus_prefix | parens
+    csv_quoting: str = "minimal"  # minimal | all | nonnumeric
+    csv_quote_char: str = '"'  # locked to '"' for v2.2
+    csv_field_separator: str = ","
+    json_bool_format: str = "lowercase"  # lowercase | python | numeric
+    json_inf_format: str = "string_infinity"  # string_infinity | reject | null
+    columns_strict: bool = True
+
+    def __post_init__(self):
+        allowed = {
+            "format": {"csv", "json", "markdown_table"},
+            "timestamp_format": {
+                "iso_utc_seconds", "iso_utc_minutes", "epoch_seconds",
+            },
+            "nan_rendering": {"empty", "literal_nan", "skip_row"},
+            "line_terminator": {"lf", "crlf"},
+            "decimal_separator": {".", ","},
+            "rounding_mode": {"half_even", "half_up"},
+            "trailing_zero_policy": {"preserve", "strip"},
+            "negative_format": {"minus_prefix", "parens"},
+            "csv_quoting": {"minimal", "all", "nonnumeric"},
+            "json_bool_format": {"lowercase", "python", "numeric"},
+            "json_inf_format": {"string_infinity", "reject", "null"},
+        }
+        for fname, allowed_set in allowed.items():
+            v = getattr(self, fname)
+            if v not in allowed_set:
+                raise ValueError(
+                    f"{fname}={v!r} not in {sorted(allowed_set)}"
+                )
+        if self.timestamp_timezone != "UTC":
+            raise ValueError(
+                "v2.2 requires UTC timestamps — pass an upstream "
+                "tz-converter if your data is local-time"
+            )
+        if self.csv_quote_char != '"':
+            raise ValueError(
+                "csv_quote_char locked to '\"' in v2.2"
+            )
+        # Combinatorial guard: ',' decimal + ',' field separator
+        # would collide on CSV.
+        if (
+            self.format == "csv"
+            and self.decimal_separator == ","
+            and self.csv_field_separator == ","
+        ):
+            raise ValueError(
+                "decimal_separator=',' collides with "
+                "csv_field_separator=','; pick a different field "
+                "separator (e.g., ';' or '\\t')"
+            )
+
+
+@dataclass(frozen=True)
+class ExemplarSpec:
+    """Closed schema for a single few-shot exemplar.
+
+    Free-form dict exemplars are rejected at attestation time
+    because two users with semantically identical exemplars but
+    different key naming (``"answer"`` vs ``"target"``) would
+    produce different ``prompt_template_hash`` silently.
+
+    ``metadata`` is an opaque string (not a dict) — recorded
+    verbatim in the hash so accidental drift is visible but
+    structure is the user's responsibility.
+    """
+
+    prompt_text: str
+    answer_text: str
+    source_symbol: Optional[str] = None
+    source_timestamp_iso: Optional[str] = None
+    metadata: str = ""
+
+
+@dataclass(frozen=True)
+class AttestedAnswers:
+    """User-attested answers + the parsing schema AND prompt template
+    that produced them.
+
+    Two ``AttestedAnswers`` objects are score-comparable iff both
+    ``parsing_schema_hash`` and ``prompt_template_hash`` match.
+    Both hashes are user-supplied via the ``attest_parsing`` and
+    ``attest_prompt_template`` helpers in ``probes/_hash_utils.py``.
+    """
+
+    answers: tuple[AnswerRecord, ...]
+    parsing_schema_hash: str
+    parsing_schema_description: str
+    prompt_template_hash: str
+    prompt_template_description: str
 
 
 class TemplateAggregate(TypedDict):
@@ -289,6 +420,13 @@ class QAProbeReport:
     by_period: Optional["pd.DataFrame"]
     question_scores: list[QuestionScore]
     manifest: dict[str, Any]
+    # v2.2 (M1): attestation hashes — populated when scoring runs
+    # via ``score_attested_answers``; ``None`` when scoring runs via
+    # the back-compat ``score_answer_file`` path. ``None`` reports
+    # carry a ``notes`` warning that they are not score-comparable
+    # to attested reports.
+    parsing_schema_hash: Optional[str] = None
+    prompt_template_hash: Optional[str] = None
 
 
 # ---------- A/B probe ----------

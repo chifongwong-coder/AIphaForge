@@ -28,6 +28,7 @@ from typing import Any, Literal, Optional, Sequence, Union
 
 from aiphaforge.probes.models import (
     AnswerRecord,
+    AttestedAnswers,
     QAProbeReport,
     QuestionScore,
     QuestionSpec,
@@ -954,7 +955,68 @@ def score_answer_file(
                 metadata=obj.get("metadata", {}) or {},
             )
             scores.append(score_question(qs, ans))
-    return aggregate_scores(question_set, scores, manifest=merged_manifest)
+    report = aggregate_scores(
+        question_set, scores, manifest=merged_manifest
+    )
+    # Back-compat path: hashes are unset; warn in notes-style entry
+    # appended to manifest so downstream aggregation can surface it.
+    if "warnings" not in report.manifest:
+        report.manifest["warnings"] = []
+    report.manifest["warnings"].append(
+        "score_answer_file path used; parsing_schema_hash and "
+        "prompt_template_hash are None. This report is NOT "
+        "score-comparable to attested reports. Use "
+        "score_attested_answers for paper-grade reproducibility."
+    )
+    return report
+
+
+def score_attested_answers(
+    question_set: "QuestionSet",
+    attested: "AttestedAnswers",
+    *,
+    manifest: Optional[dict[str, Any]] = None,
+    provider_config: Optional[dict[str, Any]] = None,
+) -> tuple["QAProbeReport", str, str]:
+    """Score an :class:`AttestedAnswers` bundle.
+
+    v2.2 (M1) attestation entry point. Returns a tuple of
+    ``(report, parsing_schema_hash, prompt_template_hash)`` where
+    the hashes are copied from ``attested`` for caller convenience
+    and the report's own hash fields are populated identically.
+
+    Two reports produced by this function are score-comparable iff
+    their two returned hashes match (a necessary condition; the full
+    contract additionally requires identical
+    ``provider_config["model_id"]`` etc., which becomes mandatory
+    when M6's ``knowledge_check`` orchestrator wraps this call).
+    """
+    merged_manifest, _ = _merge_provider_config(
+        manifest, provider_config
+    )
+    qs_by_id = {q.question_id: q for q in question_set}
+    scores: list[QuestionScore] = []
+    for ans in attested.answers:
+        qs = qs_by_id.get(ans.question_id)
+        if qs is None:
+            # Same convention as score_answer_file — silently skip
+            # records not in this question set (cross-question-set
+            # answer pools are common).
+            continue
+        scores.append(score_question(qs, ans))
+    report = aggregate_scores(
+        question_set, scores, manifest=merged_manifest
+    )
+    # Re-pack with the attestation hashes. ``QAProbeReport`` is a
+    # dataclass with default-None hash fields; we use ``replace``
+    # to set them without rebuilding the whole object.
+    from dataclasses import replace
+    report = replace(
+        report,
+        parsing_schema_hash=attested.parsing_schema_hash,
+        prompt_template_hash=attested.prompt_template_hash,
+    )
+    return report, attested.parsing_schema_hash, attested.prompt_template_hash
 
 
 # Re-export a couple of utilities for users wiring their own scorers.
@@ -966,6 +1028,7 @@ __all__ = [
     "parse_choice_answer",
     "parse_numeric_answer",
     "score_answer_file",
+    "score_attested_answers",
     "score_question",
 ]
 

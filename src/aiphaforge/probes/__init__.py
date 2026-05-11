@@ -17,6 +17,10 @@ The engine never calls LLMs. Users run their LLM externally and submit
 typed answers / hook-driven decisions back into the probe runners.
 """
 
+from aiphaforge.probes._hash_utils import (
+    attest_parsing,
+    attest_prompt_template,
+)
 from aiphaforge.probes.abtest import (
     DEFAULT_METRIC_CONFIG,
     DEFAULT_METRICS,
@@ -31,6 +35,9 @@ from aiphaforge.probes.models import (
     AgentContract,
     AnswerKeyRecord,
     AnswerRecord,
+    AttestedAnswers,
+    ContextSerializationSpec,
+    ExemplarSpec,
     MetricConfig,
     MetricDropSummary,
     QAProbeReport,
@@ -65,6 +72,7 @@ from aiphaforge.probes.scoring import (
     parse_choice_answer,
     parse_numeric_answer,
     score_answer_file,
+    score_attested_answers,
     score_question,
     serialize_answer_records,
 )
@@ -73,12 +81,15 @@ __all__ = [
     "AgentContract",
     "AnswerKeyRecord",
     "AnswerRecord",
+    "AttestedAnswers",
     "ABProbeResult",
     "ABScenario",
     "BarRangePct",
     "CloseQuestion",
     "CloseVsOpen",
+    "ContextSerializationSpec",
     "DEFAULT_TEMPLATES",
+    "ExemplarSpec",
     "GapVsPrevClose",
     "HighQuestion",
     "KnowledgeProbe",
@@ -101,6 +112,8 @@ __all__ = [
     "MeanRevBaseline",
     "MomentumBaseline",
     "aggregate_scores",
+    "attest_parsing",
+    "attest_prompt_template",
     "build_question_set",
     "build_question_sets_multi",
     "normalize_binary",
@@ -111,6 +124,7 @@ __all__ = [
     "run_ab_probe",
     "sample_dates",
     "score_answer_file",
+    "score_attested_answers",
     "score_question",
     "serialize_answer_records",
 ]
