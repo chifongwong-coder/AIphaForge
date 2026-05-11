@@ -335,6 +335,33 @@ def _z_for_confidence(confidence: float) -> float:
 # ---------- Joint effective-rate computation ----------
 
 
+def _is_structured_rank_input(x: Any) -> bool:
+    """v2.2.1 #12 Commit B: predicate matching paths 1-3 of
+    resolve_rank_answer's priority chain.
+
+    Returns True if ``x`` is a structured answer payload that
+    bypasses the refusal heuristic (user has already done the
+    parsing work).
+
+    Applies across ALL probe types (not rank-only). For a
+    KnowledgeProbe whose parsed_answer happens to be a list[str],
+    the carve-out skips refusal detection. Rationale: structured
+    input means the user already extracted the answer from raw
+    text; the engine's refusal heuristic on raw_answer is moot.
+    """
+    from aiphaforge.probes._rank import (
+        RankAnswer,
+        _is_sequence_of_str,
+    )
+    if isinstance(x, RankAnswer):
+        return True
+    if _is_sequence_of_str(x):
+        return True
+    if isinstance(x, dict) and _is_sequence_of_str(x.get("ranking")):
+        return True
+    return False
+
+
 def compute_effective_rate(records: Sequence[AnswerRecord]) -> float:
     """Joint P(parsed AND not refused), computed per-AnswerRecord.
 
@@ -342,12 +369,22 @@ def compute_effective_rate(records: Sequence[AnswerRecord]) -> float:
     `parse_success * (1 - refusal_rate)` because that formula
     double-discounts answers that BOTH fail parse AND look like
     refusal (the common case for paragraph refusals).
+
+    v2.2.1 #12 Commit B: structured-input carve-out — when
+    rec.parsed_answer is a RankAnswer / Sequence[str] / dict-with-
+    ranking, skip the refusal heuristic on raw_answer (user
+    already did the parsing).
     """
     n_total = len(records)
     if n_total == 0:
         return 0.0
     n_eff = 0
     for rec in records:
+        if _is_structured_rank_input(rec.parsed_answer):
+            # Structured input — counted as effective regardless of
+            # raw_answer content.
+            n_eff += 1
+            continue
         parsed = (rec.parsed_answer is not None
                   and rec.parse_status == "valid")
         refused = looks_like_refusal(rec.raw_answer or "")
@@ -357,11 +394,18 @@ def compute_effective_rate(records: Sequence[AnswerRecord]) -> float:
 
 
 def compute_refusal_rate(records: Sequence[AnswerRecord]) -> float:
-    """Fraction of AnswerRecords whose raw_answer looks like refusal."""
+    """Fraction of AnswerRecords whose raw_answer looks like refusal.
+
+    v2.2.1 #12 Commit B: structured-input carve-out — records with
+    structured parsed_answer are NOT counted as refusals regardless
+    of raw_answer content.
+    """
     if not records:
         return 0.0
     return sum(
-        1 for r in records if looks_like_refusal(r.raw_answer or "")
+        1 for r in records
+        if not _is_structured_rank_input(r.parsed_answer)
+        and looks_like_refusal(r.raw_answer or "")
     ) / len(records)
 
 
