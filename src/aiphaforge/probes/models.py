@@ -203,9 +203,23 @@ class ToleranceProfile:
         )
 
 
-@dataclass
+@dataclass(frozen=True)
 class QuestionSpec:
-    """A single probe question, with truth value, before export."""
+    """A single probe question, with truth value, before export.
+
+    v2.2.1 (Issue #11): switched to ``frozen=True`` so the M1
+    contract claim ('attestation containers immutable') extends
+    transitively. Verified by grep — no in-tree caller mutates
+    QuestionSpec fields.
+
+    The vol-scale wiring in M6 produces a vol-scaled spec via
+    ``dataclasses.replace(qs, tolerance=...)``, which works on
+    frozen dataclasses.
+
+    ``metadata: dict`` is shallow-immutable (the field reference
+    is frozen, the dict contents are not). Deep immutability of
+    metadata is paper-grade hardening deferred to v2.3+.
+    """
 
     question_id: str
     symbol: str
