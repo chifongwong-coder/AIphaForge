@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import math
 import uuid
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Literal, Optional, Sequence, Union
@@ -23,6 +24,8 @@ from aiphaforge.probes._continuation import ContinuationProbe
 from aiphaforge.probes._hash_utils import _normalize_for_hash
 from aiphaforge.probes._rank import (
     RankContinuationProbe,
+    resolve_rank_answer,
+    score_rank_answer,
 )
 from aiphaforge.probes.models import (
     AnswerRecord,
@@ -441,6 +444,123 @@ _LEAKAGE_INDEX_CAVEAT = (
 )
 
 
+def _score_rank_attested(
+    question_set: "QuestionSet",
+    attested: AttestedAnswers,
+    *,
+    manifest: Optional[dict[str, Any]] = None,
+    provider_config: Optional[dict] = None,
+    normalization_preset: str = "passthrough",
+) -> tuple[QAProbeReport, "Counter[str]"]:
+    """v2.2.1 #12 Commit A: score a rank-probe attested answer set.
+
+    Returns ``(QAProbeReport, parser_used_counter)``. Commit C
+    later surfaces the Counter as a typed field on
+    ``KnowledgeCheckReport``; this commit returns it so the
+    handoff is concrete.
+
+    Flow per AnswerRecord:
+      1. Look up the corresponding ``QuestionSpec`` by question_id.
+      2. Derive ``expected_symbols = set(qs.truth_value)`` — the
+         canonical normalized symbols (truth_value is a tuple of
+         these by ``RankContinuationProbe.build``'s contract).
+         NOTE: there is no ``qs.metadata["expected_symbols"]``
+         key; the truth_value tuple IS the expected-set source.
+      3. Call ``resolve_rank_answer(rec, expected_symbols,
+         normalization_preset)`` from ``_rank.py``.
+      4. On success: score with ``score_rank_answer`` against
+         ``qs.truth_value`` (a tuple in descending-return order).
+      5. On failure: produce a ``QuestionScore`` with
+         ``band="invalid"`` and ``validity="invalid"``.
+      6. Record the resolver-returned ``parser_used`` string into
+         the Counter (drop None values — they don't represent a
+         valid path).
+
+    Aggregates via ``aggregate_scores`` and returns.
+    """
+    import collections
+
+    from aiphaforge.probes.models import QuestionScore
+    from aiphaforge.probes.scoring import _merge_provider_config, aggregate_scores
+
+    merged_manifest, _ = _merge_provider_config(
+        manifest, provider_config,
+    )
+    qs_by_id = {q.question_id: q for q in question_set}
+    counter: "Counter[str]" = collections.Counter()
+    scores: list[QuestionScore] = []
+    for rec in attested.answers:
+        qs = qs_by_id.get(rec.question_id)
+        if qs is None:
+            # Answer for an unknown question; silently skip (same
+            # convention as score_attested_answers).
+            continue
+        expected_symbols = set(qs.truth_value)
+        rank_answer, parse_status, parser_used = resolve_rank_answer(
+            rec, expected_symbols, normalization_preset,
+        )
+        # Record the parser_used path for the Commit C drift note.
+        if parser_used is not None:
+            counter[parser_used] += 1
+        if rank_answer is None:
+            scores.append(
+                QuestionScore(
+                    question_id=qs.question_id,
+                    validity="invalid",
+                    band="invalid",
+                    truth_value=qs.truth_value,
+                    parsed_answer=None,
+                    relative_error=None,
+                    contains_truth=None,
+                    range_width_ratio=None,
+                    max_range_width_exceeded=None,
+                    metadata={"rank_parse_status": parse_status},
+                )
+            )
+            continue
+        band, prov = score_rank_answer(rank_answer, qs.truth_value)
+        # NOTE: validity is "valid" even when band == "invalid".
+        # The two fields measure different things:
+        #   validity = "did the LLM produce a well-formed answer?"
+        #   band     = "did the scored content fall in which bucket?"
+        # A rank answer with omitted_symbols parses fine but scores
+        # "invalid" content-wise; that still counts as a valid
+        # submission for aggregate denominators. Setting
+        # validity="invalid" here would cause aggregate_scores to
+        # filter the record out entirely (see scoring.py:730),
+        # producing zero in bands_breakdown["invalid"] — the
+        # opposite of what we want.
+        scores.append(
+            QuestionScore(
+                question_id=qs.question_id,
+                validity="valid",
+                band=band,
+                truth_value=qs.truth_value,
+                parsed_answer=rank_answer.ranking,
+                relative_error=None,
+                contains_truth=None,
+                range_width_ratio=None,
+                max_range_width_exceeded=None,
+                metadata={
+                    "rank_parser_used": parser_used,
+                    **prov,
+                },
+            )
+        )
+    from dataclasses import replace as _dc_replace
+    report = aggregate_scores(
+        question_set, scores, manifest=merged_manifest,
+    )
+    # Attach attestation hashes from the input AttestedAnswers
+    # (the standard scoring path does this; we mirror it here).
+    report = _dc_replace(
+        report,
+        parsing_schema_hash=attested.parsing_schema_hash,
+        prompt_template_hash=attested.prompt_template_hash,
+    )
+    return report, counter
+
+
 def _apply_vol_scaling_to_question_set(
     probe: "ProbeT",
     question_set: "QuestionSet",
@@ -758,10 +878,22 @@ def knowledge_check(
         vol_scale_provenance.setdefault(qid, {})["real"] = prov
 
     # ---- score real ----
-    real_report, _, _ = score_attested_answers(
-        question_set, answers, manifest=manifest,
-        provider_config=provider_config,
-    )
+    # v2.2.1 #12 Commit A: route RankContinuationProbe through
+    # the dedicated _score_rank_attested helper (uses
+    # resolve_rank_answer + score_rank_answer). Other probe
+    # types route through the standard numeric scoring path.
+    real_parser_counter: Optional[Counter[str]] = None
+    if isinstance(probe, RankContinuationProbe):
+        real_report, real_parser_counter = _score_rank_attested(
+            question_set, answers, manifest=manifest,
+            provider_config=provider_config,
+            normalization_preset=probe.normalization_preset,
+        )
+    else:
+        real_report, _, _ = score_attested_answers(
+            question_set, answers, manifest=manifest,
+            provider_config=provider_config,
+        )
 
     real_recs = list(answers.answers)
     real_eff = compute_effective_rate(real_recs)
@@ -805,10 +937,22 @@ def knowledge_check(
         )
         for qid, prov in anchor_vol_prov.items():
             vol_scale_provenance.setdefault(qid, {})["anchor"] = prov
-        anchor_report, _, _ = score_attested_answers(
-            anchor_qs, anchor_answers, manifest=manifest,
-            provider_config=provider_config,
-        )
+        # v2.2.1 #12 Commit A: same RankContinuationProbe routing
+        # on anchor side.
+        anchor_parser_counter: Optional[Counter[str]] = None
+        if isinstance(probe, RankContinuationProbe):
+            anchor_report, anchor_parser_counter = (
+                _score_rank_attested(
+                    anchor_qs, anchor_answers, manifest=manifest,
+                    provider_config=provider_config,
+                    normalization_preset=probe.normalization_preset,
+                )
+            )
+        else:
+            anchor_report, _, _ = score_attested_answers(
+                anchor_qs, anchor_answers, manifest=manifest,
+                provider_config=provider_config,
+            )
         anchor_recs = list(anchor_answers.answers)
         anchor_eff = compute_effective_rate(anchor_recs)
         anchor_refusal = compute_refusal_rate(anchor_recs)
