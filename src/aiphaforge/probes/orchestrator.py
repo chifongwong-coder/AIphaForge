@@ -211,21 +211,35 @@ def tango_paired_diff_ci(
     n_neither: int,
     confidence: float = 0.95,
 ) -> tuple[float, float]:
-    """Tango (1998) score-based CI for the difference of two paired
-    binomial proportions p1 − p2.
-
-    Reference: Tango T (1998), "Equivalence test and confidence
-    interval for the difference in proportions for the paired-sample
-    design". Stat Med 17:891-908.
+    """Wald-style CI for the difference of two paired binomial
+    proportions p1 − p2.
 
     p1 = (n_both + n_real_only) / N         # real success rate
     p2 = (n_both + n_anchor_only) / N       # anchor success rate
 
     Implementation: bisection over delta ∈ [-1, 1] for which the
     score statistic for H0: p1 - p2 = delta is within the critical
-    region. Matches PropCIs::scoreci.mp behavior.
+    region. The variance estimator uses the standard discordant-
+    cell formula (does NOT depend on delta).
 
-    Edge cases (per F3 follow-up):
+    KNOWN LIMITATION (v2.2.1 #3 follow-up): the implementation is
+    a Wald approximation, NOT Tango (1998) Method 10's true
+    constrained-MLE score CI. The function name is preserved for
+    backward API compatibility; v2.2.2 will swap in the proper
+    Tango implementation once the PropCIs::scoreci.mp R-source
+    reference fixture is generated. Per the v2.2.1 r7 plan, that
+    requires R + PropCIs which were not available in the v2.2.1
+    implementation environment. Documented as a v2.2.2 follow-up.
+
+    Practically: the Wald CI is conservative-vs-Tango (slightly
+    wider intervals) when the discordant-pair count is small
+    relative to N. For paper-grade rigor, users should additionally
+    run R/PropCIs::scoreci.mp on their (n_both, n_real_only,
+    n_anchor_only, n_neither) tables and compare. Until v2.2.2
+    ships the proper Tango implementation, this function provides
+    a reasonable approximation; do NOT cite it as Tango (1998).
+
+    Edge cases:
       - N = 0: raises ValueError (cannot CI an empty bucket).
       - All concordant (n_real_only = n_anchor_only = 0):
         returns (0.0, 0.0) — point CI at delta=0.
@@ -246,11 +260,10 @@ def tango_paired_diff_ci(
     def _score_stat(delta: float) -> float:
         """Score statistic at H0: p1 - p2 = delta.
 
-        Wald-style with the standard discordant-cell variance
-        estimator. Conservative vs Tango's constrained MLE but
-        matches PropCIs::scoreci.mp behavior to within the
-        documented test tolerance (see F2 implementation
-        follow-up — frozen reference fixture pinned separately).
+        Wald-style with discordant-cell variance estimator
+        (constant in delta). Honest documentation of what's
+        actually implemented; v2.2.2 will swap to constrained-
+        MLE Tango per the F2 follow-up.
         """
         var = ((n_real_only + n_anchor_only)
                - (n_real_only - n_anchor_only) ** 2 / n) / (n * n)

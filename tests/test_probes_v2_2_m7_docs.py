@@ -113,6 +113,7 @@ class TestReportCarriesWarning:
 
 
 class TestVersion:
-    def test_version_is_2_2_0(self):
+    def test_version_is_current_release(self):
+        # Updated by v2.2.1 #3 final bump.
         import aiphaforge
-        assert aiphaforge.__version__ == "2.2.0"
+        assert aiphaforge.__version__ == "2.2.1"
