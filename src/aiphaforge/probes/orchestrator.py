@@ -618,6 +618,22 @@ def knowledge_check(
                 anchor_validity = "OK"
 
         if anchor_validity == "OK":
+            # v2.2.1 #5: pair by question_id (was position-based,
+            # which silently misaligned on dropped/reordered
+            # questions). Hoisted out of the bucket loop so the
+            # pairing runs once.
+            paired, pairing_notes = _pair_scores_by_question_id(
+                real_report, anchor_report,
+            )
+            notes.extend(pairing_notes)
+            if not paired:
+                # Disjoint qid sets — degraded report (warning
+                # already in notes). Suppress derived statistics.
+                anchor_validity = "REFUSAL_SUSPECTED"  # closest
+                # existing validity tag — TODO v2.3 add
+                # "PAIRING_FAILED" tag.
+
+        if anchor_validity == "OK":
             # Compute per-bucket delta and Tango paired CI.
             bucket_delta = {}
             bucket_delta_ci = {}
@@ -637,13 +653,9 @@ def knowledge_check(
                 )
                 bucket_delta[bucket] = real_share - anchor_share
 
-                # Tango paired CI: requires per-question pairing.
-                # Per § 6.5, anchor question set mirrors real
-                # position-by-position. Build the contingency table
-                # by pairing scores by question_id index.
-                paired = _pair_scores_by_position(
-                    real_report, anchor_report,
-                )
+                # Tango paired CI: contingency table from `paired`
+                # (computed once before the loop, qid-keyed per
+                # v2.2.1 #5).
                 n_both = sum(
                     1 for (rb, ab) in paired
                     if rb == bucket and ab == bucket
@@ -735,9 +747,13 @@ def knowledge_check(
         ordinal_map = {
             "exact": 4, "near": 3, "rough": 2, "miss": 1, "invalid": 0,
         }
-        paired_rp = _pair_scores_by_position(
-            real_report, persistence_report,
+        # v2.2.1 #5: pair by qid (was position-based).
+        paired_rp, persistence_pairing_notes = (
+            _pair_scores_by_question_id(
+                real_report, persistence_report,
+            )
         )
+        notes.extend(persistence_pairing_notes)
         rp_pos = sum(
             1 for (rb, pb) in paired_rp
             if ordinal_map.get(rb, 0) > ordinal_map.get(pb, 0)
@@ -802,12 +818,62 @@ def _bucket_assignments(report: QAProbeReport) -> dict[str, int]:
 def _pair_scores_by_position(
     real: QAProbeReport, anchor: QAProbeReport,
 ) -> list[tuple[str, str]]:
-    """Pair (real_score.band, anchor_score.band) by index."""
+    """v2.2.0 legacy — pairs by positional index.
+
+    DEPRECATED in favor of :func:`_pair_scores_by_question_id`
+    (v2.2.1 #5). The position-based pairing silently misaligns when
+    either side has dropped or reordered questions; the qid-based
+    pairing degrades gracefully and surfaces a warning.
+
+    Kept temporarily so callers can migrate; will be removed in
+    v2.3.
+    """
     n = min(len(real.question_scores), len(anchor.question_scores))
     return [
         (real.question_scores[i].band, anchor.question_scores[i].band)
         for i in range(n)
     ]
+
+
+def _pair_scores_by_question_id(
+    real: QAProbeReport, anchor: QAProbeReport,
+) -> tuple[list[tuple[str, str]], list[str]]:
+    """Pair (real_score.band, anchor_score.band) by question_id.
+
+    v2.2.1 #5: replaces position-based pairing which silently
+    misaligned when either side dropped/reordered questions.
+
+    Returns (pairs, notes). Degraded behavior, not crash:
+      - Disjoint qid sets → returns ([], [warning_message]).
+      - Partial overlap (len(common) < min(len(real),
+        len(anchor))) → returns (pairs_for_common, [warning_message]).
+      - Full overlap → returns (pairs, []).
+
+    Pairs are sorted by question_id for deterministic output.
+    """
+    real_by_id = {s.question_id: s for s in real.question_scores}
+    anchor_by_id = {s.question_id: s for s in anchor.question_scores}
+    common = set(real_by_id) & set(anchor_by_id)
+    notes: list[str] = []
+    if not common:
+        notes.append(
+            "real and anchor question sets share NO question_ids; "
+            "the M5 §6.5 anchor-pairing contract is violated. "
+            "bucket_delta and paired_sign_test_p suppressed."
+        )
+        return [], notes
+    if len(common) < min(len(real_by_id), len(anchor_by_id)):
+        notes.append(
+            f"real and anchor question sets only partially overlap "
+            f"({len(common)} common qids out of "
+            f"{len(real_by_id)} real / {len(anchor_by_id)} anchor); "
+            f"pairing only the common qids."
+        )
+    pairs = [
+        (real_by_id[qid].band, anchor_by_id[qid].band)
+        for qid in sorted(common)
+    ]
+    return pairs, notes
 
 
 def _compute_persistence_baseline_report(
