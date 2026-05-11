@@ -234,53 +234,57 @@ def midranks(values: Sequence[float]) -> np.ndarray:
 def _spearman_null_quantile(n: int, q: float, seed: int = 42) -> float:
     """rho threshold s.t. P(|rho_null| >= rho_threshold) = 1 - q.
 
-    For N <= 20: Monte Carlo with deterministic seed (10^4 samples
-    is plenty for q in [0.75, 0.99]; cached per-N).
-    For N > 20: Gaussian closed form, sigma = 1/sqrt(N-1).
+    v2.2.1 #6: looked up from precomputed table at
+    ``src/aiphaforge/probes/_rank_null.npz``:
+      - N ∈ [3, 10]: exact enumeration of all N! permutations.
+      - N ∈ [11, 20]: Monte Carlo with 10⁶ samples per N,
+        PCG64-seeded via SeedSequence(20260512).spawn(10).
+      - N > 20: Gaussian closed form (asymptotic).
+
+    The table is generated once by
+    ``scripts/generate_rank_null_table.py`` and shipped as a
+    release artifact. Lazy-loaded into module state on first use.
     """
     if n < 3:
         return 0.0
     if n > 20:
-        # Gaussian: rho_q = z_(q) / sqrt(N-1), where z is the
-        # quantile of standard normal of |rho| under H0.
         from math import sqrt
         try:
             from scipy.stats import norm  # type: ignore[import-not-found]
             z = float(norm.ppf((1.0 + q) / 2.0))
         except ImportError:
-            # Approximation table for common q values
             z_table = {0.99: 2.576, 0.95: 1.960, 0.90: 1.645, 0.75: 1.150}
             z = z_table.get(q, 1.645)
         return z / sqrt(n - 1)
-    # Small-N: Monte Carlo. Cached on first call per N to avoid
-    # recomputation.
-    return _spearman_mc_quantile(n, q, seed=seed)
-
-
-# Module-level cache.
-_MC_CACHE: dict[tuple[int, int], np.ndarray] = {}
-
-
-def _spearman_mc_quantile(n: int, q: float, seed: int = 42) -> float:
-    """Cached Monte Carlo of |rho| under the no-tie null."""
-    cache_key = (n, seed)
-    if cache_key not in _MC_CACHE:
-        rng = np.random.Generator(np.random.PCG64(seed))
-        n_samples = 10_000
-        samples = np.empty(n_samples)
-        ranks_canonical = np.arange(1, n + 1, dtype=float)
-        for i in range(n_samples):
-            shuf = rng.permutation(ranks_canonical)
-            samples[i] = abs(
-                tie_corrected_spearman(ranks_canonical, shuf)
-            )
-        samples.sort()
-        _MC_CACHE[cache_key] = samples
-    samples = _MC_CACHE[cache_key]
+    # 3 <= n <= 20: lookup table.
+    table = _load_rank_null_table()
+    samples = table[f"abs_rho_n{n}"]
     idx = int(q * len(samples))
     if idx >= len(samples):
         idx = len(samples) - 1
     return float(samples[idx])
+
+
+# Module-level cache: loaded once on first call.
+_RANK_NULL_TABLE: dict[str, np.ndarray] | None = None
+
+
+def _load_rank_null_table() -> dict[str, np.ndarray]:
+    """Lazy-load the precomputed rank-null table."""
+    global _RANK_NULL_TABLE
+    if _RANK_NULL_TABLE is None:
+        from pathlib import Path
+        npz_path = (
+            Path(__file__).resolve().parent / "_rank_null.npz"
+        )
+        if not npz_path.exists():
+            raise FileNotFoundError(
+                f"rank-null table not found at {npz_path}; "
+                "regenerate via scripts/generate_rank_null_table.py"
+            )
+        data = np.load(npz_path)
+        _RANK_NULL_TABLE = {key: data[key] for key in data.files}
+    return _RANK_NULL_TABLE
 
 
 # ---------- RankContinuationProbe ----------
