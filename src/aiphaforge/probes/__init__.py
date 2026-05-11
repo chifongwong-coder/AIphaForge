@@ -35,6 +35,8 @@ from aiphaforge.probes._rank import (
     RankContinuationProbe,
     RankCutoffSpec,
     normalize_symbol,
+    parse_rank_answer,
+    resolve_rank_answer,
     score_rank_answer,
     tie_corrected_spearman,
 )
@@ -156,6 +158,8 @@ __all__ = [
     "knowledge_check",
     "looks_like_refusal",
     "normalize_symbol",
+    "parse_rank_answer",
+    "resolve_rank_answer",
     "sign_test_p",
     "tango_paired_diff_ci",
     "score_rank_answer",

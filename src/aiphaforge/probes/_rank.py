@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Optional, Sequence
+from typing import TYPE_CHECKING, Any, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -27,6 +27,9 @@ from aiphaforge.probes.questions import (
     QuestionSet,
     _make_question_id,
 )
+
+if TYPE_CHECKING:
+    from aiphaforge.probes.models import AnswerRecord
 
 # ---------- Symbol normalization presets ----------
 
@@ -109,6 +112,15 @@ class RankAnswer:
       - Singleton tie groups rejected at construction (semantically
         empty).
 
+    v2.2.1 (#2 + #4):
+      - ``raw_ranking`` preserves the user's pre-normalization
+        submission for paper-grade audit.
+      - ``parser_used`` records which path produced this RankAnswer
+        — one of: ``user_provided``, ``user_provided_list``,
+        ``user_provided_dict``, ``json_array``, ``json_object``,
+        ``json_array_codefence``, ``numbered``, ``bulleted_dash``,
+        ``bulleted_asterisk``, ``comma``, ``newline``, or None.
+
     See § 5.2.1.
     """
 
@@ -116,6 +128,8 @@ class RankAnswer:
     omitted_symbols: frozenset[str] = field(default_factory=frozenset)
     extra_symbols: frozenset[str] = field(default_factory=frozenset)
     tie_groups: tuple[frozenset[str], ...] = ()
+    raw_ranking: tuple[str, ...] = ()
+    parser_used: Optional[str] = None
 
     def __post_init__(self):
         if len(set(self.ranking)) != len(self.ranking):
@@ -306,6 +320,7 @@ class RankContinuationProbe:
         context_bars: int,        # NO DEFAULT
         forward_horizon: int,     # NO DEFAULT
         rank_metric: str = "log_return",
+        normalization_preset: str = "passthrough",
     ):
         if not isinstance(context_bars, int) or context_bars < 2:
             raise ValueError(
@@ -325,7 +340,21 @@ class RankContinuationProbe:
                 f"RankContinuationProbe needs >= 2 symbols; got "
                 f"{len(symbols)}"
             )
-        self.symbols = tuple(symbols)
+        if normalization_preset not in _NORMALIZATION_PRESETS:
+            raise ValueError(
+                f"normalization_preset must be in "
+                f"{sorted(_NORMALIZATION_PRESETS)}; got "
+                f"{normalization_preset!r}"
+            )
+        # v2.2.1 #4: normalize symbols at probe-build time so truth
+        # ranking and user submissions compare on the same canonical
+        # form. The preset name is also surfaced on the report so
+        # paper readers see which canonicalization was used.
+        self.normalization_preset = normalization_preset
+        self.symbols = tuple(
+            normalize_symbol(s, normalization_preset) for s in symbols
+        )
+        self.raw_symbols = tuple(symbols)  # pre-normalization for audit
         self.context_bars = context_bars
         self.forward_horizon = forward_horizon
         self.rank_metric = rank_metric
@@ -344,11 +373,15 @@ class RankContinuationProbe:
             valid = True
             ctx_by_symbol: dict[str, list[dict]] = {}
             target_returns: dict[str, float] = {}
-            for sym in self.symbols:
-                if sym not in data_dict:
+            # v2.2.1 #4: data_dict is keyed by RAW user symbols
+            # (whatever the user passed in). We look up data by raw,
+            # but produce truth + context dicts in the canonical
+            # (normalized) form so user RankAnswers compare correctly.
+            for raw_sym, sym in zip(self.raw_symbols, self.symbols):
+                if raw_sym not in data_dict:
                     valid = False
                     break
-                data = data_dict[sym]
+                data = data_dict[raw_sym]
                 if ts not in data.index:
                     valid = False
                     break
@@ -490,6 +523,283 @@ def score_rank_answer(
     }
 
 
+def _is_sequence_of_str(x: Any) -> bool:
+    """v2.2.1 #2 path-2 acceptance predicate.
+
+    Accepts list[str], tuple[str, ...], np.ndarray (kind 'U' or
+    'O' all-str), pd.Series (StringDtype, ArrowDtype string, or
+    object all-str). Rejects bare str defensively (would split
+    char-by-char).
+    """
+    if isinstance(x, str):
+        return False
+    if isinstance(x, (list, tuple)):
+        return all(isinstance(item, str) for item in x)
+    try:
+        if isinstance(x, np.ndarray):
+            if x.dtype.kind == 'U':
+                return True
+            if x.dtype.kind == 'O':
+                return all(isinstance(item, str) for item in x)
+            return False
+        if isinstance(x, pd.Series):
+            if isinstance(x.dtype, pd.StringDtype):
+                return True
+            try:
+                arrow_dtype = pd.ArrowDtype
+                if isinstance(x.dtype, arrow_dtype):
+                    try:
+                        import pyarrow as pa  # type: ignore
+                        if pa.types.is_string(x.dtype.pyarrow_dtype):
+                            return True
+                    except (ImportError, AttributeError):
+                        pass
+            except AttributeError:
+                pass  # pandas < 2.0
+            if x.dtype == object:
+                return all(isinstance(item, str) for item in x)
+            return False
+    except (ImportError, AttributeError):
+        pass
+    return False
+
+
+def parse_rank_answer(
+    raw_text: str,
+    expected_symbols: Sequence[str],
+    normalization_preset: str = "passthrough",
+) -> Optional[RankAnswer]:
+    """Lenient parser for raw LLM rank responses.
+
+    v2.2.1 #2: tries multiple text formats in order; returns the
+    first success. On failure returns None (NOT raises) — the
+    orchestrator translates None to parse_status='invalid'.
+
+    Tries in order:
+      1. JSON array (with optional markdown code fence stripped).
+      2. JSON object with "ranking" key.
+      3. Numbered list (lines starting with "N. ").
+      4. Bulleted list (lines starting with "- " or "* ").
+      5. Comma-separated.
+      6. Newline-separated.
+
+    Each parsed symbol is normalized via normalize_symbol with the
+    supplied preset before comparing to expected_symbols.
+    """
+    if not raw_text or not isinstance(raw_text, str):
+        return None
+    expected_norm = {
+        normalize_symbol(s, normalization_preset)
+        for s in expected_symbols
+    }
+    text = raw_text.strip()
+
+    # Strip markdown code fence wrappers if present.
+    fence_used = False
+    if text.startswith("```"):
+        lines = text.split("\n", 1)
+        if len(lines) == 2 and lines[1].rstrip().endswith("```"):
+            text = lines[1].rstrip()[:-3].strip()
+            fence_used = True
+
+    parsed_raw: Optional[list[str]] = None
+    parser_label: Optional[str] = None
+    tie_groups: tuple[frozenset[str], ...] = ()
+
+    # 1+2: JSON paths.
+    try:
+        import json as _json
+        obj = _json.loads(text)
+        if isinstance(obj, list) and all(
+            isinstance(x, str) for x in obj
+        ):
+            parsed_raw = list(obj)
+            parser_label = (
+                "json_array_codefence" if fence_used else "json_array"
+            )
+        elif isinstance(obj, dict) and isinstance(
+            obj.get("ranking"), list,
+        ) and all(isinstance(x, str) for x in obj["ranking"]):
+            parsed_raw = list(obj["ranking"])
+            parser_label = "json_object"
+            tied = obj.get("tied")
+            if isinstance(tied, list):
+                groups = []
+                for grp in tied:
+                    if (
+                        isinstance(grp, list)
+                        and all(isinstance(x, str) for x in grp)
+                        and len(grp) >= 2
+                    ):
+                        groups.append(frozenset(
+                            normalize_symbol(s, normalization_preset)
+                            for s in grp
+                        ))
+                tie_groups = tuple(groups)
+    except Exception:
+        pass
+
+    # 3: numbered list.
+    if parsed_raw is None:
+        import re
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        numbered_re = re.compile(r"^\d+[\.\)]\s+(.+)$")
+        matches = [numbered_re.match(ln) for ln in lines]
+        if matches and all(m is not None for m in matches):
+            parsed_raw = [m.group(1).strip() for m in matches]
+            parser_label = "numbered"
+
+    # 4: bulleted list.
+    if parsed_raw is None:
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if lines and all(ln.startswith("- ") for ln in lines):
+            parsed_raw = [ln[2:].strip() for ln in lines]
+            parser_label = "bulleted_dash"
+        elif lines and all(ln.startswith("* ") for ln in lines):
+            parsed_raw = [ln[2:].strip() for ln in lines]
+            parser_label = "bulleted_asterisk"
+
+    # 5: comma-separated (single line).
+    if parsed_raw is None and "," in text and "\n" not in text:
+        parsed_raw = [s.strip() for s in text.split(",") if s.strip()]
+        parser_label = "comma"
+
+    # 6: newline-separated (no commas).
+    if parsed_raw is None and "\n" in text:
+        parsed_raw = [
+            ln.strip() for ln in text.splitlines() if ln.strip()
+        ]
+        parser_label = "newline"
+
+    # Final fallback: single-token text.
+    if parsed_raw is None:
+        return None
+
+    # Reject duplicates.
+    seen_norm: list[str] = []
+    seen_set: set[str] = set()
+    for raw in parsed_raw:
+        norm = normalize_symbol(raw, normalization_preset)
+        if norm in seen_set:
+            return None  # duplicate symbol — invalid permutation
+        seen_set.add(norm)
+        seen_norm.append(norm)
+
+    # Classify extra and omitted.
+    extras = frozenset(s for s in seen_norm if s not in expected_norm)
+    omitted = frozenset(
+        s for s in expected_norm if s not in seen_set
+    )
+
+    return RankAnswer(
+        ranking=tuple(seen_norm),
+        omitted_symbols=omitted,
+        extra_symbols=extras,
+        tie_groups=tie_groups,
+        raw_ranking=tuple(parsed_raw),
+        parser_used=parser_label,
+    )
+
+
+def resolve_rank_answer(
+    rec: "AnswerRecord",
+    expected_symbols: Sequence[str],
+    normalization_preset: str = "passthrough",
+) -> tuple[Optional[RankAnswer], str, str]:
+    """v2.2.1 #2 priority chain — accept structured input first;
+    fall back to text parser.
+
+    Returns (rank_answer, parse_status, parser_used).
+
+    Paths (locked v2.2.1):
+      1. parsed_answer is RankAnswer → use directly.
+      2. parsed_answer is Sequence[str] (not bare str) → wrap.
+      3. parsed_answer is dict with "ranking" key → construct.
+      4. parsed_answer is None AND raw_answer is text → text parser.
+      5. else → invalid.
+
+    Failure does NOT raise.
+    """
+    parsed = rec.parsed_answer
+
+    if isinstance(parsed, RankAnswer):
+        return parsed, "valid", parsed.parser_used or "user_provided"
+
+    if _is_sequence_of_str(parsed):
+        normalized = [
+            normalize_symbol(s, normalization_preset) for s in parsed
+        ]
+        # Reject duplicates.
+        if len(set(normalized)) != len(normalized):
+            return None, "invalid", "user_provided_list_duplicates"
+        expected_norm = {
+            normalize_symbol(s, normalization_preset)
+            for s in expected_symbols
+        }
+        ans = RankAnswer(
+            ranking=tuple(normalized),
+            omitted_symbols=frozenset(
+                s for s in expected_norm if s not in normalized
+            ),
+            extra_symbols=frozenset(
+                s for s in normalized if s not in expected_norm
+            ),
+            raw_ranking=tuple(parsed),
+            parser_used="user_provided_list",
+        )
+        return ans, "valid", "user_provided_list"
+
+    if isinstance(parsed, dict) and _is_sequence_of_str(
+        parsed.get("ranking")
+    ):
+        ranking_raw = list(parsed["ranking"])
+        normalized = [
+            normalize_symbol(s, normalization_preset)
+            for s in ranking_raw
+        ]
+        if len(set(normalized)) != len(normalized):
+            return None, "invalid", "user_provided_dict_duplicates"
+        expected_norm = {
+            normalize_symbol(s, normalization_preset)
+            for s in expected_symbols
+        }
+        # Optional tied
+        tie_groups = ()
+        tied = parsed.get("tied")
+        if isinstance(tied, list):
+            groups = []
+            for grp in tied:
+                if _is_sequence_of_str(grp) and len(grp) >= 2:
+                    groups.append(frozenset(
+                        normalize_symbol(s, normalization_preset)
+                        for s in grp
+                    ))
+            tie_groups = tuple(groups)
+        ans = RankAnswer(
+            ranking=tuple(normalized),
+            omitted_symbols=frozenset(
+                s for s in expected_norm if s not in normalized
+            ),
+            extra_symbols=frozenset(
+                s for s in normalized if s not in expected_norm
+            ),
+            tie_groups=tie_groups,
+            raw_ranking=tuple(ranking_raw),
+            parser_used="user_provided_dict",
+        )
+        return ans, "valid", "user_provided_dict"
+
+    if parsed is None and isinstance(rec.raw_answer, str):
+        ans = parse_rank_answer(
+            rec.raw_answer, expected_symbols, normalization_preset,
+        )
+        if ans is None:
+            return None, "invalid", "raw_text_unparseable"
+        return ans, "valid", ans.parser_used or "raw_text_unparseable"
+
+    return None, "invalid", "unrecognized_parsed_answer_type"
+
+
 __all__ = [
     "NormalizationSpec",
     "RankAnswer",
@@ -497,6 +807,8 @@ __all__ = [
     "RankCutoffSpec",
     "midranks",
     "normalize_symbol",
+    "parse_rank_answer",
+    "resolve_rank_answer",
     "score_rank_answer",
     "tie_corrected_spearman",
 ]

@@ -610,6 +610,11 @@ class KnowledgeCheckReport:
     ] = None
     leakage_index_caveat: Optional[str] = None
 
+    # v2.2.1 #4: normalization preset surfaced for rank probes.
+    # Human-readable preset name ("us_equity", "passthrough",
+    # etc.). None for non-rank probes.
+    normalization_preset: Optional[str] = None
+
     # v2.2.1 #1: vol-scaling provenance keyed by (question_id, side).
     # side ∈ {"real", "anchor"}. None when no question used vol_scale
     # (e.g., all probes had vol_scale=None tolerance) or when no
@@ -1011,6 +1016,11 @@ def knowledge_check(
         scalar_leakage_index_h0_se=scalar_index_se,
         scalar_leakage_index_z=scalar_index_z,
         leakage_index_caveat=leakage_caveat,
+        normalization_preset=(
+            probe.normalization_preset
+            if isinstance(probe, RankContinuationProbe)
+            else None
+        ),
         vol_scale_provenance=(
             vol_scale_provenance if vol_scale_provenance else None
         ),
