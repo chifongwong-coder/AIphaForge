@@ -29,6 +29,15 @@ from aiphaforge.probes._hash_utils import (
     attest_parsing,
     attest_prompt_template,
 )
+from aiphaforge.probes._rank import (
+    NormalizationSpec,
+    RankAnswer,
+    RankContinuationProbe,
+    RankCutoffSpec,
+    normalize_symbol,
+    score_rank_answer,
+    tie_corrected_spearman,
+)
 from aiphaforge.probes.abtest import (
     DEFAULT_METRIC_CONFIG,
     DEFAULT_METRICS,
@@ -112,6 +121,7 @@ __all__ = [
     "NextCloseContinuation",
     "NextRangeContinuation",
     "NextReturnContinuation",
+    "NormalizationSpec",
     "OpenQuestion",
     "QAProbeReport",
     "QuestionPromptRecord",
@@ -119,6 +129,9 @@ __all__ = [
     "QuestionSet",
     "QuestionSpec",
     "QuestionTemplate",
+    "RankAnswer",
+    "RankContinuationProbe",
+    "RankCutoffSpec",
     "ReturnSign",
     "ScenarioABReport",
     "ToleranceProfile",
@@ -132,6 +145,9 @@ __all__ = [
     "attest_parsing",
     "attest_prompt_template",
     "build_synthetic_anchor",
+    "normalize_symbol",
+    "score_rank_answer",
+    "tie_corrected_spearman",
     "build_question_set",
     "build_question_sets_multi",
     "normalize_binary",
