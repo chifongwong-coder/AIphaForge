@@ -66,6 +66,13 @@ from aiphaforge.probes.models import (
     ToleranceProfile,
     VolScalingSpec,
 )
+from aiphaforge.probes.orchestrator import (
+    KnowledgeCheckReport,
+    knowledge_check,
+    looks_like_refusal,
+    sign_test_p,
+    tango_paired_diff_ci,
+)
 from aiphaforge.probes.questions import (
     DEFAULT_TEMPLATES,
     BarRangePct,
@@ -111,6 +118,7 @@ __all__ = [
     "ContinuationProbe",
     "ContinuationTemplate",
     "DEFAULT_TEMPLATES",
+    "KnowledgeCheckReport",
     "ExemplarSpec",
     "GapVsPrevClose",
     "HighQuestion",
@@ -145,7 +153,11 @@ __all__ = [
     "attest_parsing",
     "attest_prompt_template",
     "build_synthetic_anchor",
+    "knowledge_check",
+    "looks_like_refusal",
     "normalize_symbol",
+    "sign_test_p",
+    "tango_paired_diff_ci",
     "score_rank_answer",
     "tie_corrected_spearman",
     "build_question_set",
