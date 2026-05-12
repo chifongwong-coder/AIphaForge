@@ -1142,9 +1142,12 @@ def knowledge_check(
             if not paired:
                 # Disjoint qid sets — degraded report (warning
                 # already in notes). Suppress derived statistics.
-                anchor_validity = "REFUSAL_SUSPECTED"  # closest
-                # existing validity tag — TODO v2.3 add
-                # "PAIRING_FAILED" tag.
+                # v2.2.1 audit-fix Commit F: distinct validity tag
+                # for the pairing failure mode. Previously this
+                # case was overloaded onto REFUSAL_SUSPECTED, which
+                # confused downstream callers trying to distinguish
+                # "model refused" from "anchor qids didn't line up".
+                anchor_validity = "PAIRING_FAILED"
 
         if anchor_validity == "OK":
             # Compute per-bucket delta and Tango paired CI.
@@ -1373,8 +1376,10 @@ def _pair_scores_by_position(
     either side has dropped or reordered questions; the qid-based
     pairing degrades gracefully and surfaces a warning.
 
-    Kept temporarily so callers can migrate; will be removed in
-    v2.3.
+    Removal scheduled: v2.3.0. Kept through v2.2.x for any external
+    caller that imported the private name; the public
+    ``knowledge_check`` orchestrator no longer references it. New
+    code MUST use ``_pair_scores_by_question_id``.
     """
     n = min(len(real.question_scores), len(anchor.question_scores))
     return [

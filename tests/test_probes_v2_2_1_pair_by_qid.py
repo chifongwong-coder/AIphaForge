@@ -151,6 +151,75 @@ def _build_perfect_attested(question_set):
     )
 
 
+class TestPairingFailedTag:
+    def test_disjoint_anchor_emits_pairing_failed_tag(
+        self, monkeypatch,
+    ):
+        # v2.2.1 audit-fix Commit F: when
+        # ``_pair_scores_by_question_id`` returns empty pairs (the
+        # M5 §6.5 anchor-pairing contract is violated), the
+        # orchestrator should now tag the report PAIRING_FAILED —
+        # distinct from REFUSAL_SUSPECTED, which means "the model
+        # effectively refused on one side".
+        #
+        # End-to-end forcing of disjoint qids is awkward because
+        # both real and anchor reports flow through
+        # ``aggregate_scores``, which synthesizes "missing"
+        # placeholders keyed by the question_set qids — so the two
+        # reports end up sharing qids even when the answer records
+        # don't. We test the orchestrator gate directly by stubbing
+        # the pairing helper to return empty pairs, then confirming
+        # the validity tag flips.
+        from aiphaforge.probes import orchestrator as orch_mod
+
+        def _empty_pairs(_real, _anchor):
+            return [], [
+                "real and anchor question sets share NO question_ids; "
+                "test stub.",
+            ]
+
+        monkeypatch.setattr(
+            orch_mod, "_pair_scores_by_question_id", _empty_pairs,
+        )
+
+        data = _make_data()
+        probe = KnowledgeProbe(
+            symbol="AAPL", templates=DEFAULT_TEMPLATES,
+        )
+        anchors = list(data.index[10:15])
+        question_set = probe.build(data, anchors)
+        real_attested = _build_perfect_attested(question_set)
+        anchor_data = build_synthetic_anchor(
+            data, seed=1, method="random_walk_volmatched",
+        )
+        anchor_qs = probe.build(anchor_data, anchors)
+        anchor_attested = _build_perfect_attested(anchor_qs)
+        report = knowledge_check(
+            probe, data, anchors, real_attested,
+            anchor=anchor_data, anchor_answers=anchor_attested,
+            provider_config=_provider_config(),
+        )
+        assert report.anchor_validity == "PAIRING_FAILED"
+        # Derived stats remain suppressed — same gate as
+        # REFUSAL_SUSPECTED, only the tag changes.
+        assert report.bucket_delta is None
+        assert report.bucket_delta_ci is None
+        # Sanity: validity tag is genuinely distinct, not aliased.
+        assert report.anchor_validity != "REFUSAL_SUSPECTED"
+
+
+class TestDeprecatedPairScoresByPositionRemovalScheduled:
+    def test_docstring_announces_removal_in_v2_3(self):
+        # Commit F policy: keep the deprecated alias through v2.2.x
+        # and remove in v2.3.0. The removal intent must be visible
+        # in the source docstring so audit cycles don't lose it.
+        from aiphaforge.probes.orchestrator import (
+            _pair_scores_by_position,
+        )
+        doc = _pair_scores_by_position.__doc__ or ""
+        assert "Removal scheduled: v2.3.0" in doc
+
+
 class TestKnowledgeCheckPairByQid:
     def test_anchor_pairing_uses_qid_not_position(self):
         # End-to-end: real and anchor probes share qids by
