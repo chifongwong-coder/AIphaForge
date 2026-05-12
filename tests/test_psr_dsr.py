@@ -29,7 +29,9 @@ from tests.conftest import make_ohlcv
 
 
 def _manual_psr(rets: pd.Series, *, benchmark_per: float = 0.0) -> float:
-    sr_per = float(rets.mean() / rets.std())
+    # v2.2.2 Commit B: track the production default ddof=0 (Bailey-LdP
+    # canonical biased σ; pairs with the √(n-1) standardization below).
+    sr_per = float(rets.mean() / rets.std(ddof=0))
     skew = float(stats.skew(rets, bias=False))
     kurt_pearson = float(stats.kurtosis(rets, fisher=False, bias=False))
     n = len(rets)
@@ -52,10 +54,14 @@ class TestProbabilisticSharpeRatio:
         assert res.psr == pytest.approx(_manual_psr(rets), rel=1e-9)
 
     def test_normal_returns_locks_specific_value(self):
+        # v2.2.2 Commit B: re-pinned for the new default ddof=0
+        # (Bailey-LdP canonical biased σ). Previous pin was 0.9890164
+        # under v2.2.1's ddof=1 default; the ~4e-5 shift is the
+        # sqrt(T/(T-1)) bias factor on SR at T=750.
         np.random.seed(42)
         rets = pd.Series(np.random.normal(0.001, 0.01, 750))
         res = probabilistic_sharpe_ratio(rets, benchmark_sharpe=0.0)
-        assert res.psr == pytest.approx(0.9890164, abs=1e-6)
+        assert res.psr == pytest.approx(0.9890599896, abs=1e-7)
 
     def test_returns_psr_result_dataclass(self):
         np.random.seed(1)
@@ -117,6 +123,119 @@ class TestProbabilisticSharpeRatio:
         rets = pd.Series(np.random.normal(0.0001, 0.01, 750))
         res = probabilistic_sharpe_ratio(rets, benchmark_sharpe=1.0)
         assert res.psr < 0.30
+
+
+# ---------------------------------------------------------------------------
+# v2.2.2 Commit B: canonical-formula PSR/DSR tests (hand-computed)
+# ---------------------------------------------------------------------------
+
+
+class TestPSRCanonicalBaileyLopezDePrado:
+    """Hand-computed PSR at T=50 against Bailey & López de Prado 2012, eq. 14.
+
+    WARNING: do NOT regenerate the expected value from production code.
+    The point of this test is to verify that production matches the
+    paper formula. If this test fails, suspect the production code first,
+    not the expected value.
+
+    Fixture: 25 returns of +0.01, 25 of -0.005, interleaved. Chosen so
+    skewness is 0 by construction (symmetric deviations from μ) and the
+    kurtosis ratio simplifies cleanly. T=50 keeps the bias-corrected
+    moment estimators stable (the (n-1)/((n-2)(n-3)) factor in
+    `stats.kurtosis(bias=False)` is ill-conditioned for small n).
+
+    Arithmetic:
+      μ = 0.0025
+      Deviations: +0.0075 (for +0.01 entries), -0.0075 (for -0.005 entries)
+      m2 = 0.0075² = 5.625e-5
+      σ_biased = √m2 = 0.0075
+      SR_biased = μ / σ_biased = 0.0025 / 0.0075 = 1/3
+      m3 = 0 by symmetry → skew (bias-corrected G1) = 0
+      m4 = 0.0075⁴
+      biased kurt ratio m4/m2² = 1.0
+      bias-corrected Pearson kurtosis (G2 + 3):
+          G2 = (49/(48·47)) · (51·1.0 − 3·49) + 0
+             = 49/2256 · (−96)
+             = −4704/2256
+             = −2.085106382978723
+          Pearson_kurt = G2 + 3 = 0.914893617021277
+      denom = 1 − γ₃·SR + (γ₄−1)/4 · SR²
+            = 1 + (0.914893617... − 1) / 4 · (1/9)
+            = 1 + (−0.085106382978723) / 36
+            = 1 − 0.002364066194
+            = 0.997635933806
+      z = SR · √(T−1) / √denom = (1/3) · √49 / √0.997635933806
+        = (7/3) / 0.998817217...
+        = 2.336094...
+      PSR = Φ(2.336094) ≈ 0.9902568887
+    """
+
+    def test_psr_t50_matches_bailey_lopez_de_prado_eq_14(self):
+        rets = pd.Series(
+            [0.01 if i % 2 == 0 else -0.005 for i in range(50)]
+        )
+        # Pass trading_days=252 to fully exercise the same code path as
+        # the BacktestResult API (no impact on PSR — annualization only
+        # affects observed_sharpe display).
+        res = probabilistic_sharpe_ratio(
+            rets, benchmark_sharpe=0.0, trading_days=252,
+        )
+        assert res.psr == pytest.approx(0.9902568887, abs=1e-7)
+        # Sanity on intermediate fields per the hand calc.
+        assert res.skewness == pytest.approx(0.0, abs=1e-10)
+        assert res.kurtosis == pytest.approx(
+            0.914893617021277, abs=1e-9,
+        )
+
+    def test_psr_explicit_ddof_one_recovers_v2_2_1_value(self):
+        # Same fixture; std_ddof=1 should give a different value
+        # related by the sqrt(T/(T-1)) bias factor on the SR numerator.
+        rets = pd.Series(
+            [0.01 if i % 2 == 0 else -0.005 for i in range(50)]
+        )
+        res_default = probabilistic_sharpe_ratio(rets, benchmark_sharpe=0.0)
+        res_optout = probabilistic_sharpe_ratio(
+            rets, benchmark_sharpe=0.0, std_ddof=1,
+        )
+        # The two values are different (no silent equivalence).
+        assert res_default.psr != res_optout.psr
+        # And the difference reflects the σ shift: ddof=1 σ is larger
+        # by sqrt(T/(T-1)), so SR shrinks, so PSR drops.
+        assert res_default.psr > res_optout.psr
+
+
+class TestDSRCanonicalBaileyLopezDePrado:
+    """Hand-computed DSR sanity at T=50, N=100 trials.
+
+    WARNING: do NOT regenerate the expected value from production code.
+
+    Uses the same fixture as the PSR canonical test. The DSR adds the
+    Euler-correction term computing the expected max Sharpe under N
+    trials (eq. 7) and runs PSR against that threshold. We don't pin
+    DSR itself to a high-precision value (the Euler correction
+    `(1-γ)Φ⁻¹(1-1/N) + γΦ⁻¹(1-1/(Ne))` is well-tested elsewhere); we
+    pin two structural invariants:
+
+      1. expected_max_null_sharpe is positive and finite (the function
+         actually fires the formula, not silently NaNs).
+      2. DSR < PSR(benchmark=0) by a meaningful margin (the deflation
+         actually deflates).
+    """
+
+    def test_dsr_t50_n100_deflates_psr(self):
+        rets = pd.Series(
+            [0.01 if i % 2 == 0 else -0.005 for i in range(50)]
+        )
+        psr = probabilistic_sharpe_ratio(
+            rets, benchmark_sharpe=0.0, trading_days=252,
+        )
+        dsr = deflated_sharpe_ratio(
+            rets, n_trials=100, trading_days=252,
+        )
+        assert np.isfinite(dsr.expected_max_null_sharpe)
+        assert dsr.expected_max_null_sharpe > 0
+        # Deflation actually deflates.
+        assert dsr.dsr < psr.psr - 0.001
 
 
 # ---------------------------------------------------------------------------
@@ -188,8 +307,10 @@ class TestDeflatedSharpeRatio:
         T, td, N = 252, 252, 1000
         rets = pd.Series(np.random.normal(0.001, 0.01, T))
 
-        # Manual Bailey 2014 calc (using full skew/kurt expression)
-        sr_per = float(rets.mean() / rets.std())
+        # Manual Bailey 2014 calc (using full skew/kurt expression).
+        # v2.2.2 Commit B: ddof=0 to match the production default
+        # (Bailey-LdP canonical biased σ).
+        sr_per = float(rets.mean() / rets.std(ddof=0))
         skew = float(stats.skew(rets, bias=False))
         kurt_pearson = float(stats.kurtosis(rets, fisher=False, bias=False))
         var_sr_per = (1 - skew * sr_per

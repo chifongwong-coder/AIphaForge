@@ -239,6 +239,7 @@ def probabilistic_sharpe_ratio(
     *,
     benchmark_sharpe: float = 0.0,
     trading_days: Optional[int] = None,
+    std_ddof: int = 0,
 ) -> PSRResult:
     """Bailey & Lopez de Prado 2012, eq. 14.
 
@@ -258,6 +259,16 @@ def probabilistic_sharpe_ratio(
             1. If passed (not None), use it.
             2. Else if source is BacktestResult, use ``source.trading_days``.
             3. Else 252.
+        std_ddof: Degrees-of-freedom divisor for the SR denominator's σ.
+            v2.2.2 default is ``0`` (biased σ, dividing by T), which is
+            the canonical Bailey-LdP eq. 14 form — the √(T-1) factor in
+            the z-statistic numerator is the variance standardization
+            paired with the biased SR estimator. v2.2.1 and earlier
+            silently used ``ddof=1`` (pandas default), which paired
+            unbiased σ with the √(T-1) standardization — an internal
+            inconsistency. Users who pinned v2.2.1 numerical values
+            can opt out by passing ``std_ddof=1``. Numeric shift is
+            ~0.2% at T=252 and ~2% at T=20.
 
     Returns:
         PSRResult. ``psr`` is NaN when:
@@ -287,7 +298,7 @@ def probabilistic_sharpe_ratio(
 
     if n < 4:
         return _nan_result()
-    std = float(rets.std())
+    std = float(rets.std(ddof=std_ddof))
     # Guard against ~constant series where std is finite but vanishing
     # (floating-point noise), which makes sr_per blow up and the
     # downstream skew / kurtosis degenerate.
@@ -329,6 +340,7 @@ def deflated_sharpe_ratio(
     *,
     n_trials: int,
     trading_days: Optional[int] = None,
+    std_ddof: int = 0,
 ) -> DSRResult:
     """Bailey, Borwein, López de Prado & Zhu 2014.
 
@@ -341,12 +353,22 @@ def deflated_sharpe_ratio(
         source: A BacktestResult or pd.Series of per-period returns.
         n_trials: Number of strategy variants tested before selection.
         trading_days: Annualisation factor (see resolution order above).
+        std_ddof: σ degrees-of-freedom; default ``0`` per Bailey-LdP
+            canonical form. See :func:`probabilistic_sharpe_ratio` for
+            the rationale and the v2.2.2 numeric shift note.
 
     Returns:
         DSRResult. ``dsr`` is NaN when:
             - n < 4 observations, or
             - n_trials < 1, or
             - returns std == 0.
+
+    Note on autocorrelation:
+        The variance formula at eq. 6 assumes i.i.d. returns. Lo (2002)
+        gives an autocorrelation correction; this implementation does
+        NOT apply it. For strongly autocorrelated return series (e.g.
+        overlapping-window strategies, intraday at <1min) the DSR
+        understates uncertainty. Flagged for v2.3.
     """
     import math
 
@@ -368,7 +390,7 @@ def deflated_sharpe_ratio(
             dsr=float("nan"), n_trials=int(n_trials),
         )
 
-    std = float(rets.std())
+    std = float(rets.std(ddof=std_ddof))
     if not np.isfinite(std) or std < 1e-12:
         return DSRResult(
             observed_sharpe=float("nan"),

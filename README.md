@@ -126,6 +126,11 @@ The Q&A pillar (v2.2 `knowledge_check`) is **non-transitive** with the obfuscati
 
 Every `KnowledgeCheckReport.notes` carries this warning verbatim. Reports are intentionally not aggregated into a single 🟢/🟡/🔴 verdict — `KnowledgeCheckReport.is_pillar_summary` is `False` and the `__post_init__` rejects any attempt to flip it.
 
+#### v2.2.2 patch additions
+
+##### BREAKING NUMERIC: PSR / DSR default σ convention
+`probabilistic_sharpe_ratio` and `deflated_sharpe_ratio` previously used `rets.std()` (pandas default `ddof=1`, sample σ) but paired it with the `√(T-1)` standardization in the z-statistic — internally inconsistent with the cited Bailey & López de Prado (2012, eq. 14), which derives the formula using the **biased** σ estimator (ddof=0, divides by T). v2.2.2 flips the default to `std_ddof=0` (canonical Bailey-LdP form). Numeric drift relative to v2.2.1: ~0.2% at T=252, ~2% at T=20. Users who pinned an exact v2.2.1 PSR/DSR value in their tests can preserve the historic number by passing `std_ddof=1` explicitly. Both functions also gained a docstring note that the DSR's variance formula assumes i.i.d. returns; the Lo (2002) autocorrelation correction is currently un-applied and flagged for v2.3.
+
 #### v2.2.1 patch additions
 - **`LEAKAGE_INDEX_BUCKET_WEIGHTS`** public export (`MappingProxyType`, immutable) — paper authors should import the locked weights instead of transcribing the literals so citations track the version-locked schedule (changing the weights requires a `__version__` bump per § 14).
 - **`bucket_delta_ci`** as the canonical name for `bucket_delta_tango_ci`. The historic name was misleading (the implementation is Wald-style with a sentinel-on-zero-width fallback, not real Tango). Both fields are populated to the same dict; `bucket_delta_tango_ci` is `Removal scheduled: v2.3.0`. Real Tango lands in v2.2.2.
