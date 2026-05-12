@@ -488,6 +488,10 @@ _PERSISTENCE_CAVEAT = (
 # numeric literals — that way the citation tracks the locked weights
 # across releases. The underscored name remains as a backward-compat
 # alias for existing internal callers.
+#
+# v2.2.1 audit fix Commit I: Removal scheduled: v2.3.0. Internal
+# callers should migrate to ``LEAKAGE_INDEX_BUCKET_WEIGHTS``; the
+# private alias is retained for the v2.2.x line.
 LEAKAGE_INDEX_BUCKET_WEIGHTS: Mapping[str, float] = MappingProxyType({
     "exact": 4.0, "near": 3.0, "rough": 2.0, "miss": 1.0, "invalid": 0.0,
 })
@@ -698,6 +702,11 @@ def _score_rank_attested(
 # private name as a backward-compat alias. noqa: E402 — late
 # import is intentional to keep the rest of orchestrator.py's
 # import block at the top.
+#
+# v2.2.1 audit-fix Commit I: Removal scheduled: v2.3.0. Internal
+# callers should migrate to ``aiphaforge.probes._vol.
+# apply_vol_scaling_to_question_set``; the underscored re-export
+# is retained for the v2.2.x line.
 from aiphaforge.probes._vol import (  # noqa: E402
     apply_vol_scaling_to_question_set as _apply_vol_scaling_to_question_set,
 )
@@ -765,6 +774,11 @@ class KnowledgeCheckReport:
     # canonical name going forward. Both fields are populated to the
     # same dict in ``__post_init__`` so v2.2.0/v2.2.1 callers keep
     # working. Real Tango lands in v2.2.2.
+    #
+    # v2.2.1 audit-fix Commit I: Removal scheduled: v2.3.0. The
+    # canonical name is ``bucket_delta_ci``; migrate readers
+    # accordingly. The two names will continue to share the same
+    # dict object across the v2.2.x line.
     bucket_delta_tango_ci: Optional[dict[str, tuple[float, float]]]
 
     # Paired sign test (per quant Q3 r2 — replaces Wilcoxon)
@@ -781,7 +795,22 @@ class KnowledgeCheckReport:
     anchor_refusal_rate: Optional[float]
     real_effective_rate: float
     anchor_effective_rate: Optional[float]
-    anchor_validity: str
+    # v2.2.1 audit-fix Commit I: tightened from bare `str` so
+    # downstream consumers using pyright/mypy can exhaustively
+    # dispatch on the tag. Values:
+    #   "NO_ANCHOR"          — no anchor supplied; nothing to compare.
+    #   "OK"                 — anchor present and pairing succeeded;
+    #                          bucket_delta and scalar_leakage_index
+    #                          are populated.
+    #   "REFUSAL_SUSPECTED"  — one side's effective rate is much
+    #                          lower than the other (or both are 0);
+    #                          derived stats suppressed.
+    #   "PAIRING_FAILED"     — qid sets on real/anchor reports do
+    #                          not overlap (v2.2.1 Commit F);
+    #                          derived stats suppressed.
+    anchor_validity: Literal[
+        "NO_ANCHOR", "OK", "REFUSAL_SUSPECTED", "PAIRING_FAILED",
+    ]
 
     # Persistence baseline (continuation only)
     persistence_baseline_score: Optional[QAProbeReport]
@@ -871,6 +900,17 @@ class KnowledgeCheckReport:
         their original type — callers serializing the full
         report should still walk them with their own
         serialization helpers.
+
+        Nested dataclass guidance (v2.2.1 audit-fix Commit I):
+        ``real_score``, ``anchor_score``, and
+        ``persistence_baseline_score`` are ``QAProbeReport``
+        instances. ``QAProbeReport`` and its component types
+        (``QuestionScore``, ``TemplateAggregate``, etc.) contain
+        NO ``MappingProxyType`` members — they are safe to pass to
+        ``dataclasses.asdict()`` directly. Only THIS top-level
+        dataclass holds the proxy-wrapped fields that asdict()
+        rejects, so callers don't need bespoke serialization for
+        the nested types.
         """
         from dataclasses import fields
         out: dict[str, Any] = {}
