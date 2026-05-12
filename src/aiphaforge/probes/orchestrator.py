@@ -681,87 +681,14 @@ def _score_rank_attested(
     return report, counter
 
 
-def _apply_vol_scaling_to_question_set(
-    probe: "ProbeT",
-    question_set: "QuestionSet",
-    data: Union[pd.DataFrame, dict[str, pd.DataFrame]],
-) -> tuple["QuestionSet", dict[str, dict[str, Any]]]:
-    """v2.2.1 #1: rewrite each QuestionSpec.tolerance to the
-    vol-scaled form when its tolerance carries a vol_scale spec.
-
-    Returns (new_question_set, provenance_by_qid).
-
-    Skips:
-      - Questions whose tolerance is None.
-      - Questions whose tolerance.vol_scale is None.
-      - RankContinuationProbe (rank scoring uses Spearman ρ, not
-        sigma-bands; vol_scale doesn't apply).
-
-    For each scoped question:
-      - KnowledgeProbe → point-in-time mode; sigma from bars
-        strictly before qs.timestamp on the side's data.
-      - ContinuationProbe → continuation mode; sigma from bars
-        ending at the LAST context bar (held fixed across forward
-        steps).
-    """
-    from dataclasses import replace as _dc_replace
-
-    from ._vol import (
-        apply_vol_scale,
-        estimate_sigma_for_continuation,
-        estimate_sigma_for_pointintime,
-    )
-    from .questions import QuestionSet
-    if isinstance(probe, RankContinuationProbe):
-        # Rank scoring doesn't use vol-scaled bands.
-        return question_set, {}
-
-    rewritten: list = []
-    provenance: dict[str, dict[str, Any]] = {}
-
-    for qs in question_set:
-        if qs.tolerance is None or qs.tolerance.vol_scale is None:
-            rewritten.append(qs)
-            continue
-
-        # data may be a DataFrame (single-symbol probes) or a dict
-        # (RankContinuationProbe — but we excluded that above).
-        if isinstance(data, dict):
-            symbol_data = data.get(qs.symbol)
-            if symbol_data is None:
-                rewritten.append(qs)
-                continue
-        else:
-            symbol_data = data
-
-        spec = qs.tolerance.vol_scale
-        if isinstance(probe, ContinuationProbe):
-            ctx = qs.metadata.get("context_window")
-            if not ctx:
-                rewritten.append(qs)
-                continue
-            last_ctx_ts = pd.Timestamp(ctx[-1]["index"])
-            sigma, prov = estimate_sigma_for_continuation(
-                symbol_data, last_ctx_ts,
-                window=spec.window,
-                method=spec.method,
-                preset_name=qs.tolerance.preset_name,
-                log_returns=spec.log_returns,
-            )
-        else:
-            # Point-in-time probes (KnowledgeProbe).
-            sigma, prov = estimate_sigma_for_pointintime(
-                symbol_data, qs.timestamp,
-                window=spec.window,
-                method=spec.method,
-                preset_name=qs.tolerance.preset_name,
-                log_returns=spec.log_returns,
-            )
-        scaled_tol = apply_vol_scale(qs.tolerance, sigma)
-        rewritten.append(_dc_replace(qs, tolerance=scaled_tol))
-        provenance[qs.question_id] = prov
-
-    return QuestionSet(rewritten), provenance
+# v2.2.1 audit-fix Commit D: _apply_vol_scaling_to_question_set
+# moved to _vol.py (canonical home). Re-exported under the old
+# private name as a backward-compat alias. noqa: E402 — late
+# import is intentional to keep the rest of orchestrator.py's
+# import block at the top.
+from aiphaforge.probes._vol import (  # noqa: E402
+    apply_vol_scaling_to_question_set as _apply_vol_scaling_to_question_set,
+)
 
 
 def _compute_scalar_leakage_index_and_z(
