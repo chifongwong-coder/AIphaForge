@@ -126,6 +126,15 @@ The Q&A pillar (v2.2 `knowledge_check`) is **non-transitive** with the obfuscati
 
 Every `KnowledgeCheckReport.notes` carries this warning verbatim. Reports are intentionally not aggregated into a single 🟢/🟡/🔴 verdict — `KnowledgeCheckReport.is_pillar_summary` is `False` and the `__post_init__` rejects any attempt to flip it.
 
+#### v2.2.1 patch additions
+- **`LEAKAGE_INDEX_BUCKET_WEIGHTS`** public export (`MappingProxyType`, immutable) — paper authors should import the locked weights instead of transcribing the literals so citations track the version-locked schedule (changing the weights requires a `__version__` bump per § 14).
+- **`bucket_delta_ci`** as the canonical name for `bucket_delta_tango_ci`. The historic name was misleading (the implementation is Wald-style with a sentinel-on-zero-width fallback, not real Tango). Both fields are populated to the same dict; `bucket_delta_tango_ci` is `Removal scheduled: v2.3.0`. Real Tango lands in v2.2.2.
+- **`anchor_validity`** typed as `Literal["NO_ANCHOR", "OK", "REFUSAL_SUSPECTED", "PAIRING_FAILED"]` (was bare `str`). `PAIRING_FAILED` is a new tag distinct from `REFUSAL_SUSPECTED` — the former fires when the real-side and anchor-side question_id sets do not overlap, the latter when one side's effective rate is much lower than the other.
+- **`parser_used_distribution_real` / `_anchor`** typed `Mapping[str, int]` fields on `KnowledgeCheckReport` (rank probes only) — per-side `Counter` of which parser path resolved each `AnswerRecord` (e.g., `user_provided_list`, `json_array`, `numbered`, `raw_text_unparseable`). When the distribution is non-degenerate (different parser paths fired across the probe set), a drift-note appears in `notes` pointing readers at `manifest.provider_config` to check for prompt-template churn.
+- **Structured-input refusal carve-out**: when `AnswerRecord.parsed_answer` is a `RankAnswer` / `Sequence[str]` / dict-with-ranking AND `parse_status == "valid"`, `compute_effective_rate` and `compute_refusal_rate` skip the refusal heuristic on `raw_answer` (the user already did the parsing work; the engine's refusal heuristic is moot for them).
+- **`KnowledgeCheckReport.to_dict()`** helper that unwraps the `MappingProxyType` fields so users following the standard `json.dumps(asdict(report))` pattern don't crash. Nested dataclass fields (`real_score`, `anchor_score`, `persistence_baseline_score`) contain no `MappingProxyType` members and remain safe to pass to `dataclasses.asdict()` directly.
+- **Sign-test continuity correction** uses the textbook `max(|n_pos − n/2| − 0.5, 0)` form (floors the numerator at 0 before dividing) — same numeric output as the prior post-hoc clamp, cleaner derivation; tied `n_pos == n/2` produces `z = 0 → p = 1` directly.
+
 ### Trading Calendar
 Daily-resolution trading-day primitive shipped as a self-contained `aiphaforge.calendars` package. Note: the module name is **plural** (`calendars`) to avoid shadowing the Python stdlib `calendar`.
 - **`TradingCalendar`** dataclass with `is_trading_day` / `next_trading_day` / `prev_trading_day` / `snap` / `is_conformant` and a `stable_fingerprint` for cross-instance value-equality
