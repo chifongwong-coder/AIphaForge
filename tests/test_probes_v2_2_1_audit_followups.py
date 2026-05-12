@@ -221,6 +221,93 @@ class TestBucketDeltaCiAlias:
         assert replaced.bucket_delta_tango_ci is ci
 
 
+class TestBucketDeltaCiAliasInvariant:
+    """v2.2.2 Commit E: hard-enforce the shared-reference invariant.
+
+    The docstring promises both alias fields always point at the same
+    dict object. v2.2.1's __post_init__ cross-populated only when
+    exactly one side was None; constructing with two distinct dicts
+    silently violated the invariant.
+    """
+
+    def _valid_base(self) -> KnowledgeCheckReport:
+        # Build a real valid report so we can use dataclasses.replace
+        # to construct test states.
+        data, ts = _multi_data()
+        probe = RankContinuationProbe(
+            symbols=["A", "B", "C"], context_bars=5,
+            forward_horizon=1,
+        )
+        qs = probe.build(data, [ts])
+        qid = list(qs)[0].question_id
+        real = AttestedAnswers(
+            answers=(AnswerRecord(
+                question_id=qid, raw_answer=None,
+                parsed_answer=["A", "B", "C"],
+                parse_status="valid",
+            ),),
+            parsing_schema_hash="a" * 64,
+            parsing_schema_description="x",
+            prompt_template_hash="b" * 64,
+            prompt_template_description="y",
+        )
+        from aiphaforge.probes.anchors import build_synthetic_anchor
+        anchor_data = {
+            sym: build_synthetic_anchor(
+                df, seed=1, method="random_walk_volmatched",
+            )
+            for sym, df in data.items()
+        }
+        anchor_qs = probe.build(anchor_data, [ts])
+        anchor_qid = list(anchor_qs)[0].question_id
+        anchor_truth = list(anchor_qs)[0].truth_value
+        anchor_attested = AttestedAnswers(
+            answers=(AnswerRecord(
+                question_id=anchor_qid, raw_answer=None,
+                parsed_answer=list(anchor_truth),
+                parse_status="valid",
+            ),),
+            parsing_schema_hash="a" * 64,
+            parsing_schema_description="x",
+            prompt_template_hash="b" * 64,
+            prompt_template_description="y",
+        )
+        return knowledge_check(
+            probe, data, [ts], real,
+            anchor=anchor_data["A"],
+            anchor_answers=anchor_attested,
+            provider_config=_provider_config(),
+        )
+
+    def test_distinct_dicts_for_both_fields_raises_valueerror(self):
+        import dataclasses
+        base = self._valid_base()
+        d1 = {"exact": (-0.1, 0.2)}
+        d2 = {"exact": (-0.5, 0.5)}  # DIFFERENT dict object
+        with pytest.raises(ValueError) as exc_info:
+            dataclasses.replace(
+                base,
+                bucket_delta_ci=d1,
+                bucket_delta_tango_ci=d2,
+            )
+        # Error message points at the v2.3 migration path.
+        assert "bucket_delta_ci" in str(exc_info.value)
+        assert "bucket_delta_tango_ci" in str(exc_info.value)
+
+    def test_same_dict_for_both_fields_is_accepted(self):
+        import dataclasses
+        base = self._valid_base()
+        shared = {"exact": (-0.1, 0.2)}
+        # Same object identity → no exception.
+        replaced = dataclasses.replace(
+            base,
+            bucket_delta_ci=shared,
+            bucket_delta_tango_ci=shared,
+        )
+        assert replaced.bucket_delta_ci is shared
+        assert replaced.bucket_delta_tango_ci is shared
+
+
 # ---------- Commit G: Arrow dtype acceptance in _is_sequence_of_str ----------
 
 

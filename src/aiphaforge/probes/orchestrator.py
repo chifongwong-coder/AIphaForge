@@ -967,6 +967,25 @@ class KnowledgeCheckReport:
             object.__setattr__(
                 self, "bucket_delta_tango_ci", self.bucket_delta_ci,
             )
+        # v2.2.2 Commit E: enforce the shared-reference invariant.
+        # The docstring (lines 855-864) promises both fields are
+        # ALWAYS the same dict object. The cross-population above
+        # only fires when exactly one side is None. A caller that
+        # constructs the dataclass with TWO DISTINCT non-None dicts
+        # (legal under the type hints) silently violates the
+        # invariant, after which downstream reads through the two
+        # names diverge. Detect and raise.
+        elif (self.bucket_delta_ci is not None
+                and self.bucket_delta_tango_ci is not None
+                and self.bucket_delta_ci is not self.bucket_delta_tango_ci):
+            raise ValueError(
+                "bucket_delta_ci and bucket_delta_tango_ci must be the "
+                "same dict object (alias). Pass only ONE of the two "
+                "fields at construction time; __post_init__ "
+                "cross-populates the other. The historic "
+                "_tango_ci suffix is being removed in v2.3.0; new "
+                "code should use bucket_delta_ci only."
+            )
 
 
 # ---------- knowledge_check orchestrator ----------
