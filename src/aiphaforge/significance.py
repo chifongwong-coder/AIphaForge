@@ -1168,6 +1168,10 @@ def _benjamini_hochberg(
     return corrected_orig, significant
 
 
+# Hansen, Lunde & Nason 2011, "The Model Confidence Set",
+# Econometrica 79(2), 453-497. The MCS computes a confidence set of
+# models that contains the best model(s) with a chosen confidence
+# level (1 - alpha) under a stationary-bootstrap null.
 def _arch_mcs(
     returns_matrix: np.ndarray,
     alpha: float,
@@ -1175,7 +1179,7 @@ def _arch_mcs(
     block_size: Optional[int],
     random_state: Optional[int],
 ) -> tuple:
-    """Wrapper around arch.bootstrap.MCS.
+    """Wrapper around arch.bootstrap.MCS (Hansen-Lunde-Nason 2011).
 
     Parameters:
         returns_matrix: T x N_strategies array of per-bar returns.
