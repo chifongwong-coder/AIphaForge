@@ -552,14 +552,25 @@ class BacktestEngine:
 
         symbols = sorted(data_dict.keys())
 
-        # Validate each asset's data
+        # v2.2.2 Commit D: validate AND normalize into a local dict
+        # rather than mutating the caller's data_dict in place. Prior
+        # behavior was to write normalized frames back via
+        # `data_dict[sym] = ...`, which silently replaced the user's
+        # frames with sorted/dtype-converted copies — breaking
+        # patterns where the same data_dict is reused (e.g. running
+        # multiple backtests on the same input).
+        normalized: Dict[str, pd.DataFrame] = {}
         for sym, df in data_dict.items():
             validate_ohlcv(
                 df,
                 required=['open', 'high', 'low', 'close'],
                 validation_level=self.data_validation,
             )
-            data_dict[sym] = ensure_datetime_index(df).sort_index().copy()
+            normalized[sym] = ensure_datetime_index(df).sort_index().copy()
+        # All downstream references must use `normalized`, not
+        # `data_dict`. Replace the local binding to keep the rest of
+        # this method's body unchanged. The CALLER's dict is unchanged.
+        data_dict = normalized
 
         # Validate secondary data
         if secondary_data is not None:
