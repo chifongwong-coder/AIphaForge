@@ -96,7 +96,8 @@ class TestDriftNote:
             notes,
         )
         assert len(notes) == 1
-        assert "['real']" in notes[0]
+        assert "Non-degenerate side(s): real" in notes[0]
+        assert "anchor" not in notes[0].split("Non-degenerate")[1]
 
     def test_emit_when_anchor_non_degenerate(self):
         notes: list[str] = []
@@ -106,7 +107,7 @@ class TestDriftNote:
             notes,
         )
         assert len(notes) == 1
-        assert "['anchor']" in notes[0]
+        assert "Non-degenerate side(s): anchor" in notes[0]
 
     def test_emit_when_both_non_degenerate(self):
         notes: list[str] = []
@@ -116,7 +117,7 @@ class TestDriftNote:
             notes,
         )
         assert len(notes) == 1
-        assert "['real', 'anchor']" in notes[0]
+        assert "Non-degenerate side(s): real, anchor" in notes[0]
 
     def test_note_text_includes_provider_config_pointer(self):
         notes: list[str] = []

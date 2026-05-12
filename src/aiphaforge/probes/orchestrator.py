@@ -373,17 +373,26 @@ def compute_effective_rate(records: Sequence[AnswerRecord]) -> float:
 
     v2.2.1 #12 Commit B: structured-input carve-out — when
     rec.parsed_answer is a RankAnswer / Sequence[str] / dict-with-
-    ranking, skip the refusal heuristic on raw_answer (user
-    already did the parsing).
+    ranking AND parse_status == "valid", skip the refusal heuristic
+    on raw_answer (user already did the parsing).
+
+    v2.2.1 audit-fix nit (LE #1): carve-out also requires
+    parse_status == "valid". An upstream parser flagging the
+    structured payload as invalid (e.g., schema-validation failure
+    above the engine) should NOT be silently overridden into
+    "effective" by this carve-out.
     """
     n_total = len(records)
     if n_total == 0:
         return 0.0
     n_eff = 0
     for rec in records:
-        if _is_structured_rank_input(rec.parsed_answer):
-            # Structured input — counted as effective regardless of
-            # raw_answer content.
+        if (
+            _is_structured_rank_input(rec.parsed_answer)
+            and rec.parse_status == "valid"
+        ):
+            # Structured input AND user-attested valid → counted as
+            # effective regardless of raw_answer content.
             n_eff += 1
             continue
         parsed = (rec.parsed_answer is not None
@@ -397,15 +406,21 @@ def compute_effective_rate(records: Sequence[AnswerRecord]) -> float:
 def compute_refusal_rate(records: Sequence[AnswerRecord]) -> float:
     """Fraction of AnswerRecords whose raw_answer looks like refusal.
 
-    v2.2.1 #12 Commit B: structured-input carve-out — records with
-    structured parsed_answer are NOT counted as refusals regardless
-    of raw_answer content.
+    v2.2.1 #12 Commit B + audit-fix nit (LE #1): structured-input
+    carve-out only fires when parse_status == "valid". Records with
+    structured payload but parse_status != "valid" still get the
+    refusal heuristic applied.
     """
     if not records:
         return 0.0
+    def _carve_out_applies(r: AnswerRecord) -> bool:
+        return (
+            _is_structured_rank_input(r.parsed_answer)
+            and r.parse_status == "valid"
+        )
     return sum(
         1 for r in records
-        if not _is_structured_rank_input(r.parsed_answer)
+        if not _carve_out_applies(r)
         and looks_like_refusal(r.raw_answer or "")
     ) / len(records)
 
@@ -535,13 +550,17 @@ def _maybe_emit_parser_used_drift_note(
     ):
         drifted_sides.append("anchor")
     if drifted_sides:
+        # v2.2.1 audit-fix nit: emit comma-joined human-readable
+        # form instead of Python list repr ('real, anchor' vs
+        # "['real', 'anchor']"). Cleaner for paper readers.
+        sides_text = ", ".join(drifted_sides)
         notes.append(
             f"parser_used distribution is informational; LLM "
             f"nondeterminism upstream affects both this distribution "
             f"and bucket counts. Cross-run comparisons should "
             f"disclose LLM sampling parameters (see "
             f"KnowledgeCheckReport.manifest.provider_config). "
-            f"Non-degenerate side(s): {drifted_sides}."
+            f"Non-degenerate side(s): {sides_text}."
         )
 
 
@@ -872,6 +891,37 @@ class KnowledgeCheckReport:
 
     is_pillar_summary: bool = False  # ENFORCED False
 
+    def to_dict(self) -> dict[str, Any]:
+        """Convert this report to a plain-dict representation
+        suitable for JSON serialization.
+
+        v2.2.1 audit-fix nit (LE #2): the dataclass uses
+        MappingProxyType for the parser_used_distribution_*
+        fields to preserve frozen-dataclass immutability. But
+        Python's stdlib ``dataclasses.asdict()`` raises
+        ``TypeError: cannot pickle 'mappingproxy' object`` on
+        these fields. Users following the standard
+        ``json.dumps(asdict(report))`` pattern hit this. This
+        method provides a working alternative — it unwraps any
+        MappingProxyType to a plain dict so the result is
+        JSON-serializable.
+
+        The output is a shallow copy with field-by-field
+        unwrapping; nested dataclasses (real_score etc.) keep
+        their original type — callers serializing the full
+        report should still walk them with their own
+        serialization helpers.
+        """
+        from dataclasses import fields
+        out: dict[str, Any] = {}
+        for f in fields(self):
+            v = getattr(self, f.name)
+            if isinstance(v, MappingProxyType):
+                out[f.name] = dict(v)
+            else:
+                out[f.name] = v
+        return out
+
     def __post_init__(self):
         if self.is_pillar_summary:
             raise ValueError(
@@ -1043,6 +1093,10 @@ def knowledge_check(
     sign_test_variant: Optional[str] = None
     anchor_validity = "NO_ANCHOR"
     notes: list[str] = []
+    # v2.2.1 audit-fix nit: hoist anchor_parser_counter init out
+    # of the conditional block so the later `try/except NameError`
+    # is unnecessary. Mirrors real_parser_counter declaration above.
+    anchor_parser_counter: Optional[Counter[str]] = None
 
     if anchor is not None and anchor_answers is not None:
         if isinstance(probe, RankContinuationProbe):
@@ -1069,8 +1123,8 @@ def knowledge_check(
         for qid, prov in anchor_vol_prov.items():
             vol_scale_provenance.setdefault(qid, {})["anchor"] = prov
         # v2.2.1 #12 Commit A: same RankContinuationProbe routing
-        # on anchor side.
-        anchor_parser_counter: Optional[Counter[str]] = None
+        # on anchor side. (anchor_parser_counter was initialized
+        # to None at the outer scope per audit-fix nit.)
         if isinstance(probe, RankContinuationProbe):
             anchor_report, anchor_parser_counter = (
                 _score_rank_attested(
@@ -1277,13 +1331,8 @@ def knowledge_check(
     if isinstance(probe, RankContinuationProbe):
         if real_parser_counter is not None:
             parser_used_dist_real = dict(real_parser_counter)
-        # anchor_parser_counter only exists when anchor branch ran;
-        # guard via `try` against NameError when anchor was None.
-        try:
-            if anchor_parser_counter is not None:
-                parser_used_dist_anchor = dict(anchor_parser_counter)
-        except NameError:
-            pass
+        if anchor_parser_counter is not None:
+            parser_used_dist_anchor = dict(anchor_parser_counter)
         _maybe_emit_parser_used_drift_note(
             parser_used_dist_real, parser_used_dist_anchor, notes,
         )
