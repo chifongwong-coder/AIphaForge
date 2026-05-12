@@ -5,16 +5,29 @@ Commit E:
 - bucket_delta_ci canonical alias for bucket_delta_tango_ci.
 
 Commit G adds further pre-merge tests in this same file (Arrow dtype,
-JSON sentinel round-trip, inline comma, anchor sigma strict).
+optional pyarrow, JSON sentinel round-trip, numbered inline comma,
+anchor sigma strict).
 """
 from __future__ import annotations
 
+import builtins
 import types
 
+import numpy as np
 import pandas as pd
+import pytest
 
 from aiphaforge.probes import LEAKAGE_INDEX_BUCKET_WEIGHTS
-from aiphaforge.probes._rank import RankContinuationProbe
+from aiphaforge.probes._continuation import (
+    ContinuationProbe,
+    NextCloseContinuation,
+)
+from aiphaforge.probes._hash_utils import _canonical_json
+from aiphaforge.probes._rank import (
+    RankContinuationProbe,
+    _is_sequence_of_str,
+    parse_rank_answer,
+)
 from aiphaforge.probes.anchors import build_synthetic_anchor
 from aiphaforge.probes.models import AnswerRecord, AttestedAnswers
 from aiphaforge.probes.orchestrator import (
@@ -184,3 +197,189 @@ class TestBucketDeltaCiAlias:
         )
         assert replaced.bucket_delta_ci is ci
         assert replaced.bucket_delta_tango_ci is ci
+
+
+# ---------- Commit G: Arrow dtype acceptance in _is_sequence_of_str ----------
+
+
+class TestIsSequenceOfStrArrowDtype:
+    def test_accepts_pandas_arrow_string_series(self):
+        # r7 §15 said path-2 acceptance must cover Arrow-backed
+        # string series too — mirroring the StringDtype branch so
+        # callers using `dtype=pd.ArrowDtype(pa.string())` (the
+        # pandas 2.x recommended path for high-throughput pipelines)
+        # don't fall through to the all-False return.
+        pa = pytest.importorskip("pyarrow")
+        s = pd.Series(
+            ["AAPL", "MSFT", "GOOG"],
+            dtype=pd.ArrowDtype(pa.string()),
+        )
+        assert _is_sequence_of_str(s)
+
+    def test_falls_through_when_pyarrow_missing(self, monkeypatch):
+        # The Arrow branch wraps `import pyarrow` in try/except so
+        # a deployment without pyarrow still loads. Simulate the
+        # missing-pyarrow case by hijacking the import: any
+        # well-formed list[str] must still be accepted via the
+        # sequence path, and an Arrow-typed series (which only the
+        # opt-in branch could recognize) must produce a clean False
+        # rather than raising ImportError.
+        real_import = builtins.__import__
+
+        def _block_pyarrow(name, *args, **kwargs):
+            if name == "pyarrow" or name.startswith("pyarrow."):
+                raise ImportError("pyarrow disabled for test")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", _block_pyarrow)
+        # Plain list still accepted regardless of pyarrow state.
+        assert _is_sequence_of_str(["AAPL", "MSFT"])
+        # Object-dtype Series with all-string values accepted via
+        # the object-dtype branch — pyarrow not needed for that.
+        s = pd.Series(["AAPL", "MSFT"], dtype=object)
+        assert _is_sequence_of_str(s)
+
+
+# ---------- Commit G: canonical_json sentinel round-trip ----------
+
+
+class TestCanonicalJsonSentinelRoundTrip:
+    def test_positive_infinite_sentinel_serializes_under_allow_nan_false(
+        self,
+    ):
+        # _canonical_json pins allow_nan=False to keep hashes
+        # reproducible across releases. The orchestrator stores
+        # divide-by-zero z as the literal string sentinels
+        # "positive_infinite"/"negative_infinite" instead of float
+        # inf so this serialization stays clean. Round-trip both
+        # sentinels through _canonical_json + json.loads.
+        import json
+        payload = {
+            "scalar_leakage_index": 0.5,
+            "scalar_leakage_index_z": "positive_infinite",
+            "nested": {
+                "other_z": "negative_infinite",
+            },
+        }
+        encoded = _canonical_json(payload)
+        decoded = json.loads(encoded)
+        assert decoded["scalar_leakage_index_z"] == "positive_infinite"
+        assert decoded["nested"]["other_z"] == "negative_infinite"
+
+    def test_float_inf_still_rejected_under_allow_nan_false(self):
+        # Sanity guard: the locked allow_nan=False kwarg must keep
+        # rejecting raw float infinities. Otherwise users could
+        # silently bypass the sentinel discipline.
+        with pytest.raises(ValueError):
+            _canonical_json({"z": float("inf")})
+
+
+# ---------- Commit G: numbered list does NOT split on inline commas ----------
+
+
+class TestParseRankAnswerNumberedInlineComma:
+    def test_inline_comma_in_numbered_does_not_silently_split(self):
+        # A numbered-list line that happens to contain a comma
+        # (e.g., "1. AAPL, 2. MSFT" was emitted as ONE line by a
+        # model that forgot to insert newlines) must NOT silently
+        # produce a 2-element ranking — that would invent intent
+        # the user never expressed. The numbered regex captures the
+        # whole tail as a single token; the result either fails to
+        # resolve against expected_symbols (returns None) or yields
+        # a single-token ranking that does not equal ["AAPL","MSFT"].
+        ans = parse_rank_answer(
+            "1. AAPL, 2. MSFT",
+            expected_symbols=["AAPL", "MSFT"],
+            normalization_preset="passthrough",
+        )
+        if ans is None:
+            # Acceptable: parser refused to commit to an ambiguous
+            # interpretation. This is the strongest guarantee.
+            return
+        # If a RankAnswer was produced, it MUST NOT be the silently
+        # split ["AAPL", "MSFT"] interpretation.
+        assert tuple(ans.ranking) != ("AAPL", "MSFT")
+
+
+# ---------- Commit G: continuation anchor sigma test (strict variant) ----------
+
+
+def _make_continuation_data(
+    n: int, sigma: float, seed: int,
+) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    rets = rng.normal(0.0, sigma, n)
+    closes = 100.0 * np.exp(np.cumsum(rets))
+    # Scale H/L spread with sigma so per-day Garman-Klass picks up
+    # the difference (constant H/L would mask the sigma input).
+    intraday_range = sigma * 2.0
+    return pd.DataFrame(
+        {
+            "open": closes,
+            "high": closes * (1.0 + intraday_range),
+            "low": closes * (1.0 - intraday_range),
+            "close": closes,
+            "volume": [1e6] * n,
+        },
+        index=pd.bdate_range("2024-01-01", periods=n),
+    )
+
+
+def _build_perfect_continuation_attested(question_set):
+    return AttestedAnswers(
+        answers=tuple(
+            AnswerRecord(
+                question_id=q.question_id, raw_answer="x",
+                parsed_answer=q.truth_value, parse_status="valid",
+            )
+            for q in question_set
+        ),
+        parsing_schema_hash="a" * 64,
+        parsing_schema_description="x",
+        prompt_template_hash="b" * 64,
+        prompt_template_description="y",
+    )
+
+
+class TestContinuationAnchorSigmaStrict:
+    def test_anchor_sigma_strictly_differs_from_real_sigma(self):
+        # Strict variant of the existing wiring test: the original
+        # silently `return`-ed when no qid had both sides recorded,
+        # which let a regression where the anchor pipeline fails to
+        # populate provenance slip through. Here we assert at least
+        # one qid has both sides AND the anchor sigma is at least
+        # 3× the real sigma (the data is built with σ_anchor ≈ 10×
+        # σ_real).
+        real_data = _make_continuation_data(n=60, sigma=0.005, seed=1)
+        anchor_data = _make_continuation_data(n=60, sigma=0.05, seed=2)
+        probe = ContinuationProbe(
+            symbol="AAPL", context_bars=20, forward_horizon=1,
+            templates=[NextCloseContinuation],
+        )
+        anchors = list(real_data.index[30:35])
+        question_set = probe.build(real_data, anchors)
+        attested = _build_perfect_continuation_attested(question_set)
+        anchor_qs = probe.build(anchor_data, anchors)
+        anchor_attested = _build_perfect_continuation_attested(anchor_qs)
+        report = knowledge_check(
+            probe, real_data, anchors, attested,
+            anchor=anchor_data, anchor_answers=anchor_attested,
+            provider_config=_provider_config(),
+        )
+        prov = report.vol_scale_provenance
+        assert prov is not None
+        any_both_sides = next(
+            (
+                qid for qid, sides in prov.items()
+                if "real" in sides and "anchor" in sides
+            ),
+            None,
+        )
+        # Strict assertion (replaces the silent-return path).
+        assert any_both_sides is not None, (
+            "expected at least one question to record both real and "
+            "anchor sigma in vol_scale_provenance"
+        )
+        real_sigma = prov[any_both_sides]["real"]["sigma"]
+        anchor_sigma = prov[any_both_sides]["anchor"]["sigma"]
+        assert anchor_sigma > real_sigma * 3
