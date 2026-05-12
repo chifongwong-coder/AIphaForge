@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aiphaforge"
-version = "2.1.2"
+version = "2.2.1"
 description = "A high-performance backtest engine for AI agent-driven quantitative trading"
 readme = "README.md"
 license = {text = "GPL-3.0-or-later"}
@@ -66,6 +66,11 @@ where = ["src"]
 # as static files inside the package. importlib.resources reads them
 # at runtime; pandas_market_calendars is NOT a runtime dependency.
 "aiphaforge.calendars" = ["_data/holidays.json", "_data/LICENSE.holidays"]
+# v2.2.1 #6: precomputed Spearman null-quantile lookup table for
+# RankContinuationProbe cutoffs. Generated once by
+# scripts/generate_rank_null_table.py and shipped as a release
+# artifact.
+"aiphaforge.probes" = ["_rank_null.npz"]
 
 [tool.ruff]
 target-version = "py310"
