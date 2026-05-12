@@ -221,9 +221,20 @@ class TestIsSequenceOfStrArrowDtype:
         # a deployment without pyarrow still loads. Simulate the
         # missing-pyarrow case by hijacking the import: any
         # well-formed list[str] must still be accepted via the
-        # sequence path, and an Arrow-typed series (which only the
-        # opt-in branch could recognize) must produce a clean False
-        # rather than raising ImportError.
+        # sequence path, and an object-dtype Series with all-string
+        # values must still be accepted via the object-dtype branch.
+        #
+        # Scope note: this test covers the OUTER invariant — module
+        # load and non-Arrow paths must not eager-import pyarrow.
+        # It cannot construct a `pd.ArrowDtype(...)` Series with
+        # pyarrow blocked (pandas needs pyarrow to construct the
+        # dtype in the first place), so the inner `except ImportError`
+        # branch at _rank.py:_is_sequence_of_str — the line that
+        # catches a runtime failure of `import pyarrow` while
+        # inspecting an ArrowDtype series — is structurally
+        # untestable here. That branch is a 1-line defensive guard;
+        # treat its correctness as inspection-verified, not
+        # test-verified.
         real_import = builtins.__import__
 
         def _block_pyarrow(name, *args, **kwargs):

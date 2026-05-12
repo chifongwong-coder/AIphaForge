@@ -825,6 +825,14 @@ class KnowledgeCheckReport:
     # ``bucket_delta_tango_ci``. Cross-populated in __post_init__
     # so users can adopt the honest name without touching call sites
     # that already read the historic name.
+    #
+    # Shared-reference semantics: ``bucket_delta_ci`` and
+    # ``bucket_delta_tango_ci`` are populated with the SAME dict
+    # object, not a copy. Mutating one is visible through the other.
+    # This is intentional — copying would let the two views silently
+    # desync under in-place updates, which is worse for a
+    # transitional alias. Treat both names as read-only and do not
+    # mutate either dict in place.
     bucket_delta_ci: Optional[dict[str, tuple[float, float]]] = None
 
     # v2.2.1 #1: vol-scaling provenance keyed by (question_id, side).
