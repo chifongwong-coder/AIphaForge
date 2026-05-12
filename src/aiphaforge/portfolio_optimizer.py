@@ -233,7 +233,16 @@ class MeanVarianceOptimizer(BasePortfolioOptimizer):
 
         w = result.x
         if not self.allow_short:
-            w = np.maximum(w, 0.0)  # clamp numerical noise to enforce bounds
+            # v2.2.2 Commit A: SLSQP enforces sum(w) = 1 only within ftol
+            # (~1e-6). Clamping negative numerical noise to 0 leaves the
+            # budget at ~1 + n*ftol; renormalize so the long-only budget
+            # is exactly 1. Guard against the pathology where SLSQP
+            # returned all-negatives (would divide by 0 — fall through
+            # with unrenormalized w so the failure is visible).
+            w = np.maximum(w, 0.0)
+            total = w.sum()
+            if total > 0:
+                w = w / total
         return dict(zip(data.columns, w))
 
 
@@ -401,5 +410,12 @@ class MinimumVarianceOptimizer(BasePortfolioOptimizer):
 
         w = result.x
         if not self.allow_short:
-            w = np.maximum(w, 0.0)  # clamp numerical noise to enforce bounds
+            # v2.2.2 Commit A: same renormalize as MeanVariance path —
+            # SLSQP's sum(w)=1 is satisfied only within ftol, so the
+            # post-clamp budget drifts by ~n*ftol. Guard against the
+            # all-negatives pathology.
+            w = np.maximum(w, 0.0)
+            total = w.sum()
+            if total > 0:
+                w = w / total
         return dict(zip(data.columns, w))
