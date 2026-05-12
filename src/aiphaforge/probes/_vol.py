@@ -376,7 +376,15 @@ def apply_vol_scaling_to_question_set(
             if not ctx:
                 rewritten.append(qs)
                 continue
-            last_ctx_ts = pd.Timestamp(ctx[-1]["index"])
+            # v2.2.1 hotfix: previously `pd.Timestamp(ctx[-1]["index"])`
+            # which crashed with KeyError on DataFrames whose index has
+            # a non-None name (e.g. data.index.name == "Date"), because
+            # `df.reset_index().to_dict(orient="records")` keys the
+            # column by the index name, not the literal string "index".
+            # Read the anchor timestamp directly off the question spec
+            # — by ContinuationProbe construction, the context window
+            # ends at the anchor bar, so qs.timestamp == last_ctx_ts.
+            last_ctx_ts = qs.timestamp
             sigma, prov = estimate_sigma_for_continuation(
                 symbol_data, last_ctx_ts,
                 window=spec.window,

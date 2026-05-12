@@ -66,6 +66,52 @@ def _build_perfect_attested(question_set):
     )
 
 
+class TestVolScaleWiringNamedIndexRegression:
+    def test_continuation_vol_scaling_works_with_named_datetime_index(self):
+        # v2.2.1 hotfix regression test. Previously _vol.py looked up
+        # `ctx[-1]["index"]` to recover the last-context-bar timestamp,
+        # but `df.reset_index().to_dict(orient="records")` keys the
+        # column by the index NAME — so any user with
+        # `data.index.name == "Date"` (the realistic case from
+        # `pd.read_csv(..., parse_dates=...)` or any code that names
+        # its DatetimeIndex) crashed with KeyError("index") at
+        # vol-scaling time. The fix reads `qs.timestamp` directly,
+        # which equals the anchor bar by ContinuationProbe construction.
+        rng = np.random.default_rng(0)
+        rets = rng.normal(0.0, 0.01, 60)
+        closes = 100.0 * np.exp(np.cumsum(rets))
+        intraday_range = abs(rng.normal(0.0, 0.01, 60))
+        idx = pd.DatetimeIndex(
+            pd.bdate_range("2024-01-01", periods=60), name="Date",
+        )
+        data = pd.DataFrame(
+            {
+                "open": closes,
+                "high": closes * (1.0 + intraday_range),
+                "low": closes * (1.0 - intraday_range),
+                "close": closes,
+                "volume": [1e6] * 60,
+            },
+            index=idx,
+        )
+        assert data.index.name == "Date"
+        probe = ContinuationProbe(
+            symbol="AAPL", context_bars=20, forward_horizon=1,
+            templates=[NextCloseContinuation],
+        )
+        anchors = list(data.index[30:35])
+        question_set = probe.build(data, anchors)
+        attested = _build_perfect_attested(question_set)
+        # Pre-fix this raised KeyError('index'); now must complete cleanly.
+        report = knowledge_check(
+            probe, data, anchors, attested,
+            provider_config=_provider_config(),
+        )
+        assert report.vol_scale_provenance is not None
+        # Provenance was actually computed (not skipped via fallback).
+        assert len(report.vol_scale_provenance) == len(list(question_set))
+
+
 class TestVolScaleWiringContinuation:
     def test_continuation_probe_records_real_provenance_per_qid(self):
         # ContinuationProbe templates ship vol_scale by default.
