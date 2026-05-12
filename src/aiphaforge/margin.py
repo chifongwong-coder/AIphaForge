@@ -239,6 +239,44 @@ class FundingRateModel(PeriodicCostModel):
     ``bar_seconds`` is intentionally **ignored**: the funding rate is
     already a per-bar quantity by design. Multiplying by elapsed time
     again would double-scale the result.
+
+    Convention (v2.2.2 Commit F clarification):
+        ``calculate_cost`` returns ``abs(notional) * funding_rate_per_bar``
+        — UNSIGNED — and is added to position cost regardless of side
+        (long or short). The signed flow of funds in real perpetual
+        markets (funding-positive: longs pay shorts; funding-negative:
+        shorts pay longs) is the USER'S RESPONSIBILITY to express via
+        the sign of ``funding_rate_per_bar``. The model has no notion
+        of "side receives" versus "side pays" — it just charges the
+        magnitude.
+
+    Examples:
+
+        Long payer (standard crypto with positive funding, long pays):
+            >>> FundingRateModel(funding_rate_per_bar=0.0001)
+            # Long position pays 0.0001 * notional per bar.
+            # Short position ALSO pays 0.0001 * notional (which is wrong
+            # for a short receiver — see next example).
+
+        Short receiver (positive-funding venue, short receives):
+            For a backtest of a short-only book that should RECEIVE
+            funding when funding is positive, set the rate NEGATIVE
+            (the cost is unsigned, so negative-rate inputs result in
+            negative cost contributions = inflows). Cleaner: wire two
+            separate ``FundingRateModel`` instances at the strategy
+            layer — one for each side — with opposite signs.
+
+        Symmetric case (funding flips intraday):
+            The model takes a single scalar; if funding sign changes
+            within a backtest, build a custom ``PeriodicCostModel``
+            subclass that reads a per-timestamp rate series and
+            returns ``rate(t) * abs(notional)`` (allowing negative
+            costs = inflows from the funding leg).
+
+    See also:
+        :class:`BorrowingCostModel` for the analogous interest-on-
+        leverage cost (also unsigned, but always a CHARGE — never an
+        inflow — because the lender always profits).
     """
 
     def __init__(self, funding_rate_per_bar: float = 0.0001):
