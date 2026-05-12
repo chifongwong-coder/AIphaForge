@@ -100,3 +100,85 @@ class TestRankNullTable:
         rho_test = float(samples[int(0.99 * n_test)])
         # Tolerance: ~1e-2 to account for both MC SEs.
         assert abs(rho_table - rho_test) < 1e-2
+
+
+# ---------------------------------------------------------------------------
+# v2.2.2 Commit C: thread-safety + FD-safety regression tests
+# ---------------------------------------------------------------------------
+
+
+class TestLoadRankNullTableThreadSafety:
+    """v2.2.2 Commit C: the loader must be safe under concurrent calls.
+
+    Previously the check-then-set on the module-level cache had no
+    lock, so two threads could both pass the `is None` check and both
+    load the table. Benign duplicate work but not formally correct.
+    Now the loader uses a module-level lock with double-checked
+    locking.
+    """
+
+    def test_concurrent_load_returns_same_table_object(self):
+        # Force a fresh cache so every thread races to load.
+        import aiphaforge.probes._rank as rank_mod
+        rank_mod._RANK_NULL_TABLE = None
+
+        import threading
+        results: list[dict[str, np.ndarray]] = []
+        barrier = threading.Barrier(8)
+
+        def loader():
+            barrier.wait()  # release all threads simultaneously
+            results.append(_load_rank_null_table())
+
+        threads = [threading.Thread(target=loader) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        # All threads must observe the SAME dict object (identity,
+        # not equality) — the lock ensures only one load wins.
+        assert len(results) == 8
+        first = results[0]
+        for r in results[1:]:
+            assert r is first, (
+                "concurrent _load_rank_null_table() returned different "
+                "dict objects — double-checked locking is broken"
+            )
+
+
+class TestLoadRankNullTableFDSafety:
+    """v2.2.2 Commit C: the NpzFile must be closed after eagerly
+    copying its arrays into the cache. Without the close, the FD
+    persists for the lifetime of the cache (until process exit).
+    """
+
+    def test_cached_arrays_outlive_loader_call(self):
+        # The eager-copy invariant: reading from the cache after the
+        # loader returns must NOT raise ValueError (a closed-NpzFile
+        # would raise 'I/O operation on closed file' on access).
+        import aiphaforge.probes._rank as rank_mod
+        rank_mod._RANK_NULL_TABLE = None
+        table = _load_rank_null_table()
+        # Repeated reads after the load context has exited.
+        for _ in range(100):
+            arr = table["abs_rho_n5"]
+            assert arr.shape[0] > 0
+            # Force materialization end-to-end.
+            _ = float(arr[0])
+
+    def test_no_fd_leak_on_linux(self):
+        # Linux-only: /proc/self/fd shows open file descriptors.
+        # The loader must NOT leak the .npz FD into the cache lifetime.
+        proc_fd = Path("/proc/self/fd")
+        if not proc_fd.exists():
+            pytest.skip("FD count check requires /proc/self/fd (Linux only)")
+        import aiphaforge.probes._rank as rank_mod
+        rank_mod._RANK_NULL_TABLE = None
+        before = len(list(proc_fd.iterdir()))
+        _load_rank_null_table()
+        after = len(list(proc_fd.iterdir()))
+        # Allow a tiny slack (~2 FDs) for pytest harness noise.
+        assert after - before <= 2, (
+            f"FD count grew by {after - before} after _load_rank_null_table; "
+            f"NpzFile handle is leaking"
+        )

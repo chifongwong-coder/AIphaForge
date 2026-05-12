@@ -239,6 +239,53 @@ class FundingRateModel(PeriodicCostModel):
     ``bar_seconds`` is intentionally **ignored**: the funding rate is
     already a per-bar quantity by design. Multiplying by elapsed time
     again would double-scale the result.
+
+    Convention (v2.2.2 Commit F clarification):
+        ``calculate_cost`` returns ``abs(notional) * funding_rate_per_bar``
+        — interpreted as a CHARGE applied to position cost — and is
+        deducted from equity regardless of position side (long or
+        short). The model has no notion of "receives" versus "pays"
+        and **does not support inflows / credits to the portfolio**:
+        the event-driven cost loop at
+        ``core_event_driven.py:654`` clamps negative-return values
+        with ``if cost > 0`` before calling ``portfolio.deduct_cost``,
+        so negative cost outputs are silently dropped — they do NOT
+        flow into the portfolio as a credit.
+
+        In real perpetual markets, funding flows FROM longs TO shorts
+        when funding is positive and reverses when funding is negative.
+        Modelling the SIGNED flow per-side is OUT OF SCOPE for this
+        single-scalar model: a long-only book where longs always pay,
+        or a short-only book where shorts always pay, is what this
+        model expresses. Mixed long/short books that need to track
+        the funding leg as an INFLOW for one side must either:
+
+        - Subclass ``PeriodicCostModel`` to return per-side rates and
+          modify the cost-application path to allow inflows, OR
+        - Track funding inflows OUTSIDE the cost model (e.g. via a
+          hook that credits ``portfolio.cash`` on the receiving side).
+
+    Examples:
+
+        Long payer (standard crypto with positive funding, long pays):
+            >>> FundingRateModel(funding_rate_per_bar=0.0001)
+            # Both long and short positions are charged 0.0001 *
+            # notional per bar — model is side-agnostic. If the
+            # backtest universe is long-only, this matches reality.
+
+        Negative funding (longs receive, shorts pay):
+            For a long-only book where longs receive when funding is
+            negative, the engine still applies it as a CHARGE
+            (positive number on positive rate; zero / dropped if
+            you tried to express receive-via-negative-rate because
+            of the ``cost > 0`` guard). Track the receive leg via a
+            hook or subclass; do NOT pass a negative rate expecting
+            an inflow.
+
+    See also:
+        :class:`BorrowingCostModel` for the analogous interest-on-
+        leverage cost (also unsigned, also a charge — never an
+        inflow, because the lender always profits).
     """
 
     def __init__(self, funding_rate_per_bar: float = 0.0001):
