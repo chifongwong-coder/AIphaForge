@@ -178,8 +178,12 @@ def sign_test_p(n_pos: int, n_neg: int) -> tuple[float, str]:
             # Fall through to normal-approx fallback
             pass
     if 25 <= n < 40:
-        # Normal with continuity correction.
-        z = (abs(n_pos - n / 2.0) - 0.5) / math.sqrt(n / 4.0)
+        # Normal with continuity correction. Textbook form: floor the
+        # |x - n/2| term at 0 BEFORE dividing, so a tied n_pos == n/2
+        # produces z = 0 (and therefore p = 1) cleanly instead of a
+        # negative z that we'd have to clamp via the result. Same
+        # numeric output as the prior post-hoc clamp; cleaner derivation.
+        z = max(abs(n_pos - n / 2.0) - 0.5, 0.0) / math.sqrt(n / 4.0)
         p = 2.0 * (1.0 - _phi(z))
         return float(max(0.0, min(1.0, p))), "normal_continuity_corrected"
     if n < 25:
@@ -187,8 +191,8 @@ def sign_test_p(n_pos: int, n_neg: int) -> tuple[float, str]:
         # continuity-corrected normal approximation (better small-
         # sample coverage than uncorrected). r5/r6 had two
         # identical branches; r7 removes the dead duplication and
-        # uses the correction.
-        z = (abs(n_pos - n / 2.0) - 0.5) / math.sqrt(n / 4.0)
+        # uses the correction. Same textbook form as above.
+        z = max(abs(n_pos - n / 2.0) - 0.5, 0.0) / math.sqrt(n / 4.0)
         p = 2.0 * (1.0 - _phi(z))
         return (
             float(max(0.0, min(1.0, p))),

@@ -2,11 +2,18 @@
 
 Output: ``src/aiphaforge/probes/_rank_null.npz``.
 
-Layout per v2.2.1 r7 §6:
-- N ∈ [3, 12]: exact enumeration of all N! permutations.
-- N ∈ [13, 20]: Monte Carlo with 10⁶ samples per N, PCG64-seeded
+Layout (matches the EXACT_N_RANGE / MC_N_RANGE constants below):
+- N ∈ [3, 10]: exact enumeration of all N! permutations.
+- N ∈ [11, 20]: Monte Carlo with 10⁶ samples per N, PCG64-seeded
   via ``np.random.SeedSequence(MC_ROOT_SEED).spawn(N_RANGE_LEN)``
   so per-N regeneration isolation works.
+
+The original v2.2.1 r7 §6 plan called for exact ≤ 12, but 12! ≈
+480M permutations is impractical at pure-Python iteration speeds;
+the MC range was extended down to N=11 (see the NOTE at the
+EXACT_N_RANGE / MC_N_RANGE constants below). The docstring here
+tracks the constants, not the original plan, so users running the
+script don't see contradictory ranges.
 
 Per-N storage is the sorted absolute-ρ array. Total file size
 ~few MB. Loaded once via ``np.load`` and cached in module state.
