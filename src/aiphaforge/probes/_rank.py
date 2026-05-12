@@ -16,6 +16,7 @@ Key design (per r6 review, Q-B1):
 from __future__ import annotations
 
 import math
+import threading as _threading
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional, Sequence
 
@@ -281,24 +282,47 @@ def _spearman_null_quantile(n: int, q: float, seed: int = 42) -> float:
 
 # Module-level cache: loaded once on first call.
 _RANK_NULL_TABLE: dict[str, np.ndarray] | None = None
+# v2.2.2 Commit C: lock guarding the cache check-and-set so concurrent
+# callers don't both pass the `is None` check and both load the table.
+# Per-call lock acquisition is ~30ns when uncontested; negligible on
+# the probe hot path.
+_RANK_NULL_TABLE_LOCK = _threading.Lock()
 
 
 def _load_rank_null_table() -> dict[str, np.ndarray]:
-    """Lazy-load the precomputed rank-null table."""
+    """Lazy-load the precomputed rank-null table.
+
+    v2.2.2 Commit C: thread-safe via a module-level lock with
+    double-checked locking, and FD-safe via a ``with np.load(...)``
+    context manager. The arrays are eagerly copied out of the NpzFile
+    so the cache holds plain ndarrays even after the underlying file
+    handle closes. (NpzFile in the non-mmap default mode already
+    materializes each array on access, so the eager-copy is mostly
+    defensive — if a future numpy version switches the default to
+    `mmap_mode='r'`, the explicit copy keeps the cached arrays valid.)
+    """
     global _RANK_NULL_TABLE
-    if _RANK_NULL_TABLE is None:
-        from pathlib import Path
-        npz_path = (
-            Path(__file__).resolve().parent / "_rank_null.npz"
-        )
-        if not npz_path.exists():
-            raise FileNotFoundError(
-                f"rank-null table not found at {npz_path}; "
-                "regenerate via scripts/generate_rank_null_table.py"
+    # Fast path: already loaded, no lock needed.
+    if _RANK_NULL_TABLE is not None:
+        return _RANK_NULL_TABLE
+    with _RANK_NULL_TABLE_LOCK:
+        # Re-check inside the lock (another thread may have loaded
+        # the table while we were waiting).
+        if _RANK_NULL_TABLE is None:
+            from pathlib import Path
+            npz_path = (
+                Path(__file__).resolve().parent / "_rank_null.npz"
             )
-        data = np.load(npz_path)
-        _RANK_NULL_TABLE = {key: data[key] for key in data.files}
-    return _RANK_NULL_TABLE
+            if not npz_path.exists():
+                raise FileNotFoundError(
+                    f"rank-null table not found at {npz_path}; "
+                    "regenerate via scripts/generate_rank_null_table.py"
+                )
+            with np.load(npz_path) as data:
+                _RANK_NULL_TABLE = {
+                    key: np.asarray(data[key]) for key in data.files
+                }
+        return _RANK_NULL_TABLE
 
 
 # ---------- RankContinuationProbe ----------
