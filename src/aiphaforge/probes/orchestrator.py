@@ -477,9 +477,17 @@ _PERSISTENCE_CAVEAT = (
 # v2.2.1 #7: hardcoded ordinal weighting for scalar_leakage_index.
 # Locked v2.2.1; changing requires __version__ bump per §14
 # stability commitment.
-_BUCKET_ORDINAL_WEIGHTS = {
+#
+# v2.2.1 audit fix Commit E: promoted to a public, MappingProxyType-
+# backed constant. Paper authors should `from aiphaforge.probes
+# import LEAKAGE_INDEX_BUCKET_WEIGHTS` rather than transcribing the
+# numeric literals — that way the citation tracks the locked weights
+# across releases. The underscored name remains as a backward-compat
+# alias for existing internal callers.
+LEAKAGE_INDEX_BUCKET_WEIGHTS: Mapping[str, float] = MappingProxyType({
     "exact": 4.0, "near": 3.0, "rough": 2.0, "miss": 1.0, "invalid": 0.0,
-}
+})
+_BUCKET_ORDINAL_WEIGHTS = LEAKAGE_INDEX_BUCKET_WEIGHTS
 _LEAKAGE_INDEX_CAVEAT = (
     "scalar_leakage_index is a point estimate with hardcoded "
     "ordinal weighting (exact=4, near=3, rough=2, miss=1, "
@@ -746,6 +754,13 @@ class KnowledgeCheckReport:
     real_score: QAProbeReport
     anchor_score: Optional[QAProbeReport]
     bucket_delta: Optional[dict[str, float]]
+    # v2.2.1 audit-fix Commit E: ``bucket_delta_tango_ci`` is the
+    # historic field name but the implementation is Wald-style with a
+    # sentinel-on-zero-width fallback (see ``tango_paired_diff_ci``);
+    # the "tango" suffix is misleading. ``bucket_delta_ci`` is the
+    # canonical name going forward. Both fields are populated to the
+    # same dict in ``__post_init__`` so v2.2.0/v2.2.1 callers keep
+    # working. Real Tango lands in v2.2.2.
     bucket_delta_tango_ci: Optional[dict[str, tuple[float, float]]]
 
     # Paired sign test (per quant Q3 r2 — replaces Wilcoxon)
@@ -801,6 +816,12 @@ class KnowledgeCheckReport:
     # to preserve frozen-dataclass immutability per r7 §2.6.
     parser_used_distribution_real: Optional["Mapping[str, int]"] = None
     parser_used_distribution_anchor: Optional["Mapping[str, int]"] = None
+
+    # v2.2.1 audit-fix Commit E: canonical alias for
+    # ``bucket_delta_tango_ci``. Cross-populated in __post_init__
+    # so users can adopt the honest name without touching call sites
+    # that already read the historic name.
+    bucket_delta_ci: Optional[dict[str, tuple[float, float]]] = None
 
     # v2.2.1 #1: vol-scaling provenance keyed by (question_id, side).
     # side ∈ {"real", "anchor"}. None when no question used vol_scale
@@ -878,6 +899,21 @@ class KnowledgeCheckReport:
             object.__setattr__(
                 self, "parser_used_distribution_anchor",
                 MappingProxyType(dict(self.parser_used_distribution_anchor)),
+            )
+        # v2.2.1 audit-fix Commit E: cross-populate the canonical
+        # ``bucket_delta_ci`` alias and the historic
+        # ``bucket_delta_tango_ci`` so either field is non-None when
+        # the other is. The alias is structural — both names point
+        # at the same dict object.
+        if (self.bucket_delta_ci is None
+                and self.bucket_delta_tango_ci is not None):
+            object.__setattr__(
+                self, "bucket_delta_ci", self.bucket_delta_tango_ci,
+            )
+        elif (self.bucket_delta_tango_ci is None
+                and self.bucket_delta_ci is not None):
+            object.__setattr__(
+                self, "bucket_delta_tango_ci", self.bucket_delta_ci,
             )
 
 

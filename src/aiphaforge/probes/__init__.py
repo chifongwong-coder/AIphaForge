@@ -69,6 +69,7 @@ from aiphaforge.probes.models import (
     VolScalingSpec,
 )
 from aiphaforge.probes.orchestrator import (
+    LEAKAGE_INDEX_BUCKET_WEIGHTS,
     KnowledgeCheckReport,
     knowledge_check,
     looks_like_refusal,
@@ -121,6 +122,7 @@ __all__ = [
     "ContinuationTemplate",
     "DEFAULT_TEMPLATES",
     "KnowledgeCheckReport",
+    "LEAKAGE_INDEX_BUCKET_WEIGHTS",
     "ExemplarSpec",
     "GapVsPrevClose",
     "HighQuestion",
