@@ -179,6 +179,28 @@ class TestBucketDeltaCiAlias:
         assert report.bucket_delta_ci is None
         assert report.bucket_delta_tango_ci is None
 
+    def test_bucket_delta_ci_mutation_shows_in_tango_alias(self):
+        # v2.2.1 audit-fix Commit J: pin the documented shared-
+        # reference semantics. The two field names point at the
+        # SAME dict object — mutating one (against the documented
+        # "read-only" advice) must show up in the other. The
+        # existing test_alias_populated_when_anchor_present asserts
+        # `is`-identity; this test exercises the contract via an
+        # actual mutation so a future regression that switches
+        # __post_init__ to `dict(...)` (copy) is caught.
+        report = self._build_report_with_anchor()
+        assert report.bucket_delta_ci is not None
+        before = dict(report.bucket_delta_ci)
+        # Mutate via the canonical name.
+        report.bucket_delta_ci["__probe__"] = (9.0, 9.0)
+        # The historic name reflects it.
+        assert report.bucket_delta_tango_ci is not None
+        assert report.bucket_delta_tango_ci["__probe__"] == (9.0, 9.0)
+        # Clean up so we don't pollute report state for any
+        # later assertion in the build helper's shared fixture.
+        del report.bucket_delta_ci["__probe__"]
+        assert dict(report.bucket_delta_ci) == before
+
     def test_alias_back_fills_historic_name_from_canonical(self):
         # Forward-compat: if a downstream caller produces a report
         # carrying only the canonical bucket_delta_ci (e.g., a v2.2.2

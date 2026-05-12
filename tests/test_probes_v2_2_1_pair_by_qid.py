@@ -204,6 +204,11 @@ class TestPairingFailedTag:
         # REFUSAL_SUSPECTED, only the tag changes.
         assert report.bucket_delta is None
         assert report.bucket_delta_ci is None
+        # v2.2.1 audit-fix Commit J: pin the suppression contract
+        # for the scalar leakage index too. The orchestrator only
+        # populates scalar_leakage_index when
+        # anchor_validity == "OK"; PAIRING_FAILED must leave it None.
+        assert report.scalar_leakage_index is None
         # Sanity: validity tag is genuinely distinct, not aliased.
         assert report.anchor_validity != "REFUSAL_SUSPECTED"
 

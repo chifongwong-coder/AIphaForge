@@ -250,11 +250,19 @@ class TestKnowledgeCheckRankContinuation:
             anchor_answers=anchor_attested,
             provider_config=_provider_config(),
         )
-        # If validity OK, bucket_delta and scalar_leakage_index
-        # should be populated.
-        if report.anchor_validity == "OK":
-            assert report.bucket_delta is not None
-            assert report.scalar_leakage_index is not None
+        # v2.2.1 audit-fix Commit J: removed the prior
+        # `if report.anchor_validity == "OK":` conditional guard.
+        # With the current fixtures (real + synthetic-anchor probes,
+        # both attested with valid answers) the validity gate is OK
+        # by construction; the conditional was defensive against a
+        # case that can't happen here. Without it, a regression that
+        # silently flipped the tag to REFUSAL_SUSPECTED or
+        # PAIRING_FAILED would have bypassed both downstream
+        # assertions and let the test pass with zero meaningful
+        # coverage. Now we pin the tag explicitly.
+        assert report.anchor_validity == "OK"
+        assert report.bucket_delta is not None
+        assert report.scalar_leakage_index is not None
 
     def test_normalization_preset_applies_to_user_answer(self):
         # User submits lowercase + dash; us_equity preset
