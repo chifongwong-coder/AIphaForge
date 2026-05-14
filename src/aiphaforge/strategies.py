@@ -14,7 +14,8 @@ Or generate signals for custom engine configuration::
 Supports single-asset (pd.DataFrame) and multi-asset (Dict[str, pd.DataFrame]).
 """
 
-from typing import Any, Dict, List, Optional, Union
+import logging
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -34,6 +35,8 @@ from .indicators import (
     SUPERTREND,
     VWAP,
 )
+
+_LOG = logging.getLogger(__name__)
 
 
 def _transitions_only(raw: pd.Series) -> pd.Series:
@@ -708,6 +711,80 @@ class MultiIndicatorStrategy(BaseStrategy):
 # ---------------------------------------------------------------------------
 # Strategy Composition Tree (v1.4)
 # ---------------------------------------------------------------------------
+
+# v2.5: module-level state for the once-per-pair fallback warning policy.
+# Each (composite_cls, child_cls) pair logs a warning the first time the
+# auto-mode fallback fires; subsequent fallbacks for the same pair log
+# at debug level only. Cleared automatically by an autouse pytest fixture
+# in each new v2.5 test file (see plan §A test isolation requirement).
+_FALLBACK_WARNED: Set[Tuple[type, type]] = set()
+
+_VALID_MODES = ("auto", "generate_signals", "legacy_compute")
+
+
+def _resolve_child_signals(
+    composite_cls: type,
+    child: BaseStrategy,
+    data: Union[pd.DataFrame, Dict[str, pd.DataFrame]],
+    *,
+    mode: Literal["auto", "generate_signals", "legacy_compute"],
+) -> Union[pd.Series, Dict[str, pd.Series]]:
+    """Dispatch a single child strategy to its signal-generation method.
+
+    Single source of truth for the v2.5 3-mode dispatch so the 5 composite
+    classes don't reimplement the auto/fallback chain.
+
+    auto:
+        Try ``child.generate_signals(data)``. On any ``Exception``, fall
+        back to single-asset ``child._compute(data)`` IF data is a single
+        DataFrame. Multi-asset dict + auto-fallback raises ``ValueError``
+        (legacy ``_compute`` can't accept dicts; user must pick an
+        explicit mode). The first fallback for each
+        ``(composite_cls, child_cls)`` pair logs a ``WARNING``;
+        subsequent fallbacks for the same pair log at ``DEBUG``.
+    generate_signals:
+        Always call ``child.generate_signals(data)``. Propagate any
+        exception (no fallback).
+    legacy_compute:
+        Always call ``child._compute(df)``. Requires single DataFrame
+        input — multi-asset dict raises ``TypeError`` naming the child.
+    """
+    if mode == "generate_signals":
+        return child.generate_signals(data)
+    if mode == "legacy_compute":
+        if isinstance(data, dict):
+            raise TypeError(
+                f"legacy_compute mode requires a single DataFrame, got dict; "
+                f"child {type(child).__name__} cannot run via _compute on "
+                "multi-asset data"
+            )
+        return child._compute(data)
+    if mode == "auto":
+        try:
+            return child.generate_signals(data)
+        except Exception as exc:
+            if isinstance(data, dict):
+                raise ValueError(
+                    f"auto-mode fallback to _compute is unavailable for "
+                    f"multi-asset dict input (child {type(child).__name__} "
+                    f"raised {type(exc).__name__}: {str(exc)[:200]}). "
+                    "Use mode='legacy_compute' explicitly or fix the child."
+                ) from exc
+            pair = (composite_cls, type(child))
+            msg = (
+                f"{composite_cls.__name__} auto-mode: child "
+                f"{type(child).__name__} raised {type(exc).__name__}: "
+                f"{str(exc)[:200]} — falling back to legacy _compute"
+            )
+            if pair not in _FALLBACK_WARNED:
+                _FALLBACK_WARNED.add(pair)
+                _LOG.warning(msg)
+            else:
+                _LOG.debug(msg)
+            return child._compute(data)
+    raise ValueError(
+        f"mode={mode!r} invalid; must be one of {_VALID_MODES}"
+    )
 
 
 class StrategyNode(BaseStrategy):
