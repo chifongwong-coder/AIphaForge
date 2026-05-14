@@ -51,6 +51,24 @@ class TestAssertFactorNoLookahead:
             assert_factor_no_lookahead(lookahead_factor, _ohlcv())
 
 
+class TestDtypePrecheck:
+    def test_lookahead_diagnostic_rejects_string_dtype_factor(self):
+        # v2.4 Commit C: a string-valued factor (e.g. sector
+        # classification) must produce a typed error message naming
+        # the offending column, not a confusing
+        # "could not convert string to float" deep in numpy.
+        idx = pd.bdate_range("2024-01-01", periods=20)
+        data = pd.DataFrame({"close": [100.0] * 20}, index=idx)
+
+        def string_factor(d):
+            return pd.DataFrame(
+                {"sector": ["tech"] * len(d.index)}, index=d.index,
+            )
+
+        with pytest.raises(AssertionError, match="non-numeric"):
+            assert_factor_no_lookahead(string_factor, data)
+
+
 class TestAssertSignalNoLookahead:
     def test_passes_for_threshold_strategy_callable(self):
         # Plain callable form (no generate_signals method).
