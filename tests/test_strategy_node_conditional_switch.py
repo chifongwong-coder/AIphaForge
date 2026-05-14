@@ -70,8 +70,10 @@ class _NonDirectionStub(BaseStrategy):
         return pd.Series(0.5, index=df.index)
 
 
-def _regime_alternating_5(df):
-    arr = np.array([(i // 5) % 2 for i in range(len(df))], dtype=int)
+def _regime_alternating_1(df):
+    # Matches the snapshot fixture in test_strategy_node_legacy_snapshots:
+    # alternate every bar so each child has bars where it's selected.
+    arr = np.array([i % 2 for i in range(len(df))], dtype=int)
     return pd.Series(arr, index=df.index)
 
 
@@ -87,7 +89,7 @@ class TestConditionalSwitchV2_5:
         data = _snap()
         comp = ConditionalSwitch(
             children=[MACrossover(5, 20), RSIMeanReversion(14)],
-            condition_fn=_regime_alternating_5,
+            condition_fn=_regime_alternating_1,
             mode="legacy_compute",
         )
         expected = _expected_from_transitions(data, _EXPECTED_CS)
@@ -101,7 +103,7 @@ class TestConditionalSwitchV2_5:
         # gets bars where it's selected.
         comp = ConditionalSwitch(
             children=[_ConstantModern(value=1.0), _ConstantModern(value=-1.0)],
-            condition_fn=_regime_alternating_5,
+            condition_fn=_regime_alternating_1,
             mode="generate_signals",
         )
         actual = comp.generate_signals(_data())
@@ -114,7 +116,7 @@ class TestConditionalSwitchV2_5:
     def test_eager_shape_validation_rejects_mixed_shapes(self):
         comp = ConditionalSwitch(
             children=[_DictOnlyChild(), _ConstantModern(value=1.0)],
-            condition_fn=_regime_alternating_5,
+            condition_fn=_regime_alternating_1,
             mode="generate_signals",
         )
         with pytest.raises(TypeError, match="single-asset"):
@@ -123,7 +125,7 @@ class TestConditionalSwitchV2_5:
     def test_rejects_non_direction_spec_child(self):
         comp = ConditionalSwitch(
             children=[MACrossover(5, 20), _NonDirectionStub()],
-            condition_fn=_regime_alternating_5,
+            condition_fn=_regime_alternating_1,
         )
         with pytest.raises(ValueError, match="direction-kind"):
             comp.generate_signals(_data())

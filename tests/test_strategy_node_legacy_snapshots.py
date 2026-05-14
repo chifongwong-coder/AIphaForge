@@ -27,7 +27,7 @@ from aiphaforge.strategies import (
 )
 
 
-def _make_seeded_data(periods: int = 60, seed: int = 42) -> pd.DataFrame:
+def _make_seeded_data(periods: int = 200, seed: int = 42) -> pd.DataFrame:
     """Single shared deterministic OHLCV builder.
 
     Uses ``np.random.default_rng`` (not legacy ``np.random.seed``)
@@ -58,14 +58,31 @@ def _expected_from_transitions(
     return out
 
 
-# Inline-literal expected snapshots captured at v2.5 branch base.
+# Inline-literal expected snapshots captured at v2.5 branch base
+# (200-bar fixture for density: catches scale/sign drift that the
+# original 60-bar fixture missed because it only had 2 transitions).
 # Format: {bar_index: signal_value}; all other bars = NaN.
 
-_EXPECTED_WB = {19: 1.0, 50: -1.0}
-_EXPECTED_SB = {19: 1.0, 50: -1.0}
-_EXPECTED_PC = {19: 1.0, 50: -1.0}
-_EXPECTED_VE = {19: 1.0, 50: -1.0}
-_EXPECTED_CS: dict[int, float] = {}  # all NaN under this regime fixture
+_EXPECTED_WB = {
+    19: 1.0, 50: -1.0, 68: 1.0, 72: -1.0, 96: 1.0,
+    133: -1.0, 140: 1.0, 146: -1.0, 168: 1.0, 173: -1.0, 181: 1.0,
+}
+_EXPECTED_SB = {
+    19: 1.0, 50: -1.0, 68: 1.0, 72: -1.0, 96: 1.0,
+    133: -1.0, 140: 1.0, 146: -1.0, 168: 1.0, 173: -1.0, 181: 1.0,
+}
+_EXPECTED_PC = {
+    19: 1.0, 50: -1.0, 68: 1.0, 72: -1.0, 96: 1.0,
+    133: -1.0, 140: 1.0, 146: -1.0, 168: 1.0, 173: -1.0, 181: 1.0,
+}
+_EXPECTED_VE = {
+    19: 1.0, 50: -1.0, 68: 1.0, 72: -1.0, 96: 1.0,
+    133: -1.0, 140: 1.0, 146: -1.0, 168: 1.0, 173: -1.0, 181: 1.0,
+}
+# CS regime alternates every bar (i % 2): each child gets non-overlapping
+# bars to fire on. Yields 5 transitions vs 0 with the original 5-bar
+# regime — catches a broken _switch that returns all-NaN.
+_EXPECTED_CS = {68: 1.0, 72: -1.0, 140: 1.0, 146: -1.0, 168: 1.0}
 
 
 class TestLegacySnapshotsV2_4:
@@ -130,10 +147,10 @@ class TestLegacySnapshotsV2_4:
     def test_conditional_switch_snapshot_v2_4(self):
         data = _make_seeded_data()
 
-        def _regime_alternating_5(df: pd.DataFrame) -> pd.Series:
-            arr = np.array(
-                [(i // 5) % 2 for i in range(len(df))], dtype=int,
-            )
+        def _regime_alternating_1(df: pd.DataFrame) -> pd.Series:
+            # Alternate every single bar so each child has bars where
+            # it's selected — produces a non-empty snapshot.
+            arr = np.array([i % 2 for i in range(len(df))], dtype=int)
             return pd.Series(arr, index=df.index)
 
         composite = ConditionalSwitch(
@@ -141,7 +158,7 @@ class TestLegacySnapshotsV2_4:
                 MACrossover(short=5, long=20),
                 RSIMeanReversion(period=14),
             ],
-            condition_fn=_regime_alternating_5,
+            condition_fn=_regime_alternating_1,
         )
         expected = _expected_from_transitions(data, _EXPECTED_CS)
         actual = composite._compute(data)

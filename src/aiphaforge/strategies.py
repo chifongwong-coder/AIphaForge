@@ -715,8 +715,15 @@ class MultiIndicatorStrategy(BaseStrategy):
 # v2.5: module-level state for the once-per-pair fallback warning policy.
 # Each (composite_cls, child_cls) pair logs a warning the first time the
 # auto-mode fallback fires; subsequent fallbacks for the same pair log
-# at debug level only. Cleared automatically by an autouse pytest fixture
-# in each new v2.5 test file (see plan §A test isolation requirement).
+# at debug level only — including subsequent fallbacks raising a
+# DIFFERENT exception type from the same pair. Users who need to see
+# every fallback's exception type should set the logger level to DEBUG:
+#
+#     logging.getLogger("aiphaforge.strategies").setLevel(logging.DEBUG)
+#
+# Cleared automatically by an autouse pytest fixture in each new v2.5
+# test file (see plan §A test isolation requirement). NOT thread-safe;
+# pytest-xdist users must serialize tests touching this set.
 _FALLBACK_WARNED: Set[Tuple[type, type]] = set()
 
 _VALID_MODES = ("auto", "generate_signals", "legacy_compute")
@@ -948,6 +955,7 @@ class WeightedBlend(StrategyNode):
             _resolve_child_signals(WeightedBlend, c, df, mode=self.mode)
             for c in self.children
         ]
+        _check_uniform_series_shape(WeightedBlend, self.children, per_child)
         return self._weighted_blend(per_child, df.index)
 
     def _generate_multi(
@@ -1010,16 +1018,13 @@ class WeightedBlend(StrategyNode):
         return result
 
     def _compute(self, df: pd.DataFrame) -> pd.Series:
-        # Backward-compat hook: external callers that bypass
-        # generate_signals (rare) get the legacy_compute semantics
-        # without going through kind validation.
-        per_child = [
-            _resolve_child_signals(
-                WeightedBlend, c, df, mode="legacy_compute",
-            )
-            for c in self.children
-        ]
-        return self._weighted_blend(per_child, df.index)
+        # _compute is BaseStrategy's per-symbol override point — a true
+        # private method (underscore-prefixed). External code should
+        # always call generate_signals(). For any internal caller that
+        # routes through _compute, delegate to generate_signals so the
+        # full v2.5 contract (kind validation + mode dispatch) applies
+        # uniformly. Matches plan §D as written.
+        return self.generate_signals(df)
 
 
 class SelectBest(StrategyNode):
@@ -1067,11 +1072,7 @@ class SelectBest(StrategyNode):
         return result
 
     def _compute(self, df: pd.DataFrame) -> pd.Series:
-        per_child = [
-            _resolve_child_signals(SelectBest, c, df, mode="legacy_compute")
-            for c in self.children
-        ]
-        return self._select_best(per_child, df.index)
+        return self.generate_signals(df)
 
 
 class PriorityCascade(StrategyNode):
@@ -1123,13 +1124,7 @@ class PriorityCascade(StrategyNode):
         return _transitions_only(result)
 
     def _compute(self, df: pd.DataFrame) -> pd.Series:
-        per_child = [
-            _resolve_child_signals(
-                PriorityCascade, c, df, mode="legacy_compute",
-            )
-            for c in self.children
-        ]
-        return self._cascade(per_child, df.index)
+        return self.generate_signals(df)
 
 
 class VoteEnsemble(StrategyNode):
@@ -1182,11 +1177,7 @@ class VoteEnsemble(StrategyNode):
         return result
 
     def _compute(self, df: pd.DataFrame) -> pd.Series:
-        per_child = [
-            _resolve_child_signals(VoteEnsemble, c, df, mode="legacy_compute")
-            for c in self.children
-        ]
-        return self._vote(per_child, df.index)
+        return self.generate_signals(df)
 
 
 class ConditionalSwitch(StrategyNode):
@@ -1267,10 +1258,4 @@ class ConditionalSwitch(StrategyNode):
         return _transitions_only(result)
 
     def _compute(self, df: pd.DataFrame) -> pd.Series:
-        per_child = [
-            _resolve_child_signals(
-                ConditionalSwitch, c, df, mode="legacy_compute",
-            )
-            for c in self.children
-        ]
-        return self._switch(per_child, self.condition_fn(df), df.index)
+        return self.generate_signals(df)
