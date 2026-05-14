@@ -98,3 +98,51 @@ class IncrementalFactor(ABC):
             value, state = self.update(row, state)
             out.append(value)
         return pd.Series(out, index=data.index, dtype=float)
+
+
+# ---------------------------------------------------------------------------
+# Concrete v2.6 MVP factors (Commits C-G)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _RollingMeanState(FactorState):
+    window_buf: tuple = ()
+    running_sum: float = 0.0
+
+
+class RollingMeanIncremental(IncrementalFactor):
+    """Rolling mean of ``close`` over a fixed window.
+
+    Algorithm: running sum + tuple-backed sliding window. Emits
+    NaN until ``window`` bars have been observed (matches
+    ``pd.Series.rolling(window).mean()`` warmup convention).
+    """
+
+    def __init__(self, window: int):
+        if window < 1:
+            raise ValueError(f"window must be >= 1, got {window}")
+        self.window = window
+        self.name = f"rolling_mean_{window}"
+
+    def initial_state(self) -> _RollingMeanState:
+        return _RollingMeanState()
+
+    def update(
+        self, bar_row: pd.Series, state: _RollingMeanState,
+    ) -> Tuple[float, _RollingMeanState]:
+        x = float(bar_row["close"])
+        if len(state.window_buf) < self.window:
+            new_buf = state.window_buf + (x,)
+            new_sum = state.running_sum + x
+        else:
+            popped = state.window_buf[0]
+            new_buf = state.window_buf[1:] + (x,)
+            new_sum = state.running_sum + x - popped
+        value = new_sum / self.window if len(new_buf) >= self.window else float("nan")
+        new_state = _RollingMeanState(
+            bar_count=state.bar_count + 1,
+            window_buf=new_buf,
+            running_sum=new_sum,
+        )
+        return value, new_state
