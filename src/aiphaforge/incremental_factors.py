@@ -150,6 +150,50 @@ class RollingMeanIncremental(IncrementalFactor):
 
 
 @dataclass
+class _MomentumState(FactorState):
+    window_buf: tuple = ()
+
+
+class MomentumIncremental(IncrementalFactor):
+    """Gross simple return over the past ``window`` bars.
+
+    Formula: ``close[t] / close[t - window] - 1`` (matches v2.4
+    ``MomentumFactor`` byte-for-byte at the closed-form arithmetic
+    level). Warmup: first ``window`` bars NaN — bar ``window`` is
+    the first non-NaN (because we need ``close[t-window]``,
+    indexed at bar 0 when t == window).
+    """
+
+    def __init__(self, window: int):
+        if window < 1:
+            raise ValueError(f"window must be >= 1, got {window}")
+        self.window = window
+        self.name = f"momentum_{window}"
+
+    def initial_state(self) -> _MomentumState:
+        return _MomentumState()
+
+    def update(
+        self, bar_row: pd.Series, state: _MomentumState,
+    ) -> Tuple[float, _MomentumState]:
+        x = float(bar_row["close"])
+        # Maintain a (window + 1)-element buffer: head is close[t-window].
+        if len(state.window_buf) < self.window + 1:
+            new_buf = state.window_buf + (x,)
+        else:
+            new_buf = state.window_buf[1:] + (x,)
+        if len(new_buf) < self.window + 1:
+            value = float("nan")
+        else:
+            value = new_buf[-1] / new_buf[0] - 1.0
+        new_state = _MomentumState(
+            bar_count=state.bar_count + 1,
+            window_buf=new_buf,
+        )
+        return value, new_state
+
+
+@dataclass
 class _RollingStdState(FactorState):
     window_buf: tuple = ()
 
