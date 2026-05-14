@@ -133,6 +133,23 @@ from .risk import (
     MaxDrawdownHalt,
     RiskSignal,
 )
+
+# v2.3 Commit J: signal-layer public exports.
+# Factor + diagnostic APIs remain subpackage-import only in v2.3
+# (per master plan §6.3); they get top-level exports in v2.4 once
+# FactorRuleStrategy is stable.
+from .signal_rules import (
+    CrossSectionalQuantileRule,
+    ThresholdScoreRule,
+)
+from .signal_strategy import DirectSignalStrategy
+from .signals import (
+    dict_to_signal_wide,
+    prepare_signals_for_engine,
+    target_weight_wide_to_schedule,
+    transitions_only,
+    wide_to_signal_dict,
+)
 from .significance import (
     BootstrapResult,
     CorrectionResult,
@@ -159,7 +176,7 @@ from .strategies import (
     WeightedBlend,
 )
 
-__version__ = '2.2.2'
+__version__ = '2.3.0'
 
 __all__ = [
     # Main engine
@@ -323,4 +340,14 @@ __all__ = [
     'PerformanceAnalyzer',
     'analyze',
     'compare_strategies',
+
+    # v2.3 Signal Layer
+    'transitions_only',
+    'prepare_signals_for_engine',
+    'dict_to_signal_wide',
+    'wide_to_signal_dict',
+    'target_weight_wide_to_schedule',
+    'ThresholdScoreRule',
+    'CrossSectionalQuantileRule',
+    'DirectSignalStrategy',
 ]

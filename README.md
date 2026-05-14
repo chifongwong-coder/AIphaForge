@@ -126,6 +126,27 @@ The Q&A pillar (v2.2 `knowledge_check`) is **non-transitive** with the obfuscati
 
 Every `KnowledgeCheckReport.notes` carries this warning verbatim. Reports are intentionally not aggregated into a single 🟢/🟡/🔴 verdict — `KnowledgeCheckReport.is_pillar_summary` is `False` and the `__post_init__` rejects any attempt to flip it.
 
+#### v2.3 release notes — Signal Layer Foundation
+
+v2.3 establishes the **Signal Layer** as a first-class abstraction without touching `BacktestEngine`. This is the first step of the multi-version refactor (v2.3 → v2.8) decoupling factors from strategies; see `docs/AIphaForge_Framework_Refactor_Master_Plan_v1.0.md` for the full roadmap.
+
+**New top-level exports**:
+
+- Signal-layer utilities: `transitions_only`, `prepare_signals_for_engine` (with `broadcast=True` for global market-wide signals), `dict_to_signal_wide`, `wide_to_signal_dict`, `target_weight_wide_to_schedule` (with `union`/`intersection` universe alignment + `on_collision` policy for snap collisions).
+- Score → signal rules: `ThresholdScoreRule` (default `neutral_action="hold"` — preserves existing positions on uncertain scores) and `CrossSectionalQuantileRule` (default `neutral_action="flat"` — Alphalens / Qlib convention closes middle quantiles).
+- `DirectSignalStrategy` — wraps ML / AI / external precomputed signals or scores+rule. `update_signals(...)` / `update_scores(...)` instance methods support live MetaController-driven updates.
+
+**New subpackages** (subpackage-import only in v2.3, top-level exports planned for v2.4):
+
+- `aiphaforge.factors` — `FactorSpec`, `FactorSet`, `FactorProvider` Protocol (data structures only; no compute logic). **Note**: these dataclasses are `frozen=True`; field additions in future minor versions will break pickled instances. Persist via JSON if cross-version stability is required.
+- `aiphaforge.diagnostics` — `assert_factor_no_lookahead` and `assert_signal_no_lookahead` test/research tools using prefix-slice semantics with `atol=1e-12` default. NOT runtime checks.
+
+`SignalSpec` / `SignalFrame` typed wrappers are deferred from the original v2.3 scope to **v2.4** alongside the factor layer — they earn their keep when factor → rule → signal pipelines need typed metadata flowing through the stack.
+
+**Internal**: the four backward-compat aliases (`_BUCKET_ORDINAL_WEIGHTS`, `bucket_delta_tango_ci` field, `_apply_vol_scaling_to_question_set` re-export, `_pair_scores_by_position`) had their removal-version annotations updated from v2.3.0 to **v2.8.0** to match the revised v2.x → v3.0 roadmap (v2.x line ends at v2.8 cleanup; v3.0 reserved for a separate major reformulation).
+
+`BacktestEngine` source diff: zero lines. The v2.3 release adds parallel API surface only.
+
 #### v2.2.2 patch additions
 
 ##### BREAKING NUMERIC: PSR / DSR default σ convention

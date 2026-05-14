@@ -489,9 +489,10 @@ _PERSISTENCE_CAVEAT = (
 # across releases. The underscored name remains as a backward-compat
 # alias for existing internal callers.
 #
-# v2.2.1 audit fix Commit I: Removal scheduled: v2.3.0. Internal
-# callers should migrate to ``LEAKAGE_INDEX_BUCKET_WEIGHTS``; the
-# private alias is retained for the v2.2.x line.
+# v2.3 Commit A (was v2.2.1 Commit I, retargeted): Removal scheduled:
+# v2.8.0. Internal callers should migrate to
+# ``LEAKAGE_INDEX_BUCKET_WEIGHTS``; the private alias is retained
+# through the v2.x line and removed in v2.8 cleanup.
 LEAKAGE_INDEX_BUCKET_WEIGHTS: Mapping[str, float] = MappingProxyType({
     "exact": 4.0, "near": 3.0, "rough": 2.0, "miss": 1.0, "invalid": 0.0,
 })
@@ -703,10 +704,10 @@ def _score_rank_attested(
 # import is intentional to keep the rest of orchestrator.py's
 # import block at the top.
 #
-# v2.2.1 audit-fix Commit I: Removal scheduled: v2.3.0. Internal
-# callers should migrate to ``aiphaforge.probes._vol.
-# apply_vol_scaling_to_question_set``; the underscored re-export
-# is retained for the v2.2.x line.
+# v2.3 Commit A (was v2.2.1 Commit I, retargeted): Removal scheduled:
+# v2.8.0. Internal callers should migrate to
+# ``aiphaforge.probes._vol.apply_vol_scaling_to_question_set``; the
+# underscored re-export is retained through the v2.x line.
 from aiphaforge.probes._vol import (  # noqa: E402
     apply_vol_scaling_to_question_set as _apply_vol_scaling_to_question_set,
 )
@@ -775,10 +776,10 @@ class KnowledgeCheckReport:
     # same dict in ``__post_init__`` so v2.2.0/v2.2.1 callers keep
     # working. Real Tango lands in v2.2.2.
     #
-    # v2.2.1 audit-fix Commit I: Removal scheduled: v2.3.0. The
-    # canonical name is ``bucket_delta_ci``; migrate readers
-    # accordingly. The two names will continue to share the same
-    # dict object across the v2.2.x line.
+    # v2.3 Commit A (was v2.2.1 Commit I, retargeted): Removal
+    # scheduled: v2.8.0. The canonical name is ``bucket_delta_ci``;
+    # migrate readers accordingly. The two names will continue to
+    # share the same dict object across the v2.x line.
     bucket_delta_tango_ci: Optional[dict[str, tuple[float, float]]]
 
     # Paired sign test (per quant Q3 r2 — replaces Wilcoxon)
@@ -983,7 +984,7 @@ class KnowledgeCheckReport:
                 "same dict object (alias). Pass only ONE of the two "
                 "fields at construction time; __post_init__ "
                 "cross-populates the other. The historic "
-                "_tango_ci suffix is being removed in v2.3.0; new "
+                "_tango_ci suffix is being removed in v2.8.0; new "
                 "code should use bucket_delta_ci only."
             )
 
@@ -1447,10 +1448,11 @@ def _pair_scores_by_position(
     either side has dropped or reordered questions; the qid-based
     pairing degrades gracefully and surfaces a warning.
 
-    Removal scheduled: v2.3.0. Kept through v2.2.x for any external
-    caller that imported the private name; the public
-    ``knowledge_check`` orchestrator no longer references it. New
-    code MUST use ``_pair_scores_by_question_id``.
+    Removal scheduled: v2.8.0 (was v2.3.0; retargeted in v2.3 Commit
+    A). Kept through the v2.x line for any external caller that
+    imported the private name; the public ``knowledge_check``
+    orchestrator no longer references it. New code MUST use
+    ``_pair_scores_by_question_id``.
     """
     n = min(len(real.question_scores), len(anchor.question_scores))
     return [
