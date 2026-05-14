@@ -150,6 +150,52 @@ class RollingMeanIncremental(IncrementalFactor):
 
 
 @dataclass
+class _VolumeZScoreState(FactorState):
+    window_buf: tuple = ()
+
+
+class VolumeZScoreIncremental(IncrementalFactor):
+    """Per-symbol rolling z-score of ``volume`` over a fixed window.
+
+    Matches v2.4 ``VolumeZScoreFactor``: ``(v - rolling_mean) /
+    rolling_std`` with ``ddof=1`` and ``min_periods=window``. This
+    is a per-symbol time-series transform (NOT cross-sectional).
+    Cross-sectional z-score is deferred to v2.7+ / v3.0.
+    """
+
+    def __init__(self, window: int):
+        if window < 2:
+            raise ValueError(
+                f"window must be >= 2 for sample std (ddof=1), got {window}"
+            )
+        self.window = window
+        self.name = f"volume_zscore_{window}"
+
+    def initial_state(self) -> _VolumeZScoreState:
+        return _VolumeZScoreState()
+
+    def update(
+        self, bar_row: pd.Series, state: _VolumeZScoreState,
+    ) -> Tuple[float, _VolumeZScoreState]:
+        v = float(bar_row["volume"])
+        if len(state.window_buf) < self.window:
+            new_buf = state.window_buf + (v,)
+        else:
+            new_buf = state.window_buf[1:] + (v,)
+        if len(new_buf) < self.window:
+            value = float("nan")
+        else:
+            mean = sum(new_buf) / self.window
+            std = float(np.std(new_buf, ddof=1))
+            value = (v - mean) / std if std != 0 else float("nan")
+        new_state = _VolumeZScoreState(
+            bar_count=state.bar_count + 1,
+            window_buf=new_buf,
+        )
+        return value, new_state
+
+
+@dataclass
 class _RSIState(FactorState):
     avg_gain: float = 0.0
     avg_loss: float = 0.0
