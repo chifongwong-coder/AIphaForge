@@ -126,6 +126,26 @@ The Q&A pillar (v2.2 `knowledge_check`) is **non-transitive** with the obfuscati
 
 Every `KnowledgeCheckReport.notes` carries this warning verbatim. Reports are intentionally not aggregated into a single 🟢/🟡/🔴 verdict — `KnowledgeCheckReport.is_pillar_summary` is `False` and the `__post_init__` rejects any attempt to flip it.
 
+#### v2.5 release notes — StrategyNode 3-Mode Rewrite
+
+v2.5 rewrites the 5 `StrategyNode` composite classes (`WeightedBlend`, `SelectBest`, `PriorityCascade`, `VoteEnsemble`, `ConditionalSwitch`) so they can host modern `generate_signals(data)` children alongside the existing `_compute(df)` legacy children. Engine source diff: zero lines.
+
+**New `mode` parameter** (keyword-only, defaults to `"auto"`):
+
+- `"auto"` — try each child's `generate_signals`; on any `Exception`, fall back to `_compute` (single-asset only). The first fallback for each `(composite_class, child_class)` pair logs a `WARNING`; subsequent fallbacks for the same pair drop to `DEBUG`.
+- `"generate_signals"` — always route through `child.generate_signals(data)`. No fallback; child exceptions propagate.
+- `"legacy_compute"` — always route through `child._compute(df)`. Multi-asset dict input raises `TypeError` (legacy `_compute` is single-asset only). This is the v2.4-equivalent safety hatch.
+
+Existing user code constructing composites without `mode=` is unchanged: bit-equal output against v2.4 (snapshot-pinned).
+
+**Direction-only contract** (v3.0 will widen): If any child carries a `SignalSpec` with `kind != "direction"` (e.g. `"target_weight"`), the composite raises `ValueError` at `generate_signals` entry. Legacy children without `spec` are trusted as direction. Mixed-kind composition is a v3.0 design point.
+
+**Multi-asset symbol mismatch is a hard error**: If two children of `WeightedBlend(mode="generate_signals")` return per-symbol dicts with different key sets, the composite raises `ValueError` naming the missing/extra symbols. Pre-pad via `child_output.reindex(union)` is the user's responsibility — silent renormalization across universes is deferred to v3.0.
+
+**Nested-composite mode is independent**: `WeightedBlend(mode="auto", children=[SelectBest(mode="legacy_compute"), ...])` — the inner `SelectBest` runs its children via `_compute` regardless of the parent's `auto` mode. Each composite reads its own `.mode`; parents do not propagate.
+
+**`extract_strategy_factors` contract is preserved**: the adapter still returns `FactorSet.empty()` for any `StrategyNode` subclass, independent of `mode`. Recursive factor extraction is a v3.0 opt-in feature (separate function).
+
 #### v2.4 release notes — Factor + Alpha Layer
 
 v2.4 adds the **Factor + Alpha layer** on top of v2.3's Signal Layer Foundation. Engine source diff: zero lines (parallel API surface only).

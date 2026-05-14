@@ -114,6 +114,6 @@ class TestReportCarriesWarning:
 
 class TestVersion:
     def test_version_is_current_release(self):
-        # Updated by v2.4.0 minor bump (factor + alpha layer).
+        # Updated by v2.5.0 minor bump (StrategyNode 3-mode rewrite).
         import aiphaforge
-        assert aiphaforge.__version__ == "2.4.0"
+        assert aiphaforge.__version__ == "2.5.0"
