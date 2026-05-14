@@ -801,8 +801,18 @@ class StrategyNode(BaseStrategy):
 
     name = "Strategy Node"
 
-    def __init__(self, children: List[BaseStrategy]):
+    def __init__(
+        self,
+        children: List[BaseStrategy],
+        *,
+        mode: Literal["auto", "generate_signals", "legacy_compute"] = "auto",
+    ):
+        if mode not in _VALID_MODES:
+            raise ValueError(
+                f"mode={mode!r} invalid; must be one of {_VALID_MODES}"
+            )
         self.children = children
+        self.mode = mode
 
     @property
     def params(self) -> Dict[str, Any]:
@@ -844,8 +854,12 @@ class WeightedBlend(StrategyNode):
 
     def __init__(self, children: List[BaseStrategy],
                  weights: Optional[List[float]] = None,
-                 signal_precision: int = 2):
-        super().__init__(children)
+                 signal_precision: int = 2,
+                 *,
+                 mode: Literal[
+                     "auto", "generate_signals", "legacy_compute",
+                 ] = "auto"):
+        super().__init__(children, mode=mode)
         if weights is not None and len(weights) != len(children):
             raise ValueError(
                 f"len(weights)={len(weights)} != len(children)={len(children)}")
@@ -958,8 +972,12 @@ class ConditionalSwitch(StrategyNode):
 
     name = "Conditional Switch"
 
-    def __init__(self, children: List[BaseStrategy], condition_fn):
-        super().__init__(children)
+    def __init__(
+        self, children: List[BaseStrategy], condition_fn,
+        *,
+        mode: Literal["auto", "generate_signals", "legacy_compute"] = "auto",
+    ):
+        super().__init__(children, mode=mode)
         self.condition_fn = condition_fn
 
     def _compute(self, df: pd.DataFrame) -> pd.Series:
