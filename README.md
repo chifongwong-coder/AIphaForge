@@ -126,6 +126,34 @@ The Q&A pillar (v2.2 `knowledge_check`) is **non-transitive** with the obfuscati
 
 Every `KnowledgeCheckReport.notes` carries this warning verbatim. Reports are intentionally not aggregated into a single 🟢/🟡/🔴 verdict — `KnowledgeCheckReport.is_pillar_summary` is `False` and the `__post_init__` rejects any attempt to flip it.
 
+#### v2.4 release notes — Factor + Alpha Layer
+
+v2.4 adds the **Factor + Alpha layer** on top of v2.3's Signal Layer Foundation. Engine source diff: zero lines (parallel API surface only).
+
+**New top-level exports**:
+
+- `SignalSpec` / `SignalFrame` typed wrappers (deferred from v2.3 — earn their keep alongside the factor layer where typed metadata flows through factor → rule → signal pipelines).
+- Factor layer: `BaseFactor`, plus 5 reference factors (`RSIFactor`, `MomentumFactor`, `MASpreadFactor`, `VWAPDistanceFactor`, `VolumeZScoreFactor`) with parametrised `name` format pinning (`"rsi_14"`, `"momentum_20"`, etc.).
+- `FactorRuleStrategy(factor, rule)` — single-factor MVP per master plan §6.4. Multi-factor composition deferred to v2.5+ when `FactorSpec.is_primary` is honored.
+- `extract_strategy_factors(strategy, data)` — adapter exposing implicit factors of 5 built-in strategies (MACrossover, RSIMeanReversion, VWAPReversion, MomentumRank, PairsTrading). Composite strategies (StrategyNode subclasses) explicitly return `FactorSet.empty()` (no recursion). Point-in-time snapshot — uses strategy's CURRENT params; documented in docstring.
+- `aiphaforge.alpha` subpackage: `AlphaScreener` MVP (IC / RankIC / ICIR / coverage / quantile returns), `forward_returns` (with `return_type="simple"` default + `"log"` opt-in), `ic` / `rank_ic` / `coverage` per-timestamp metrics, `signal_forward_return` / `signal_hit_rate` / `signal_turnover` for signal-only strategies (no factors required).
+- `assert_factor_no_lookahead` / `assert_signal_no_lookahead` (already in v2.3; promoted to top-level in v2.4).
+- `FactorSet.to_json()` / `from_json()` — sanctioned cross-version persistence path (R10). JSON via `pandas orient='split'` preserves DatetimeIndex / column / values dtypes. Schema version 1.
+
+**Architectural firewall** (R7 + R11): `aiphaforge.alpha.*` and `factor_library.py` / `factor_strategy.py` / `strategy_factors.py` MUST NOT import any of 13 execution-layer modules (engine, fees, broker, market_impact, position_sizing, risk, portfolio, optimizer, portfolio_optimizer, capital_allocator, margin, costs, latency). AST-based guard tests verify each module.
+
+**Closed v2.2.2 G methodology gap**: canonical-formula tests for `_vol.py` (Parkinson + Garman-Klass + stdev_returns ddof=1), `_rank.py` (tie-corrected Spearman ρ vs hand-derived Kendall formula), `anchors.py` (block bootstrap seed determinism + GJR-GARCH parameter recovery with empirically-pinned per-parameter tolerance bands), and a true end-to-end Phipson-Smyth invocation of `permutation_test` (the v2.2.2 G test reproduced the formula inline only).
+
+**v2.4 reference-factor formulas pinned in plan + tests**:
+
+- `RSIFactor(period)` wraps `indicators.RSI`. Output [0, 100].
+- `MomentumFactor(window)` is gross simple return `close[t]/close[t-w] - 1` (NOT `indicators.ROC`'s 100x-scaled).
+- `MASpreadFactor(short, long, ma_type)` is `MA_short / MA_long - 1`.
+- `VWAPDistanceFactor(window)` uses **rolling** VWAP (NOT the running-cumulative `indicators.VWAP`). Zero-volume window naturally returns NaN via `0/0`.
+- `VolumeZScoreFactor(window)` uses `min_periods=window` rolling z-score with `ddof=1`. Explicitly NOT `.expanding()` (would be lookahead).
+
+**Default behaviour preservation**: all v2.3 / v2.2.x APIs are untouched. `wide_to_signal_dict(warn_on_inf=False)` default preserves v2.3 silent Inf coercion; the opt-in warning is for users debugging upstream factor bugs.
+
 #### v2.3 release notes — Signal Layer Foundation
 
 v2.3 establishes the **Signal Layer** as a first-class abstraction without touching `BacktestEngine`. This is the first step of the multi-version refactor (v2.3 → v2.8) decoupling factors from strategies; see `docs/AIphaForge_Framework_Refactor_Master_Plan_v1.0.md` for the full roadmap.
