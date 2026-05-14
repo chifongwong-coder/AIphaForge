@@ -72,12 +72,22 @@ class TestAlphaScreenerSingleDataFrame:
         # Without spec: IC mean is negative.
         rep_unsigned = AlphaScreener().evaluate(factor, prices)
         ic_unsigned = rep_unsigned.metrics["ic_mean"]
+        rank_ic_unsigned = rep_unsigned.metrics["rank_ic_mean"]
         assert ic_unsigned < 0
         # With spec.direction=-1: sign flips, IC reported positive.
         spec = FactorSpec(name="negfac", direction=-1)
         rep_signed = AlphaScreener().evaluate(factor, prices, spec=spec)
         ic_signed = rep_signed.metrics["ic_mean"]
+        rank_ic_signed = rep_signed.metrics["rank_ic_mean"]
         assert ic_signed == pytest.approx(-ic_unsigned, rel=1e-12)
+        # Per quant-review v2 final-pass nit: the spec.direction
+        # sign-flip applies to BOTH IC and RankIC. The production
+        # code at evaluator.py:86-87 multiplies both metrics by
+        # `sign`; pin the RankIC half explicitly to catch a
+        # regression that drops the flip on one of the two.
+        assert rank_ic_signed == pytest.approx(
+            -rank_ic_unsigned, rel=1e-12,
+        )
 
 
 class TestAlphaScreenerFactorSetDispatch:
