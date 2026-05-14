@@ -787,6 +787,55 @@ def _resolve_child_signals(
     )
 
 
+def _check_uniform_series_shape(
+    composite_cls: type,
+    children: List[BaseStrategy],
+    per_child: List[Any],
+) -> None:
+    """Reject mixed Series/dict children at composite entry.
+
+    Eager validation: catches shape mismatch BEFORE the per-bar merge
+    loop, so the error message names the offending child rather than
+    surfacing as a confusing TypeError mid-merge.
+    """
+    for i, out in enumerate(per_child):
+        if not isinstance(out, pd.Series):
+            raise TypeError(
+                f"{composite_cls.__name__} single-asset mode requires "
+                f"children to return pd.Series; child[{i}] "
+                f"{type(children[i]).__name__} returned "
+                f"{type(out).__name__}"
+            )
+
+
+def _check_uniform_dict_shape(
+    composite_cls: type,
+    children: List[BaseStrategy],
+    per_child: List[Any],
+    data_dict: Dict[str, pd.DataFrame],
+) -> None:
+    expected_keys = set(data_dict.keys())
+    for i, out in enumerate(per_child):
+        if not isinstance(out, dict):
+            raise TypeError(
+                f"{composite_cls.__name__} multi-asset mode requires "
+                f"children to return dict[str, Series]; child[{i}] "
+                f"{type(children[i]).__name__} returned "
+                f"{type(out).__name__}"
+            )
+        got_keys = set(out.keys())
+        if got_keys != expected_keys:
+            missing = expected_keys - got_keys
+            extra = got_keys - expected_keys
+            raise ValueError(
+                f"{composite_cls.__name__} child[{i}] "
+                f"{type(children[i]).__name__} returned mismatched "
+                f"symbols: missing={sorted(missing)}, "
+                f"extra={sorted(extra)}. Pre-pad child output via "
+                "reindex(union) before composing."
+            )
+
+
 def _validate_children_kind(
     composite_cls: type, children: List[BaseStrategy],
 ) -> None:
@@ -982,21 +1031,47 @@ class SelectBest(StrategyNode):
 
     name = "Select Best"
 
-    def _compute(self, df: pd.DataFrame) -> pd.Series:
-        signals = pd.concat(
-            [child._compute(df) for child in self.children], axis=1)
+    def generate_signals(self, data):
+        _validate_children_kind(SelectBest, self.children)
+        if isinstance(data, dict):
+            per_child = [
+                _resolve_child_signals(SelectBest, c, data, mode=self.mode)
+                for c in self.children
+            ]
+            _check_uniform_dict_shape(SelectBest, self.children, per_child, data)
+            return {
+                sym: self._select_best(
+                    [child_out[sym] for child_out in per_child], data[sym].index,
+                )
+                for sym in data
+            }
+        per_child = [
+            _resolve_child_signals(SelectBest, c, data, mode=self.mode)
+            for c in self.children
+        ]
+        return self._select_best(per_child, data.index)
+
+    def _select_best(
+        self, per_child: List[pd.Series], index: pd.Index,
+    ) -> pd.Series:
+        signals = pd.concat(per_child, axis=1)
         signals.columns = range(len(self.children))
-        # Vectorized: select column with max abs value per row
         abs_signals = signals.abs()
-        # Use fillna(-1) to avoid FutureWarning on all-NaN rows;
-        # all-NaN rows get idxmax=0 but are excluded by valid check below
         best_col = abs_signals.fillna(-1).idxmax(axis=1)
         has_any = abs_signals.notna().any(axis=1)
-        result = pd.Series(np.nan, index=df.index, dtype=float)
+        result = pd.Series(np.nan, index=signals.index, dtype=float)
         for col in range(len(self.children)):
             mask = (best_col == col) & has_any
             result[mask] = signals.loc[mask, col]
-        return _transitions_only(result)
+        result = _transitions_only(result).reindex(index)
+        return result
+
+    def _compute(self, df: pd.DataFrame) -> pd.Series:
+        per_child = [
+            _resolve_child_signals(SelectBest, c, df, mode="legacy_compute")
+            for c in self.children
+        ]
+        return self._select_best(per_child, df.index)
 
 
 class PriorityCascade(StrategyNode):
@@ -1008,13 +1083,53 @@ class PriorityCascade(StrategyNode):
 
     name = "Priority Cascade"
 
-    def _compute(self, df: pd.DataFrame) -> pd.Series:
-        result = pd.Series(np.nan, index=df.index, dtype=float)
-        for child in self.children:
-            sig = child._compute(df)
+    def generate_signals(self, data):
+        _validate_children_kind(PriorityCascade, self.children)
+        if isinstance(data, dict):
+            per_child = [
+                _resolve_child_signals(
+                    PriorityCascade, c, data, mode=self.mode,
+                )
+                for c in self.children
+            ]
+            _check_uniform_dict_shape(
+                PriorityCascade, self.children, per_child, data,
+            )
+            return {
+                sym: self._cascade(
+                    [child_out[sym] for child_out in per_child], data[sym].index,
+                )
+                for sym in data
+            }
+        per_child = [
+            _resolve_child_signals(
+                PriorityCascade, c, data, mode=self.mode,
+            )
+            for c in self.children
+        ]
+        _check_uniform_series_shape(
+            PriorityCascade, self.children, per_child,
+        )
+        return self._cascade(per_child, data.index)
+
+    def _cascade(
+        self, per_child: List[pd.Series], index: pd.Index,
+    ) -> pd.Series:
+        result = pd.Series(np.nan, index=index, dtype=float)
+        for sig in per_child:
+            sig = sig.reindex(index)
             mask = result.isna() & sig.notna()
             result[mask] = sig[mask]
         return _transitions_only(result)
+
+    def _compute(self, df: pd.DataFrame) -> pd.Series:
+        per_child = [
+            _resolve_child_signals(
+                PriorityCascade, c, df, mode="legacy_compute",
+            )
+            for c in self.children
+        ]
+        return self._cascade(per_child, df.index)
 
 
 class VoteEnsemble(StrategyNode):
@@ -1026,18 +1141,52 @@ class VoteEnsemble(StrategyNode):
 
     name = "Vote Ensemble"
 
-    def _compute(self, df: pd.DataFrame) -> pd.Series:
-        signals = pd.concat(
-            [child._compute(df) for child in self.children], axis=1)
+    def generate_signals(self, data):
+        _validate_children_kind(VoteEnsemble, self.children)
+        if isinstance(data, dict):
+            per_child = [
+                _resolve_child_signals(VoteEnsemble, c, data, mode=self.mode)
+                for c in self.children
+            ]
+            _check_uniform_dict_shape(
+                VoteEnsemble, self.children, per_child, data,
+            )
+            return {
+                sym: self._vote(
+                    [child_out[sym] for child_out in per_child], data[sym].index,
+                )
+                for sym in data
+            }
+        per_child = [
+            _resolve_child_signals(VoteEnsemble, c, data, mode=self.mode)
+            for c in self.children
+        ]
+        _check_uniform_series_shape(
+            VoteEnsemble, self.children, per_child,
+        )
+        return self._vote(per_child, data.index)
+
+    def _vote(
+        self, per_child: List[pd.Series], index: pd.Index,
+    ) -> pd.Series:
+        signals = pd.concat(per_child, axis=1)
         signals.columns = range(len(self.children))
         votes = signals.apply(np.sign)
         vote_sum = votes.sum(axis=1)
         n_valid = votes.notna().sum(axis=1)
 
-        result = pd.Series(np.nan, index=df.index, dtype=float)
+        result = pd.Series(np.nan, index=signals.index, dtype=float)
         majority = vote_sum.abs() > n_valid / 2
         result[majority] = np.sign(vote_sum[majority])
-        return _transitions_only(result)
+        result = _transitions_only(result).reindex(index)
+        return result
+
+    def _compute(self, df: pd.DataFrame) -> pd.Series:
+        per_child = [
+            _resolve_child_signals(VoteEnsemble, c, df, mode="legacy_compute")
+            for c in self.children
+        ]
+        return self._vote(per_child, df.index)
 
 
 class ConditionalSwitch(StrategyNode):
@@ -1065,11 +1214,63 @@ class ConditionalSwitch(StrategyNode):
         super().__init__(children, mode=mode)
         self.condition_fn = condition_fn
 
-    def _compute(self, df: pd.DataFrame) -> pd.Series:
-        selection = self.condition_fn(df)
-        child_signals = [c._compute(df) for c in self.children]
-        result = pd.Series(np.nan, index=df.index, dtype=float)
-        for i, sig in enumerate(child_signals):
+    def generate_signals(self, data):
+        _validate_children_kind(ConditionalSwitch, self.children)
+        if isinstance(data, dict):
+            per_child = [
+                _resolve_child_signals(
+                    ConditionalSwitch, c, data, mode=self.mode,
+                )
+                for c in self.children
+            ]
+            _check_uniform_dict_shape(
+                ConditionalSwitch, self.children, per_child, data,
+            )
+            # condition_fn must accept the data shape it's invoked with.
+            # For multi-asset, expect dict[str, Series] back.
+            selection = self.condition_fn(data)
+            if not isinstance(selection, dict):
+                raise TypeError(
+                    "ConditionalSwitch.condition_fn must return "
+                    "dict[str, Series] when called with multi-asset data; "
+                    f"got {type(selection).__name__}"
+                )
+            return {
+                sym: self._switch(
+                    [child_out[sym] for child_out in per_child],
+                    selection[sym], data[sym].index,
+                )
+                for sym in data
+            }
+        per_child = [
+            _resolve_child_signals(
+                ConditionalSwitch, c, data, mode=self.mode,
+            )
+            for c in self.children
+        ]
+        _check_uniform_series_shape(
+            ConditionalSwitch, self.children, per_child,
+        )
+        return self._switch(per_child, self.condition_fn(data), data.index)
+
+    def _switch(
+        self,
+        per_child: List[pd.Series],
+        selection: pd.Series,
+        index: pd.Index,
+    ) -> pd.Series:
+        result = pd.Series(np.nan, index=index, dtype=float)
+        for i, sig in enumerate(per_child):
+            sig = sig.reindex(index)
             mask = selection == i
             result[mask] = sig[mask]
         return _transitions_only(result)
+
+    def _compute(self, df: pd.DataFrame) -> pd.Series:
+        per_child = [
+            _resolve_child_signals(
+                ConditionalSwitch, c, df, mode="legacy_compute",
+            )
+            for c in self.children
+        ]
+        return self._switch(per_child, self.condition_fn(df), df.index)
