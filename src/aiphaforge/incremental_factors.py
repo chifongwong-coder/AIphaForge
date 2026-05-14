@@ -18,6 +18,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Tuple
 
+import numpy as np
 import pandas as pd
 
 
@@ -144,5 +145,59 @@ class RollingMeanIncremental(IncrementalFactor):
             bar_count=state.bar_count + 1,
             window_buf=new_buf,
             running_sum=new_sum,
+        )
+        return value, new_state
+
+
+@dataclass
+class _RollingStdState(FactorState):
+    window_buf: tuple = ()
+
+
+class RollingStdIncremental(IncrementalFactor):
+    """Rolling sample std of ``close`` over a fixed window.
+
+    Algorithm: maintain a sliding window tuple; each update
+    recomputes std on the current window via ``numpy.std`` (which
+    uses Welford internally since NumPy 1.x and matches pandas
+    ``Series.rolling(window).std(ddof=...)`` numerically).
+
+    The per-update complexity is O(window). True O(1) rolling
+    Welford requires approximate removal arithmetic that
+    accumulates floating-point error over thousands of bars; the
+    O(window) per-update cost is the v2.6 MVP trade-off in favor
+    of bit-stable equivalence with the pandas batch reference.
+    Implementation MUST short-circuit to NaN while
+    ``bar_count < window`` to avoid the n=1 / divide-by-zero edge
+    case in the variance formula at ddof=1.
+    """
+
+    def __init__(self, window: int, ddof: int = 1):
+        if window < 1:
+            raise ValueError(f"window must be >= 1, got {window}")
+        if ddof < 0:
+            raise ValueError(f"ddof must be >= 0, got {ddof}")
+        self.window = window
+        self.ddof = ddof
+        self.name = f"rolling_std_{window}"
+
+    def initial_state(self) -> _RollingStdState:
+        return _RollingStdState()
+
+    def update(
+        self, bar_row: pd.Series, state: _RollingStdState,
+    ) -> Tuple[float, _RollingStdState]:
+        x = float(bar_row["close"])
+        if len(state.window_buf) < self.window:
+            new_buf = state.window_buf + (x,)
+        else:
+            new_buf = state.window_buf[1:] + (x,)
+        if len(new_buf) < self.window:
+            value = float("nan")
+        else:
+            value = float(np.std(new_buf, ddof=self.ddof))
+        new_state = _RollingStdState(
+            bar_count=state.bar_count + 1,
+            window_buf=new_buf,
         )
         return value, new_state
