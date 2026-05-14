@@ -119,6 +119,15 @@ from .hooks import (
     SecondaryTimeframe,
     schedule_rebalance,
 )
+from .incremental_factors import (
+    FactorState,
+    IncrementalFactor,
+    MomentumIncremental,
+    RollingMeanIncremental,
+    RollingStdIncremental,
+    RSIIncremental,
+    VolumeZScoreIncremental,
+)
 from .latency import LatencyHook, SimpleLatencyHook, SymbolRoutingLatencyHook
 from .margin import (
     BasePortfolioExitRule,
@@ -390,6 +399,14 @@ __all__ = [
     'MASpreadFactor',
     'VWAPDistanceFactor',
     'VolumeZScoreFactor',
+    # v2.6 incremental factors (parallel API to BaseFactor)
+    'IncrementalFactor',
+    'FactorState',
+    'RollingMeanIncremental',
+    'RollingStdIncremental',
+    'MomentumIncremental',
+    'RSIIncremental',
+    'VolumeZScoreIncremental',
     'FactorRuleStrategy',
     'AlphaScreener',
     'AlphaScreenConfig',
