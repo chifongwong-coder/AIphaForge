@@ -150,6 +150,85 @@ class RollingMeanIncremental(IncrementalFactor):
 
 
 @dataclass
+class _RSIState(FactorState):
+    avg_gain: float = 0.0
+    avg_loss: float = 0.0
+    prev_close: float = float("nan")
+
+
+class RSIIncremental(IncrementalFactor):
+    """Relative Strength Index (Wilder smoothing via EWM, ``adjust=False``).
+
+    Matches v2.4 ``RSIFactor`` (which delegates to ``indicators.RSI``)
+    byte-for-byte at the SMA-seed → recursive-Wilder transition cliff.
+
+    The v2.4 reference uses ``ewm(alpha=1/period, min_periods=period,
+    adjust=False).mean()`` on the per-bar gains and losses. The
+    incremental form is the same recursion driven one bar at a time:
+
+        avg_gain[t] = alpha * gain[t] + (1 - alpha) * avg_gain[t-1]
+        avg_loss[t] = alpha * loss[t] + (1 - alpha) * avg_loss[t-1]
+
+    where ``gain[0] = loss[0] = 0`` (delta is undefined on the first
+    bar). Output is NaN for bars 0..(period - 2); bar ``period - 1``
+    is the first non-NaN value (matches pandas
+    ``ewm(min_periods=period).mean()`` semantics: emit once
+    ``period`` non-NaN inputs have been observed, including bar 0).
+
+    avg_loss == 0 edge case (post-warmup): RSI = 100 (matches the
+    explicit fill in v2.4 ``indicators.RSI``).
+    """
+
+    def __init__(self, period: int = 14):
+        if period < 1:
+            raise ValueError(f"period must be >= 1, got {period}")
+        self.period = period
+        self.alpha = 1.0 / period
+        self.name = f"rsi_{period}"
+
+    def initial_state(self) -> _RSIState:
+        return _RSIState()
+
+    def update(
+        self, bar_row: pd.Series, state: _RSIState,
+    ) -> Tuple[float, _RSIState]:
+        x = float(bar_row["close"])
+        if state.bar_count == 0:
+            # First bar: no prev_close, delta is NaN → coerce to (0, 0)
+            # to match v2.4's `delta.where(delta > 0, 0.0)` behavior.
+            gain = 0.0
+            loss = 0.0
+        else:
+            delta = x - state.prev_close
+            if delta > 0:
+                gain, loss = delta, 0.0
+            elif delta < 0:
+                gain, loss = 0.0, -delta
+            else:
+                gain, loss = 0.0, 0.0
+
+        new_avg_gain = self.alpha * gain + (1.0 - self.alpha) * state.avg_gain
+        new_avg_loss = self.alpha * loss + (1.0 - self.alpha) * state.avg_loss
+        new_bar_count = state.bar_count + 1
+
+        if new_bar_count < self.period:
+            value = float("nan")
+        elif new_avg_loss == 0.0:
+            value = 100.0
+        else:
+            rs = new_avg_gain / new_avg_loss
+            value = 100.0 - 100.0 / (1.0 + rs)
+
+        new_state = _RSIState(
+            bar_count=new_bar_count,
+            avg_gain=new_avg_gain,
+            avg_loss=new_avg_loss,
+            prev_close=x,
+        )
+        return value, new_state
+
+
+@dataclass
 class _MomentumState(FactorState):
     window_buf: tuple = ()
 
