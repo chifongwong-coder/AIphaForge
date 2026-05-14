@@ -22,8 +22,9 @@ in v2.4.
 """
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Mapping, Protocol
+from typing import Mapping, Protocol, Union
 
 import pandas as pd
 
@@ -111,6 +112,39 @@ class FactorSet:
         return cls(values={}, specs={})
 
 
+class BaseFactor(ABC):
+    """Abstract base class for compute-side factors (v2.4).
+
+    Subclasses implement :meth:`compute` returning a wide
+    ``pd.DataFrame[index=datetime, columns=symbol]``. Both
+    single-asset and multi-asset inputs are accepted; the column
+    layout is uniform per master plan §2.4.
+
+    Single-vs-multi dispatch (pinned in v2.4 Commit D):
+      - If ``data`` is ``pd.DataFrame``: single-asset; output is a
+        one-column DataFrame whose column name is ``self.name``
+        (the factor's own parametrised identity).
+      - If ``data`` is ``Mapping[str, pd.DataFrame]``: multi-asset;
+        output columns mirror the input keys preserving the
+        mapping's iteration order.
+
+    Subclasses MUST set ``self.name`` (typically encoding the
+    parameter values, e.g. ``"rsi_14"``, ``"momentum_20"``) and
+    SHOULD set ``self.spec`` to a :class:`FactorSpec` describing
+    the factor's metadata.
+    """
+
+    name: str = "base_factor"
+    spec: "FactorSpec | None" = None
+
+    @abstractmethod
+    def compute(
+        self,
+        data: Union[pd.DataFrame, Mapping[str, pd.DataFrame]],
+    ) -> pd.DataFrame:
+        """Return canonical wide ``DataFrame[index=datetime, columns=symbol]``."""
+
+
 class FactorProvider(Protocol):
     """OPTIONAL Protocol for factor-aware objects.
 
@@ -188,6 +222,7 @@ __all__ = [
     "FactorSpec",
     "FactorSet",
     "FactorProvider",
+    "BaseFactor",
     "dict_to_factor_wide",
     "validate_factor_wide",
 ]
