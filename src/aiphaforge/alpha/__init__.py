@@ -17,3 +17,29 @@ v2.4 ships:
                           strategies that don't expose factors
 """
 from __future__ import annotations
+
+from aiphaforge.alpha.evaluator import AlphaScreener
+from aiphaforge.alpha.labels import forward_returns
+from aiphaforge.alpha.metrics import coverage, ic, rank_ic
+from aiphaforge.alpha.rank_stats import midranks, tie_corrected_spearman
+from aiphaforge.alpha.report import AlphaScreenConfig, FactorReport
+from aiphaforge.alpha.signal_analysis import (
+    signal_forward_return,
+    signal_hit_rate,
+    signal_turnover,
+)
+
+__all__ = [
+    "AlphaScreener",
+    "AlphaScreenConfig",
+    "FactorReport",
+    "coverage",
+    "forward_returns",
+    "ic",
+    "rank_ic",
+    "midranks",
+    "tie_corrected_spearman",
+    "signal_forward_return",
+    "signal_hit_rate",
+    "signal_turnover",
+]

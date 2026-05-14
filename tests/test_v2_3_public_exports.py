@@ -18,15 +18,11 @@ class TestPublicExportsV2_3Importable:
         # Strategy wrapper
         assert hasattr(aiphaforge, "DirectSignalStrategy")
 
-    def test_factor_and_diagnostic_apis_subpackage_only(self):
-        # v2.3 plan §J: factor + diagnostic APIs are deliberately
-        # NOT exported at top level until v2.4.
-        import aiphaforge
-
-        assert not hasattr(aiphaforge, "FactorSpec")
-        assert not hasattr(aiphaforge, "FactorSet")
-        assert not hasattr(aiphaforge, "assert_factor_no_lookahead")
-        # But they ARE importable from their subpackages.
+    def test_factor_and_diagnostic_apis_subpackage_imports_work(self):
+        # v2.3 plan §J originally pinned factor/diagnostic APIs as
+        # subpackage-import only. v2.4 Commit P promoted them to
+        # top level. The subpackage import path is preserved as a
+        # backward-compat invariant — verify both forms still work.
         from aiphaforge.diagnostics import (
             assert_factor_no_lookahead,
             assert_signal_no_lookahead,

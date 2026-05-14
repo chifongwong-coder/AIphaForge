@@ -53,6 +53,18 @@ Performance Analysis:
 ... })
 """
 
+# v2.3 Commit J: signal-layer public exports.
+# v2.4 Commit P: factor / alpha / diagnostic APIs promoted from
+# subpackage-only to top level now that FactorRuleStrategy is stable.
+from .alpha import (
+    AlphaScreenConfig,
+    AlphaScreener,
+    FactorReport,
+    coverage,
+    forward_returns,
+    ic,
+    rank_ic,
+)
 from .broker import Broker, FillModel, SimpleBroker, SlippageModel
 from .capital_allocator import (
     BaseCapitalAllocator,
@@ -64,8 +76,26 @@ from .capital_allocator import (
 from .config import BacktestConfig, TurnoverConfig, resolve_config
 from .corporate_actions import CorporateActionHook
 from .costs import BaseTradeCost, DefaultTradeCost
+from .diagnostics import (
+    assert_factor_no_lookahead,
+    assert_signal_no_lookahead,
+)
 from .engine import BacktestEngine, ExecutionMode, PositionSizing, backtest
 from .exit_rules import BaseExitRule, PercentageStopLoss, PercentageTakeProfit, TrailingStopLoss
+from .factor_library import (
+    MASpreadFactor,
+    MomentumFactor,
+    RSIFactor,
+    VolumeZScoreFactor,
+    VWAPDistanceFactor,
+)
+from .factor_strategy import FactorRuleStrategy
+from .factors import (
+    BaseFactor,
+    FactorProvider,
+    FactorSet,
+    FactorSpec,
+)
 from .fees import (
     BaseFeeModel,
     ChinaAShareFeeModel,
@@ -133,17 +163,14 @@ from .risk import (
     MaxDrawdownHalt,
     RiskSignal,
 )
-
-# v2.3 Commit J: signal-layer public exports.
-# Factor + diagnostic APIs remain subpackage-import only in v2.3
-# (per master plan §6.3); they get top-level exports in v2.4 once
-# FactorRuleStrategy is stable.
 from .signal_rules import (
     CrossSectionalQuantileRule,
     ThresholdScoreRule,
 )
 from .signal_strategy import DirectSignalStrategy
 from .signals import (
+    SignalFrame,
+    SignalSpec,
     dict_to_signal_wide,
     prepare_signals_for_engine,
     target_weight_wide_to_schedule,
@@ -350,4 +377,27 @@ __all__ = [
     'ThresholdScoreRule',
     'CrossSectionalQuantileRule',
     'DirectSignalStrategy',
+
+    # v2.4 Factor / Alpha layer
+    'SignalSpec',
+    'SignalFrame',
+    'BaseFactor',
+    'FactorSpec',
+    'FactorSet',
+    'FactorProvider',
+    'RSIFactor',
+    'MomentumFactor',
+    'MASpreadFactor',
+    'VWAPDistanceFactor',
+    'VolumeZScoreFactor',
+    'FactorRuleStrategy',
+    'AlphaScreener',
+    'AlphaScreenConfig',
+    'FactorReport',
+    'forward_returns',
+    'ic',
+    'rank_ic',
+    'coverage',
+    'assert_factor_no_lookahead',
+    'assert_signal_no_lookahead',
 ]
