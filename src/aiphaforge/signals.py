@@ -116,6 +116,8 @@ def dict_to_signal_wide(
 def wide_to_signal_dict(
     signal_wide: pd.DataFrame,
     data_dict: Mapping[str, pd.DataFrame] | None = None,
+    *,
+    warn_on_inf: bool = False,
 ) -> dict[str, pd.Series]:
     """Split wide signal DataFrame into per-symbol Series.
 
@@ -131,6 +133,14 @@ def wide_to_signal_dict(
         ``signal_wide`` but absent from ``data_dict`` are dropped
         with no warning (the caller is presumably routing only the
         relevant subset to the engine).
+    warn_on_inf
+        v2.4 opt-in: when ``True``, emit a ``UserWarning`` listing
+        the per-column count of ±Inf values BEFORE coercing them
+        to NaN. Default ``False`` preserves v2.3 silent-coercion
+        behaviour. ±Inf in a signal column almost always indicates
+        an upstream computation bug (e.g. division by zero in a
+        z-score factor); the opt-in warning surfaces it without
+        breaking existing callers.
 
     Returns
     -------
@@ -145,6 +155,22 @@ def wide_to_signal_dict(
     behavior for infinite values and engine code uses NaN as the
     "hold" sentinel.
     """
+    if warn_on_inf:
+        import warnings as _warnings
+        inf_mask = np.isinf(signal_wide.to_numpy(dtype=float))
+        if inf_mask.any():
+            per_col = (
+                np.isinf(signal_wide.astype(float)).sum().to_dict()
+            )
+            offenders = {k: int(v) for k, v in per_col.items() if v}
+            _warnings.warn(
+                f"wide_to_signal_dict: ±Inf values detected in "
+                f"signal_wide and silently coerced to NaN per the "
+                f"signal contract. Per-column counts: {offenders}. "
+                f"This usually indicates an upstream computation bug.",
+                UserWarning,
+                stacklevel=2,
+            )
     cleaned = signal_wide.replace([np.inf, -np.inf], np.nan)
     if data_dict is None:
         return {sym: cleaned[sym].copy() for sym in cleaned.columns}

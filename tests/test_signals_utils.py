@@ -106,6 +106,25 @@ class TestLayoutAdapters:
         assert out["B"].isna().all()
         assert len(out["B"]) == 3
 
+    def test_warn_on_inf_emits_user_warning(self):
+        # v2.4 Commit B: opt-in warning when Inf coercion fires.
+        # Default behavior (no warning) preserved by the False default.
+        idx = pd.date_range("2024-01-01", periods=3)
+        wide = pd.DataFrame(
+            {"A": [1.0, np.inf, -np.inf], "B": [0.0, np.nan, 1.0]},
+            index=idx,
+        )
+        # Default: silent (v2.3 behavior).
+        import warnings as _w
+        with _w.catch_warnings(record=True) as records:
+            _w.simplefilter("always")
+            wide_to_signal_dict(wide)
+        inf_warnings = [r for r in records if "Inf" in str(r.message)]
+        assert not inf_warnings, "default warn_on_inf should be silent"
+        # Opt-in: warning fires with per-column counts.
+        with pytest.warns(UserWarning, match="Inf values detected"):
+            wide_to_signal_dict(wide, warn_on_inf=True)
+
     def test_inf_values_replaced_with_nan(self):
         # Signal contract has no defined behavior for Inf; treat as
         # "hold" (NaN) rather than letting it leak into engine math.
