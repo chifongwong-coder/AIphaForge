@@ -100,6 +100,47 @@ class IncrementalFactor(ABC):
             out.append(value)
         return pd.Series(out, index=data.index, dtype=float)
 
+    # ------------------------------------------------------------------
+    # Stateful convenience API — for callers (typically strategy
+    # authors) who treat the factor as if it owned its own state. The
+    # main update(bar, state) API remains stateless; these helpers
+    # manage ``self._state`` for the common single-symbol use case.
+    # ------------------------------------------------------------------
+
+    def update_params(self, **kwargs) -> None:
+        """Apply runtime parameter changes; reset internal state.
+
+        Per the v2.6 design doc Q4 decision: clear + rebuild (no
+        local invalidation). After ``update_params``, ``self._state``
+        is a clean slate; the caller MUST call ``rewarmup(history)``
+        before resuming live ``update()`` calls, otherwise the next
+        ``window`` bars emit NaN.
+        """
+        for k, v in kwargs.items():
+            if not hasattr(self, k):
+                raise ValueError(
+                    f"Unknown param '{k}' for {type(self).__name__}"
+                )
+            setattr(self, k, v)
+        self._state = self.initial_state()
+
+    def rewarmup(self, history: pd.DataFrame) -> None:
+        """Replay history to rebuild ``self._state`` under current params.
+
+        Convenience method to avoid every caller hand-rolling the
+        same per-bar update loop after ``update_params(...)``.
+        Equivalent to manually calling ``initial_state()`` then
+        feeding each row of ``history`` through ``update()``.
+
+        If ``history`` is shorter than the factor's warmup window,
+        rewarmup completes but ``self._state`` is still in warmup —
+        subsequent ``update()`` calls will return NaN until enough
+        bars accumulate.
+        """
+        self._state = self.initial_state()
+        for _, bar in history.iterrows():
+            _, self._state = self.update(bar, self._state)
+
 
 # ---------------------------------------------------------------------------
 # Concrete v2.6 MVP factors (Commits C-G)
