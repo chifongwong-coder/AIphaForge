@@ -252,10 +252,141 @@ def validate_signal_wide(signal_wide: pd.DataFrame) -> None:
         )
 
 
+def prepare_signals_for_engine(
+    signals: pd.Series | dict[str, pd.Series] | pd.DataFrame,
+    data: pd.DataFrame | dict[str, pd.DataFrame],
+    *,
+    broadcast: bool = False,
+) -> pd.Series | dict[str, pd.Series]:
+    """Resolve user-supplied signals to engine-compatible shape.
+
+    `BacktestEngine.set_signals` accepts only ``pd.Series`` (single
+    asset) or ``dict[str, pd.Series]`` (multi asset). Research and
+    ML pipelines often produce wide ``pd.DataFrame`` signals or a
+    single Series intended to apply across a multi-asset universe.
+    This adapter resolves the user input to the engine-compatible
+    shape, raising on ambiguous combinations.
+
+    Routing:
+
+    +---------------------------------------+----------------------------+
+    | Input                                 | Output                     |
+    +=======================================+============================+
+    | single ``data`` + ``Series``          | ``Series`` (validated)     |
+    +---------------------------------------+----------------------------+
+    | single ``data`` + 1-col ``DataFrame`` | ``Series`` (the column)    |
+    +---------------------------------------+----------------------------+
+    | single ``data`` + multi-col ``DF``    | ``ValueError`` (ambiguous) |
+    +---------------------------------------+----------------------------+
+    | multi ``data_dict`` + ``dict``        | aligned ``dict``           |
+    +---------------------------------------+----------------------------+
+    | multi ``data_dict`` + wide ``DF``     | ``dict[str, Series]``      |
+    +---------------------------------------+----------------------------+
+    | multi ``data_dict`` + ``Series``,     |                            |
+    |   ``broadcast=False`` (default)       | ``ValueError``             |
+    +---------------------------------------+----------------------------+
+    | multi ``data_dict`` + ``Series``,     | ``dict``: same Series for  |
+    |   ``broadcast=True``                  | each symbol (per-symbol    |
+    |                                       | reindex)                   |
+    +---------------------------------------+----------------------------+
+
+    Parameters
+    ----------
+    signals
+        User-supplied signal in any of the accepted shapes.
+    data
+        ``pd.DataFrame`` (single asset) or
+        ``Mapping[str, pd.DataFrame]`` (multi asset). Used only to
+        determine the routing shape and the per-symbol target index.
+    broadcast
+        Opt-in escape hatch: when ``True`` and the input is a
+        single Series with multi-asset ``data``, the same Series is
+        replicated across every symbol in ``data`` (each reindexed
+        to that symbol's data index). The canonical use case is
+        a global market-wide signal (e.g. "go long all symbols
+        when VIX < 15"). Default ``False`` makes the case raise so
+        the user has to acknowledge the broadcast intent
+        explicitly.
+
+    Returns
+    -------
+    pd.Series | dict[str, pd.Series]
+        Shape-matched, index-aligned, NaN/0/±1 semantics preserved.
+
+    Raises
+    ------
+    TypeError
+        If ``signals`` or ``data`` is a type the routing doesn't
+        recognise.
+    ValueError
+        On the ambiguous routing cases listed in the table.
+    """
+    multi = isinstance(data, dict)
+    # ---- single-asset branch ----
+    if not multi:
+        if not isinstance(data, pd.DataFrame):
+            raise TypeError(
+                f"data must be pd.DataFrame (single) or "
+                f"Mapping[str, pd.DataFrame] (multi); got "
+                f"{type(data).__name__}"
+            )
+        if isinstance(signals, pd.Series):
+            return signals.copy()
+        if isinstance(signals, pd.DataFrame):
+            if signals.shape[1] == 1:
+                return signals.iloc[:, 0].copy()
+            raise ValueError(
+                f"single-asset data was supplied but signals is a "
+                f"multi-column DataFrame ({signals.shape[1]} columns: "
+                f"{list(signals.columns)[:5]}{'...' if signals.shape[1] > 5 else ''}). "
+                f"Routing is ambiguous — slice the column you want "
+                f"explicitly: signals['<col>']."
+            )
+        if isinstance(signals, dict):
+            raise ValueError(
+                "single-asset data was supplied but signals is a "
+                "dict[str, Series]. Pick one symbol's series or pass "
+                "the multi-asset data_dict."
+            )
+        raise TypeError(
+            f"signals must be pd.Series, pd.DataFrame, or "
+            f"dict[str, pd.Series]; got {type(signals).__name__}"
+        )
+    # ---- multi-asset branch ----
+    if isinstance(signals, pd.DataFrame):
+        return wide_to_signal_dict(signals, data)
+    if isinstance(signals, dict):
+        out: dict[str, pd.Series] = {}
+        for sym, df in data.items():
+            if sym in signals:
+                out[sym] = signals[sym].reindex(df.index)
+            else:
+                out[sym] = pd.Series(np.nan, index=df.index, dtype=float)
+        return out
+    if isinstance(signals, pd.Series):
+        if not broadcast:
+            raise ValueError(
+                "multi-asset data was supplied but signals is a "
+                "single pd.Series. To broadcast the same signal "
+                "across all symbols (e.g. a market-wide regime "
+                "indicator), pass broadcast=True; otherwise supply a "
+                "wide DataFrame or dict[str, Series]."
+            )
+        return {
+            sym: signals.reindex(df.index).copy()
+            for sym, df in data.items()
+        }
+    raise TypeError(
+        f"signals must be pd.Series, pd.DataFrame, or "
+        f"dict[str, pd.Series]; got {type(signals).__name__}"
+    )
+
+
 __all__ = [
     "transitions_only",
     "dict_to_signal_wide",
     "wide_to_signal_dict",
     "validate_signal_series",
     "validate_signal_wide",
+    "prepare_signals_for_engine",
 ]
