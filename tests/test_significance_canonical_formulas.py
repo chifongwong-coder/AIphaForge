@@ -32,6 +32,102 @@ from aiphaforge.significance import (
 # ---------------------------------------------------------------------------
 
 
+class TestPhipsonSmythEndToEnd:
+    """v2.4 Commit O — closes the v2.2.2 G gap.
+
+    The original v2.2.2 G TestPhipsonSmythCorrection reproduces
+    `(k+1)/(B+1)` arithmetic inline but does NOT invoke
+    `permutation_test`. These tests run permutation_test end-to-end
+    with a deterministic seed, count k from the returned null
+    distribution, and assert p_value == (k+1)/(B+1) exactly.
+    """
+
+    def _ohlcv(self, periods: int = 60, seed: int = 0):
+        import numpy as np
+        import pandas as pd
+        rng = np.random.default_rng(seed)
+        closes = 100.0 * np.exp(np.cumsum(rng.normal(0.0, 0.005, periods)))
+        return pd.DataFrame(
+            {
+                "open": closes, "high": closes * 1.01,
+                "low": closes * 0.99, "close": closes,
+                "volume": [1e6] * periods,
+            },
+            index=pd.bdate_range("2024-01-01", periods=periods),
+        )
+
+    def test_permutation_test_p_value_matches_phipson_smyth_form(self):
+        # End-to-end: run permutation_test on a real signal, then
+        # recompute (k+1)/(B+1) from the returned null distribution
+        # and assert exact match. This is what v2.2.2 G omitted.
+        import numpy as np
+        import pandas as pd
+
+        from aiphaforge.fees import ZeroFeeModel
+        from aiphaforge.significance import permutation_test
+
+        data = self._ohlcv(periods=80, seed=7)
+        # Hand-craft a signal: long the first half, short the second.
+        signals = pd.Series(np.nan, index=data.index, dtype=float)
+        signals.iloc[5] = 1.0
+        signals.iloc[40] = -1.0
+        signals.iloc[70] = 0.0
+
+        result = permutation_test(
+            data, signals=signals,
+            metric="sharpe_ratio",
+            n_permutations=99,  # small for test speed
+            random_state=2024,
+            zero_cost=True,
+            fee_model=ZeroFeeModel(),
+        )
+
+        # higher_is_better=True for sharpe_ratio (default for that string).
+        # k = number of null samples >= observed.
+        valid = np.array([
+            v for v in result.null_distribution if not np.isnan(v)
+        ])
+        k = int((valid >= result.observed).sum())
+        b = len(valid)
+        expected_p = (k + 1) / (b + 1)
+        assert result.p_value == pytest.approx(expected_p, abs=1e-12)
+
+    def test_permutation_test_p_value_lower_bound_one_over_b_plus_one(self):
+        # The Phipson-Smyth +1 correction guarantees p_value >=
+        # 1/(B+1) — never zero. Verify with a strategy that has
+        # extreme alpha (every permutation worse than observed).
+        import numpy as np
+        import pandas as pd
+
+        from aiphaforge.fees import ZeroFeeModel
+        from aiphaforge.significance import permutation_test
+
+        # Build a strongly-trending series + a signal that perfectly
+        # rides the trend.
+        idx = pd.bdate_range("2024-01-01", periods=80)
+        trend = pd.Series(np.linspace(100, 200, 80), index=idx)
+        data = pd.DataFrame(
+            {
+                "open": trend, "high": trend * 1.001, "low": trend * 0.999,
+                "close": trend, "volume": [1e6] * 80,
+            },
+            index=idx,
+        )
+        signals = pd.Series(np.nan, index=idx, dtype=float)
+        signals.iloc[5] = 1.0
+        result = permutation_test(
+            data, signals=signals,
+            metric="sharpe_ratio",
+            n_permutations=49,
+            random_state=2024,
+            zero_cost=True,
+            fee_model=ZeroFeeModel(),
+        )
+        b = int(result.n_valid)
+        # p_value is bounded below by 1/(B+1).
+        assert result.p_value >= 1.0 / (b + 1) - 1e-12
+
+
 class TestPhipsonSmythCorrection:
     """Phipson & Smyth 2010, "Permutation P-values Should Never Be Zero".
 

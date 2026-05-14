@@ -22,8 +22,9 @@ in v2.4.
 """
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Mapping, Protocol
+from typing import Mapping, Protocol, Union
 
 import pandas as pd
 
@@ -110,6 +111,118 @@ class FactorSet:
         """
         return cls(values={}, specs={})
 
+    def to_json(self) -> str:
+        """Serialise to JSON via pandas ``orient='split'``.
+
+        v2.4 Commit P — sanctioned cross-version persistence path
+        (R10). Pickle is unstable across minor versions because
+        FactorSpec / FactorSet are frozen dataclasses; field
+        additions break pickled instances. JSON via this helper
+        survives v2.x → v3.0.
+
+        Schema (version 1):
+
+        ::
+
+            {
+              "version": "1",
+              "values": { factor_name: <pandas split dict> },
+              "specs":  { factor_name: <FactorSpec field dict> }
+            }
+
+        ``orient="split"`` preserves DatetimeIndex dtype + column
+        dtype + values dtype across the round-trip.
+        """
+        import json
+        from dataclasses import asdict
+        values_payload: dict[str, dict] = {}
+        for name, df in self.values.items():
+            # Convert the DataFrame to a JSON-friendly dict via
+            # split orient. Index is serialised to ISO timestamps
+            # by default for DatetimeIndex.
+            values_payload[name] = json.loads(df.to_json(orient="split"))
+        specs_payload: dict[str, dict] = {}
+        for name, spec in self.specs.items():
+            d = asdict(spec)
+            # tuples → lists in JSON; preserve the field shape.
+            d["required_columns"] = list(d.get("required_columns", ()))
+            d["tags"] = list(d.get("tags", ()))
+            specs_payload[name] = d
+        return json.dumps({
+            "version": "1",
+            "values": values_payload,
+            "specs": specs_payload,
+        })
+
+    @classmethod
+    def from_json(cls, payload: str) -> "FactorSet":
+        """Deserialise from :meth:`to_json` output.
+
+        Reconstructs frozen ``FactorSpec`` instances via keyword
+        expansion. Tuples (``required_columns``, ``tags``) are
+        re-wrapped from JSON lists.
+        """
+        import json
+        from io import StringIO
+        obj = json.loads(payload)
+        version = obj.get("version", "1")
+        if version != "1":
+            raise ValueError(
+                f"unsupported FactorSet JSON schema version: "
+                f"{version!r}. Only version '1' is supported in v2.4."
+            )
+        values: dict[str, pd.DataFrame] = {}
+        for name, split_dict in obj.get("values", {}).items():
+            df = pd.read_json(
+                StringIO(json.dumps(split_dict)), orient="split",
+            )
+            df.index = pd.to_datetime(df.index)
+            # Factor canonical layout is float64; cast to preserve
+            # dtype across the round-trip (read_json infers int64
+            # when all values are whole numbers).
+            df = df.astype(float)
+            values[name] = df
+        specs: dict[str, FactorSpec] = {}
+        for name, d in obj.get("specs", {}).items():
+            d = dict(d)
+            d["required_columns"] = tuple(d.get("required_columns", ()))
+            d["tags"] = tuple(d.get("tags", ()))
+            specs[name] = FactorSpec(**d)
+        return cls(values=values, specs=specs)
+
+
+class BaseFactor(ABC):
+    """Abstract base class for compute-side factors (v2.4).
+
+    Subclasses implement :meth:`compute` returning a wide
+    ``pd.DataFrame[index=datetime, columns=symbol]``. Both
+    single-asset and multi-asset inputs are accepted; the column
+    layout is uniform per master plan §2.4.
+
+    Single-vs-multi dispatch (pinned in v2.4 Commit D):
+      - If ``data`` is ``pd.DataFrame``: single-asset; output is a
+        one-column DataFrame whose column name is ``self.name``
+        (the factor's own parametrised identity).
+      - If ``data`` is ``Mapping[str, pd.DataFrame]``: multi-asset;
+        output columns mirror the input keys preserving the
+        mapping's iteration order.
+
+    Subclasses MUST set ``self.name`` (typically encoding the
+    parameter values, e.g. ``"rsi_14"``, ``"momentum_20"``) and
+    SHOULD set ``self.spec`` to a :class:`FactorSpec` describing
+    the factor's metadata.
+    """
+
+    name: str = "base_factor"
+    spec: "FactorSpec | None" = None
+
+    @abstractmethod
+    def compute(
+        self,
+        data: Union[pd.DataFrame, Mapping[str, pd.DataFrame]],
+    ) -> pd.DataFrame:
+        """Return canonical wide ``DataFrame[index=datetime, columns=symbol]``."""
+
 
 class FactorProvider(Protocol):
     """OPTIONAL Protocol for factor-aware objects.
@@ -188,6 +301,7 @@ __all__ = [
     "FactorSpec",
     "FactorSet",
     "FactorProvider",
+    "BaseFactor",
     "dict_to_factor_wide",
     "validate_factor_wide",
 ]

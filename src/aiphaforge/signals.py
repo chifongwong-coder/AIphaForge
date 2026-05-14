@@ -22,7 +22,9 @@ Signal contract (from master plan v1.0 §0.3):
 """
 from __future__ import annotations
 
-from typing import Iterable, Literal, Mapping
+from dataclasses import dataclass, field
+from types import MappingProxyType
+from typing import Any, Iterable, Literal, Mapping, Union
 
 import numpy as np
 import pandas as pd
@@ -114,6 +116,8 @@ def dict_to_signal_wide(
 def wide_to_signal_dict(
     signal_wide: pd.DataFrame,
     data_dict: Mapping[str, pd.DataFrame] | None = None,
+    *,
+    warn_on_inf: bool = False,
 ) -> dict[str, pd.Series]:
     """Split wide signal DataFrame into per-symbol Series.
 
@@ -129,6 +133,14 @@ def wide_to_signal_dict(
         ``signal_wide`` but absent from ``data_dict`` are dropped
         with no warning (the caller is presumably routing only the
         relevant subset to the engine).
+    warn_on_inf
+        v2.4 opt-in: when ``True``, emit a ``UserWarning`` listing
+        the per-column count of ±Inf values BEFORE coercing them
+        to NaN. Default ``False`` preserves v2.3 silent-coercion
+        behaviour. ±Inf in a signal column almost always indicates
+        an upstream computation bug (e.g. division by zero in a
+        z-score factor); the opt-in warning surfaces it without
+        breaking existing callers.
 
     Returns
     -------
@@ -143,6 +155,22 @@ def wide_to_signal_dict(
     behavior for infinite values and engine code uses NaN as the
     "hold" sentinel.
     """
+    if warn_on_inf:
+        import warnings as _warnings
+        inf_mask = np.isinf(signal_wide.to_numpy(dtype=float))
+        if inf_mask.any():
+            per_col = (
+                np.isinf(signal_wide.astype(float)).sum().to_dict()
+            )
+            offenders = {k: int(v) for k, v in per_col.items() if v}
+            _warnings.warn(
+                f"wide_to_signal_dict: ±Inf values detected in "
+                f"signal_wide and silently coerced to NaN per the "
+                f"signal contract. Per-column counts: {offenders}. "
+                f"This usually indicates an upstream computation bug.",
+                UserWarning,
+                stacklevel=2,
+            )
     cleaned = signal_wide.replace([np.inf, -np.inf], np.nan)
     if data_dict is None:
         return {sym: cleaned[sym].copy() for sym in cleaned.columns}
@@ -250,6 +278,92 @@ def validate_signal_wide(signal_wide: pd.DataFrame) -> None:
             f"signal_wide columns must be numeric; non-numeric: "
             f"{non_numeric_cols}"
         )
+
+
+# ---------------------------------------------------------------------------
+# v2.4 Commit A: SignalSpec / SignalFrame typed wrappers
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SignalSpec:
+    """Typed metadata for the signal contract.
+
+    Wraps the canonical NaN/0/±1 contract plus optional per-pipeline
+    semantics (target-weight kind, transition-only behaviour, signal
+    shift) so factor → rule → signal pipelines can carry intent
+    through the stack without resorting to ad-hoc conventions.
+
+    The defaults match v2.3's de facto contract — direction signals,
+    NaN=hold, 0=flat, ±1=direction, transitions-only output, no
+    additional shift (engine handles its own positioning lag).
+
+    Pickle stability:
+        SignalSpec is ``frozen=True``. Adding or renaming fields in
+        a future minor version (v2.5+) WILL BREAK pickled instances.
+        For cross-version persistence, serialize the contained
+        values via JSON (using a manual converter) rather than
+        pickle. The v2.x dataclass shape is NOT a stable
+        persistence schema.
+    """
+
+    kind: Literal["direction", "target_weight", "score"] = "direction"
+    hold_value: float = float("nan")
+    flat_value: float = 0.0
+    long_value: float = 1.0
+    short_value: float = -1.0
+    transition_only: bool = True
+    signal_shift: int = 0   # default 0; engine handles its own lag
+
+
+@dataclass(frozen=True)
+class SignalFrame:
+    """Typed wrapper around the raw signal payload.
+
+    Carries the signal values + a SignalSpec describing the contract
+    + free-form metadata (source attribution, generation timestamp,
+    upstream model hash, etc.).
+
+    Pickle stability:
+        Same caveat as :class:`SignalSpec`. Persist via JSON for
+        cross-version stability.
+    """
+
+    values: Union[pd.Series, Mapping[str, pd.Series], pd.DataFrame]
+    spec: SignalSpec
+    source: str = "unknown"
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self):
+        # Wrap metadata in MappingProxyType so the read-only Mapping
+        # contract holds. Mirrors KnowledgeCheckReport's pattern in
+        # probes/orchestrator.py — `frozen=True` blocks attribute
+        # rebinding but the dict-default would otherwise still be
+        # mutable.
+        if not isinstance(self.metadata, MappingProxyType):
+            object.__setattr__(
+                self, "metadata",
+                MappingProxyType(dict(self.metadata)),
+            )
+
+    def to_engine_input(
+        self,
+        data: Union[pd.DataFrame, Mapping[str, pd.DataFrame]],
+    ) -> Union[pd.Series, dict[str, pd.Series]]:
+        """Downgrade to engine-compatible signal.
+
+        Calls :func:`prepare_signals_for_engine` internally to
+        resolve the wide-vs-dict-vs-series shape against the engine's
+        data shape. Takes ``data`` at call time (NOT at SignalFrame
+        construction) so a single SignalFrame can be reused across
+        multiple engine runs / data shapes.
+
+        The ``broadcast=False`` default is preserved — callers wanting
+        to broadcast a single Series across a multi-asset universe
+        should call :func:`prepare_signals_for_engine` directly with
+        ``broadcast=True``.
+        """
+        return prepare_signals_for_engine(self.values, data)
 
 
 def prepare_signals_for_engine(
@@ -579,4 +693,7 @@ __all__ = [
     "validate_signal_wide",
     "prepare_signals_for_engine",
     "target_weight_wide_to_schedule",
+    # v2.4 Commit A
+    "SignalSpec",
+    "SignalFrame",
 ]

@@ -99,6 +99,30 @@ def _compare_prefix(
             )
     if not full_prefix.index.equals(trunc_prefix.index):
         return f"index mismatch at t={t!r}"
+    # v2.4 Commit C: dtype precheck. The diagnostic is numeric-only;
+    # categorical / string-valued factors raise a confusing
+    # "could not convert string to float" deep inside numpy. Catch
+    # them here with a typed message naming the offending column.
+    if isinstance(full_prefix, pd.DataFrame):
+        non_numeric = [
+            c for c in full_prefix.columns
+            if not pd.api.types.is_numeric_dtype(full_prefix[c])
+        ]
+        if non_numeric:
+            return (
+                f"non-numeric column dtype detected at t={t!r}: "
+                f"{[(c, str(full_prefix[c].dtype)) for c in non_numeric]}. "
+                f"assert_*_no_lookahead is numeric-only — convert "
+                f"categorical / string factors to integer codes "
+                f"before checking, or write a custom check."
+            )
+    elif isinstance(full_prefix, pd.Series):
+        if not pd.api.types.is_numeric_dtype(full_prefix):
+            return (
+                f"non-numeric series dtype detected at t={t!r}: "
+                f"{full_prefix.dtype}. assert_*_no_lookahead is "
+                f"numeric-only."
+            )
     arr_full = full_prefix.to_numpy(dtype=float)
     arr_trunc = trunc_prefix.to_numpy(dtype=float)
     # Treat NaN-vs-finite asymmetry as divergence (catches shift(-N)
