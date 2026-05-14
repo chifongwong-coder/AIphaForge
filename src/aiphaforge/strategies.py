@@ -19,6 +19,8 @@ from typing import Any, Dict, List, Optional, Union
 import numpy as np
 import pandas as pd
 
+from aiphaforge.signals import transitions_only as _public_transitions_only
+
 from .indicators import (
     ADX,
     BBANDS,
@@ -35,18 +37,22 @@ from .indicators import (
 
 
 def _transitions_only(raw: pd.Series) -> pd.Series:
-    """Convert a raw position series (1/-1/0/NaN on every bar) to
-    transition-only signals (emit only when direction changes, NaN=hold).
+    """v2.3 Commit C: thin alias for ``signals.transitions_only``.
 
-    Supports 0 (flatten) as a valid signal value.
-    This prevents micro-rebalancing: the engine only sees a signal at
-    the crossover point, not on every bar where the condition holds.
+    Kept for backward compatibility with any external caller that
+    imported the private name from ``aiphaforge.strategies``.
+    Removal scheduled: v3.0.
+
+    Semantic preservation:
+        NaN = hold
+        0   = explicit flatten (transition)
+        1   = long
+        -1  = short
+
+    Internally delegates to :func:`aiphaforge.signals.transitions_only`
+    so any future fix lands in one place.
     """
-    filled = raw.ffill()
-    changed = filled != filled.shift(1)
-    signals = pd.Series(np.nan, index=raw.index, dtype=float)
-    signals[changed] = filled[changed]
-    return signals
+    return _public_transitions_only(raw)
 
 
 class BaseStrategy:
