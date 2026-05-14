@@ -191,9 +191,15 @@ def extract_strategy_factors(strategy, data: DataLike) -> FactorSet:
     Composite strategies (StrategyNode subclasses: WeightedBlend,
     SelectBest, PriorityCascade, VoteEnsemble, ConditionalSwitch)
     explicitly return ``FactorSet.empty()`` — the adapter does NOT
-    recurse into children. Composing factor-aware strategies
-    requires v2.5's StrategyNode rewrite where the composite
-    framework supports factor pass-through.
+    recurse into children. v2.5's 3-mode dispatch (auto /
+    generate_signals / legacy_compute) does NOT change this contract:
+    the extractor's output is independent of the composite's
+    ``mode`` parameter. Naive recursion would silently merge factors
+    from conflicting families (e.g. ``ma_spread`` from MACrossover
+    and ``ma_spread`` from a different MA-based strategy collide on
+    the name). The right v3.0 design is opt-in recursion via a
+    separate function (e.g. ``extract_composite_factors`` with an
+    explicit naming strategy) — not yet available.
 
     Unknown / signal-only types return ``FactorSet.empty()`` per
     master plan §0.4 (signal-only strategies are first-class).
