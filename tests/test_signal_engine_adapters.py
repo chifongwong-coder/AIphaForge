@@ -51,6 +51,19 @@ class TestPrepareSignalsRouting:
         assert list(out["A"].values[:3]) == [1.0, 0.0, -1.0]
         assert list(out["B"].values[:3]) == [0.0, 1.0, 0.0]
 
+    def test_single_data_with_signal_dict_raises(self):
+        # Symmetric to test_single_multi_column_df_raises — passing a
+        # multi-symbol dict with single-asset data is ambiguous and
+        # must raise. Caught by the routing's "single data + dict"
+        # branch at signals.py:345-350.
+        data = _ohlcv()
+        sigs = {
+            "A": pd.Series([1.0, 0.0, -1.0, np.nan, 1.0], index=data.index),
+            "B": pd.Series([0.0, 1.0, 0.0, -1.0, 0.0], index=data.index),
+        }
+        with pytest.raises(ValueError, match="dict"):
+            prepare_signals_for_engine(sigs, data)
+
     def test_multi_series_raises_without_broadcast(self):
         data_dict = {"A": _ohlcv(), "B": _ohlcv()}
         sig = pd.Series([1.0, 0.0, -1.0, np.nan, 1.0], index=data_dict["A"].index)

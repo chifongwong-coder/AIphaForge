@@ -205,6 +205,24 @@ class TestUpdateParamsScope:
         with pytest.raises(ValueError, match="update_signals"):
             strategy.update_params(long_threshold=0.7)
 
+    def test_update_params_rule_none_clears_rule(self):
+        # Document the clearing semantic: update_params(rule=None) is
+        # legal and disables future update_scores() calls. Subsequent
+        # update_scores raises with the standard "requires a rule"
+        # message — verifying the cleared state is detectable.
+        sig = pd.Series([1.0])
+        rule = ThresholdScoreRule(long_threshold=0.7)
+        strategy = DirectSignalStrategy(signals=sig)
+        strategy.update_params(rule=rule)
+        assert strategy.rule is rule
+        # Now clear it.
+        strategy.update_params(rule=None)
+        assert strategy.rule is None
+        # update_scores must now raise.
+        scores = pd.Series([0.85])
+        with pytest.raises(ValueError, match="requires a rule"):
+            strategy.update_scores(scores)
+
     def test_name_and_rule_allowed(self):
         sig = pd.Series([1.0])
         strategy = DirectSignalStrategy(signals=sig)
