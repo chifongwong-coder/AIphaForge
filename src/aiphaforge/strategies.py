@@ -787,6 +787,28 @@ def _resolve_child_signals(
     )
 
 
+def _validate_children_kind(
+    composite_cls: type, children: List[BaseStrategy],
+) -> None:
+    """Reject composites containing children with non-direction SignalSpec.
+
+    v2.5 supports direction-only composition. Legacy children without a
+    ``spec`` attribute are trusted as direction (preserves v2.4
+    behavior). Mixed-kind composition is a v3.0 design point.
+    """
+    for child in children:
+        spec = getattr(child, "spec", None)
+        if spec is None:
+            continue
+        kind = getattr(spec, "kind", "direction")
+        if kind != "direction":
+            raise ValueError(
+                f"{composite_cls.__name__} requires direction-kind "
+                f"children; {type(child).__name__} has spec.kind={kind!r}. "
+                "Mixed-kind composition is a v3.0 feature."
+            )
+
+
 class StrategyNode(BaseStrategy):
     """Base for composite strategy nodes.
 
@@ -866,26 +888,89 @@ class WeightedBlend(StrategyNode):
         self.weights = weights or [1.0 / len(children)] * len(children)
         self.signal_precision = signal_precision
 
-    def _compute(self, df: pd.DataFrame) -> pd.Series:
-        signals = pd.concat(
-            [child._compute(df) for child in self.children], axis=1)
+    def generate_signals(self, data):
+        _validate_children_kind(WeightedBlend, self.children)
+        if isinstance(data, dict):
+            return self._generate_multi(data)
+        return self._generate_single(data)
+
+    def _generate_single(self, df: pd.DataFrame) -> pd.Series:
+        per_child = [
+            _resolve_child_signals(WeightedBlend, c, df, mode=self.mode)
+            for c in self.children
+        ]
+        return self._weighted_blend(per_child, df.index)
+
+    def _generate_multi(
+        self, data_dict: Dict[str, pd.DataFrame],
+    ) -> Dict[str, pd.Series]:
+        per_child = [
+            _resolve_child_signals(WeightedBlend, c, data_dict, mode=self.mode)
+            for c in self.children
+        ]
+        expected_keys = set(data_dict.keys())
+        for i, child_out in enumerate(per_child):
+            if not isinstance(child_out, dict):
+                raise ValueError(
+                    f"WeightedBlend multi-asset mode requires children to "
+                    f"return dict[str, Series]; child[{i}] "
+                    f"{type(self.children[i]).__name__} returned "
+                    f"{type(child_out).__name__}"
+                )
+            got_keys = set(child_out.keys())
+            if got_keys != expected_keys:
+                missing = expected_keys - got_keys
+                extra = got_keys - expected_keys
+                raise ValueError(
+                    f"WeightedBlend child[{i}] "
+                    f"{type(self.children[i]).__name__} returned mismatched "
+                    f"symbols: missing={sorted(missing)}, "
+                    f"extra={sorted(extra)}. Pre-pad child output via "
+                    "reindex(union) before composing."
+                )
+        return {
+            sym: self._weighted_blend(
+                [child_out[sym] for child_out in per_child],
+                data_dict[sym].index,
+            )
+            for sym in data_dict
+        }
+
+    def _weighted_blend(
+        self, per_child: List[pd.Series], index: pd.Index,
+    ) -> pd.Series:
+        signals = pd.concat(per_child, axis=1)
         signals.columns = range(len(self.children))
         w = pd.Series(self.weights, index=signals.columns)
 
-        # Re-normalize weights per bar: exclude NaN children
+        # Re-normalize weights per bar: exclude NaN children.
         valid = signals.notna()
         w_valid = valid.mul(w, axis=1)
         w_sum = w_valid.sum(axis=1).replace(0, np.nan)
         w_norm = w_valid.div(w_sum, axis=0)
 
-        # Weighted sum with re-normalized weights
+        # Weighted sum with re-normalized weights.
         result = (signals.fillna(0) * w_norm.fillna(0)).sum(axis=1)
         all_nan = valid.sum(axis=1) == 0
         result[all_nan] = np.nan
 
-        # Discretize + transition-only to prevent micro-rebalancing
+        # Discretize + transition-only to prevent micro-rebalancing.
         result = result.round(self.signal_precision)
-        return _transitions_only(result)
+        result = _transitions_only(result)
+        result = result.reindex(index)
+        return result
+
+    def _compute(self, df: pd.DataFrame) -> pd.Series:
+        # Backward-compat hook: external callers that bypass
+        # generate_signals (rare) get the legacy_compute semantics
+        # without going through kind validation.
+        per_child = [
+            _resolve_child_signals(
+                WeightedBlend, c, df, mode="legacy_compute",
+            )
+            for c in self.children
+        ]
+        return self._weighted_blend(per_child, df.index)
 
 
 class SelectBest(StrategyNode):
