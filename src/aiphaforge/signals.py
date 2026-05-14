@@ -22,7 +22,7 @@ Signal contract (from master plan v1.0 §0.3):
 """
 from __future__ import annotations
 
-from typing import Mapping
+from typing import Iterable, Literal, Mapping
 
 import numpy as np
 import pandas as pd
@@ -382,6 +382,195 @@ def prepare_signals_for_engine(
     )
 
 
+def target_weight_wide_to_schedule(
+    weights: pd.DataFrame,
+    data_dict: Mapping[str, pd.DataFrame],
+    *,
+    rebalance_dates: Iterable[pd.Timestamp] | None = None,
+    snap: Literal["exact", "next", "previous"] = "exact",
+    universe_alignment: Literal["union", "intersection"] = "union",
+    on_collision: Literal["warn", "raise", "first", "last"] = "warn",
+) -> dict:
+    """Convert a wide target-weight DataFrame to engine schedule format.
+
+    The output is suitable for ``engine.set_target_weights(schedule)``,
+    which accepts both ``str`` and ``pd.Timestamp`` keys via the
+    coercion at ``engine.py:725``. This adapter returns
+    ``pd.Timestamp`` keys for type safety.
+
+    Parameters
+    ----------
+    weights
+        Wide-layout target-weight DataFrame:
+        ``index=datetime, columns=symbol``.
+    data_dict
+        Per-symbol OHLCV mapping. Used to determine the
+        valid-trading-day set per symbol (see ``universe_alignment``).
+    rebalance_dates
+        Specific dates to fire rebalances on. If None, every row in
+        ``weights`` is treated as a candidate rebalance date.
+    snap
+        - ``"exact"``: candidate rebalance dates that are not present
+          in the per-symbol valid-date set are silently dropped (with
+          a count warning).
+        - ``"next"``: snap to the next valid trading day.
+        - ``"previous"``: snap to the previous valid trading day.
+    universe_alignment
+        - ``"union"`` (DEFAULT): per-symbol valid-date sets are
+          independent. A staggered listing date does NOT invalidate
+          rebalances for already-listed symbols. Missing-symbol-at-
+          date receives weight 0.
+        - ``"intersection"``: a rebalance date is valid only if ALL
+          symbols have that date in their data index. Use when the
+          strategy requires simultaneous rebalances of every name.
+    on_collision
+        Policy when ``snap="next"`` / ``"previous"`` pushes multiple
+        requested rebalance dates onto the same target date:
+
+        - ``"warn"`` (DEFAULT): last-write-wins, emit ``UserWarning``.
+        - ``"raise"``: ``ValueError``.
+        - ``"first"``: keep the first-requested write.
+        - ``"last"``: silently last-write-wins (no warning).
+
+    Returns
+    -------
+    dict[pd.Timestamp, dict[str, float]]
+        Engine-compatible target-weight schedule.
+
+    Notes
+    -----
+    Engine compatibility:
+        ``BacktestEngine.set_target_weights(schedule)`` (defined at
+        ``engine.py:363``) accepts both ``dict[str, ...]`` (date-string
+        keys) and ``dict[pd.Timestamp, ...]``. Coercion via
+        ``pd.Timestamp(date_str)`` happens at ``engine.py:725`` for
+        every schedule key. v2.3 returns Timestamp keys; the engine
+        side is unchanged.
+    """
+    import warnings
+
+    if not isinstance(weights, pd.DataFrame):
+        raise TypeError(
+            f"weights must be pd.DataFrame, got {type(weights).__name__}"
+        )
+    if rebalance_dates is None:
+        candidates = list(weights.index)
+    else:
+        candidates = [pd.Timestamp(d) for d in rebalance_dates]
+
+    # Per-symbol valid-date sets.
+    per_symbol_valid: dict[str, pd.DatetimeIndex] = {
+        sym: pd.DatetimeIndex(df.index) for sym, df in data_dict.items()
+    }
+    if universe_alignment == "intersection":
+        if per_symbol_valid:
+            common = per_symbol_valid[next(iter(per_symbol_valid))]
+            for v in per_symbol_valid.values():
+                common = common.intersection(v)
+            universe_valid = common
+        else:
+            universe_valid = pd.DatetimeIndex([])
+    elif universe_alignment == "union":
+        if per_symbol_valid:
+            universe_valid = per_symbol_valid[next(iter(per_symbol_valid))]
+            for v in per_symbol_valid.values():
+                universe_valid = universe_valid.union(v)
+        else:
+            universe_valid = pd.DatetimeIndex([])
+    else:
+        raise ValueError(
+            f"universe_alignment must be 'union' or 'intersection', "
+            f"got {universe_alignment!r}"
+        )
+
+    def _snap_to(ts: pd.Timestamp) -> pd.Timestamp | None:
+        if ts in universe_valid:
+            return ts
+        if snap == "exact":
+            return None
+        if snap == "next":
+            after = universe_valid[universe_valid > ts]
+            return after[0] if len(after) > 0 else None
+        if snap == "previous":
+            before = universe_valid[universe_valid < ts]
+            return before[-1] if len(before) > 0 else None
+        raise ValueError(
+            f"snap must be 'exact', 'next', or 'previous', got {snap!r}"
+        )
+
+    snapped: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+    n_dropped = 0
+    for ts in candidates:
+        target = _snap_to(ts)
+        if target is None:
+            n_dropped += 1
+            continue
+        snapped.append((ts, target))
+
+    if snap == "exact" and n_dropped > 0:
+        warnings.warn(
+            f"target_weight_wide_to_schedule dropped {n_dropped} "
+            f"rebalance date(s) not present in the universe valid "
+            f"set (snap='exact'). Use snap='next' or 'previous' "
+            f"to absorb non-aligned dates.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    # Detect collisions: target → list[requested]
+    by_target: dict[pd.Timestamp, list[pd.Timestamp]] = {}
+    for requested, target in snapped:
+        by_target.setdefault(target, []).append(requested)
+    collisions = {
+        t: reqs for t, reqs in by_target.items() if len(reqs) > 1
+    }
+    if collisions:
+        if on_collision == "raise":
+            sample = next(iter(collisions.items()))
+            raise ValueError(
+                f"snap='{snap}' produced {len(collisions)} collision(s) "
+                f"where multiple requested rebalance dates landed on the "
+                f"same target. Sample: target={sample[0]}, requested="
+                f"{sample[1][:3]}{'...' if len(sample[1]) > 3 else ''}. "
+                f"Use on_collision='first' / 'last' / 'warn' to absorb."
+            )
+        if on_collision == "warn":
+            warnings.warn(
+                f"target_weight_wide_to_schedule snap='{snap}' produced "
+                f"{len(collisions)} collision(s); using last-write-wins. "
+                f"Pass on_collision='raise'/'first'/'last' to choose "
+                f"a different policy.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+    out: dict[pd.Timestamp, dict[str, float]] = {}
+    for requested, target in snapped:
+        if target in out:
+            if on_collision == "first":
+                continue  # keep the existing (earlier) write
+            # "last" / "warn" → overwrite (last-write-wins)
+        if requested in weights.index:
+            row = weights.loc[requested]
+        else:
+            # Snapping forward/backward but the *requested* row isn't
+            # in weights (only happens if rebalance_dates supplied
+            # values not in the weights frame). Fall back to all-zero.
+            row = pd.Series(0.0, index=weights.columns)
+        symbol_weights: dict[str, float] = {}
+        for sym in data_dict:
+            if sym in weights.columns:
+                val = row[sym]
+                if pd.isna(val):
+                    symbol_weights[sym] = 0.0
+                else:
+                    symbol_weights[sym] = float(val)
+            else:
+                symbol_weights[sym] = 0.0
+        out[target] = symbol_weights
+    return out
+
+
 __all__ = [
     "transitions_only",
     "dict_to_signal_wide",
@@ -389,4 +578,5 @@ __all__ = [
     "validate_signal_series",
     "validate_signal_wide",
     "prepare_signals_for_engine",
+    "target_weight_wide_to_schedule",
 ]
