@@ -14,7 +14,8 @@ Or generate signals for custom engine configuration::
 Supports single-asset (pd.DataFrame) and multi-asset (Dict[str, pd.DataFrame]).
 """
 
-from typing import Any, Dict, List, Optional, Union
+import logging
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -34,6 +35,8 @@ from .indicators import (
     SUPERTREND,
     VWAP,
 )
+
+_LOG = logging.getLogger(__name__)
 
 
 def _transitions_only(raw: pd.Series) -> pd.Series:
@@ -709,6 +712,158 @@ class MultiIndicatorStrategy(BaseStrategy):
 # Strategy Composition Tree (v1.4)
 # ---------------------------------------------------------------------------
 
+# v2.5: module-level state for the once-per-pair fallback warning policy.
+# Each (composite_cls, child_cls) pair logs a warning the first time the
+# auto-mode fallback fires; subsequent fallbacks for the same pair log
+# at debug level only — including subsequent fallbacks raising a
+# DIFFERENT exception type from the same pair. Users who need to see
+# every fallback's exception type should set the logger level to DEBUG:
+#
+#     logging.getLogger("aiphaforge.strategies").setLevel(logging.DEBUG)
+#
+# Cleared automatically by an autouse pytest fixture in each new v2.5
+# test file (see plan §A test isolation requirement). NOT thread-safe;
+# pytest-xdist users must serialize tests touching this set.
+_FALLBACK_WARNED: Set[Tuple[type, type]] = set()
+
+_VALID_MODES = ("auto", "generate_signals", "legacy_compute")
+
+
+def _resolve_child_signals(
+    composite_cls: type,
+    child: BaseStrategy,
+    data: Union[pd.DataFrame, Dict[str, pd.DataFrame]],
+    *,
+    mode: Literal["auto", "generate_signals", "legacy_compute"],
+) -> Union[pd.Series, Dict[str, pd.Series]]:
+    """Dispatch a single child strategy to its signal-generation method.
+
+    Single source of truth for the v2.5 3-mode dispatch so the 5 composite
+    classes don't reimplement the auto/fallback chain.
+
+    auto:
+        Try ``child.generate_signals(data)``. On any ``Exception``, fall
+        back to single-asset ``child._compute(data)`` IF data is a single
+        DataFrame. Multi-asset dict + auto-fallback raises ``ValueError``
+        (legacy ``_compute`` can't accept dicts; user must pick an
+        explicit mode). The first fallback for each
+        ``(composite_cls, child_cls)`` pair logs a ``WARNING``;
+        subsequent fallbacks for the same pair log at ``DEBUG``.
+    generate_signals:
+        Always call ``child.generate_signals(data)``. Propagate any
+        exception (no fallback).
+    legacy_compute:
+        Always call ``child._compute(df)``. Requires single DataFrame
+        input — multi-asset dict raises ``TypeError`` naming the child.
+    """
+    if mode == "generate_signals":
+        return child.generate_signals(data)
+    if mode == "legacy_compute":
+        if isinstance(data, dict):
+            raise TypeError(
+                f"legacy_compute mode requires a single DataFrame, got dict; "
+                f"child {type(child).__name__} cannot run via _compute on "
+                "multi-asset data"
+            )
+        return child._compute(data)
+    if mode == "auto":
+        try:
+            return child.generate_signals(data)
+        except Exception as exc:
+            if isinstance(data, dict):
+                raise ValueError(
+                    f"auto-mode fallback to _compute is unavailable for "
+                    f"multi-asset dict input (child {type(child).__name__} "
+                    f"raised {type(exc).__name__}: {str(exc)[:200]}). "
+                    "Use mode='legacy_compute' explicitly or fix the child."
+                ) from exc
+            pair = (composite_cls, type(child))
+            msg = (
+                f"{composite_cls.__name__} auto-mode: child "
+                f"{type(child).__name__} raised {type(exc).__name__}: "
+                f"{str(exc)[:200]} — falling back to legacy _compute"
+            )
+            if pair not in _FALLBACK_WARNED:
+                _FALLBACK_WARNED.add(pair)
+                _LOG.warning(msg)
+            else:
+                _LOG.debug(msg)
+            return child._compute(data)
+    raise ValueError(
+        f"mode={mode!r} invalid; must be one of {_VALID_MODES}"
+    )
+
+
+def _check_uniform_series_shape(
+    composite_cls: type,
+    children: List[BaseStrategy],
+    per_child: List[Any],
+) -> None:
+    """Reject mixed Series/dict children at composite entry.
+
+    Eager validation: catches shape mismatch BEFORE the per-bar merge
+    loop, so the error message names the offending child rather than
+    surfacing as a confusing TypeError mid-merge.
+    """
+    for i, out in enumerate(per_child):
+        if not isinstance(out, pd.Series):
+            raise TypeError(
+                f"{composite_cls.__name__} single-asset mode requires "
+                f"children to return pd.Series; child[{i}] "
+                f"{type(children[i]).__name__} returned "
+                f"{type(out).__name__}"
+            )
+
+
+def _check_uniform_dict_shape(
+    composite_cls: type,
+    children: List[BaseStrategy],
+    per_child: List[Any],
+    data_dict: Dict[str, pd.DataFrame],
+) -> None:
+    expected_keys = set(data_dict.keys())
+    for i, out in enumerate(per_child):
+        if not isinstance(out, dict):
+            raise TypeError(
+                f"{composite_cls.__name__} multi-asset mode requires "
+                f"children to return dict[str, Series]; child[{i}] "
+                f"{type(children[i]).__name__} returned "
+                f"{type(out).__name__}"
+            )
+        got_keys = set(out.keys())
+        if got_keys != expected_keys:
+            missing = expected_keys - got_keys
+            extra = got_keys - expected_keys
+            raise ValueError(
+                f"{composite_cls.__name__} child[{i}] "
+                f"{type(children[i]).__name__} returned mismatched "
+                f"symbols: missing={sorted(missing)}, "
+                f"extra={sorted(extra)}. Pre-pad child output via "
+                "reindex(union) before composing."
+            )
+
+
+def _validate_children_kind(
+    composite_cls: type, children: List[BaseStrategy],
+) -> None:
+    """Reject composites containing children with non-direction SignalSpec.
+
+    v2.5 supports direction-only composition. Legacy children without a
+    ``spec`` attribute are trusted as direction (preserves v2.4
+    behavior). Mixed-kind composition is a v3.0 design point.
+    """
+    for child in children:
+        spec = getattr(child, "spec", None)
+        if spec is None:
+            continue
+        kind = getattr(spec, "kind", "direction")
+        if kind != "direction":
+            raise ValueError(
+                f"{composite_cls.__name__} requires direction-kind "
+                f"children; {type(child).__name__} has spec.kind={kind!r}. "
+                "Mixed-kind composition is a v3.0 feature."
+            )
+
 
 class StrategyNode(BaseStrategy):
     """Base for composite strategy nodes.
@@ -724,8 +879,18 @@ class StrategyNode(BaseStrategy):
 
     name = "Strategy Node"
 
-    def __init__(self, children: List[BaseStrategy]):
+    def __init__(
+        self,
+        children: List[BaseStrategy],
+        *,
+        mode: Literal["auto", "generate_signals", "legacy_compute"] = "auto",
+    ):
+        if mode not in _VALID_MODES:
+            raise ValueError(
+                f"mode={mode!r} invalid; must be one of {_VALID_MODES}"
+            )
         self.children = children
+        self.mode = mode
 
     @property
     def params(self) -> Dict[str, Any]:
@@ -767,34 +932,99 @@ class WeightedBlend(StrategyNode):
 
     def __init__(self, children: List[BaseStrategy],
                  weights: Optional[List[float]] = None,
-                 signal_precision: int = 2):
-        super().__init__(children)
+                 signal_precision: int = 2,
+                 *,
+                 mode: Literal[
+                     "auto", "generate_signals", "legacy_compute",
+                 ] = "auto"):
+        super().__init__(children, mode=mode)
         if weights is not None and len(weights) != len(children):
             raise ValueError(
                 f"len(weights)={len(weights)} != len(children)={len(children)}")
         self.weights = weights or [1.0 / len(children)] * len(children)
         self.signal_precision = signal_precision
 
-    def _compute(self, df: pd.DataFrame) -> pd.Series:
-        signals = pd.concat(
-            [child._compute(df) for child in self.children], axis=1)
+    def generate_signals(self, data):
+        _validate_children_kind(WeightedBlend, self.children)
+        if isinstance(data, dict):
+            return self._generate_multi(data)
+        return self._generate_single(data)
+
+    def _generate_single(self, df: pd.DataFrame) -> pd.Series:
+        per_child = [
+            _resolve_child_signals(WeightedBlend, c, df, mode=self.mode)
+            for c in self.children
+        ]
+        _check_uniform_series_shape(WeightedBlend, self.children, per_child)
+        return self._weighted_blend(per_child, df.index)
+
+    def _generate_multi(
+        self, data_dict: Dict[str, pd.DataFrame],
+    ) -> Dict[str, pd.Series]:
+        per_child = [
+            _resolve_child_signals(WeightedBlend, c, data_dict, mode=self.mode)
+            for c in self.children
+        ]
+        expected_keys = set(data_dict.keys())
+        for i, child_out in enumerate(per_child):
+            if not isinstance(child_out, dict):
+                raise ValueError(
+                    f"WeightedBlend multi-asset mode requires children to "
+                    f"return dict[str, Series]; child[{i}] "
+                    f"{type(self.children[i]).__name__} returned "
+                    f"{type(child_out).__name__}"
+                )
+            got_keys = set(child_out.keys())
+            if got_keys != expected_keys:
+                missing = expected_keys - got_keys
+                extra = got_keys - expected_keys
+                raise ValueError(
+                    f"WeightedBlend child[{i}] "
+                    f"{type(self.children[i]).__name__} returned mismatched "
+                    f"symbols: missing={sorted(missing)}, "
+                    f"extra={sorted(extra)}. Pre-pad child output via "
+                    "reindex(union) before composing."
+                )
+        return {
+            sym: self._weighted_blend(
+                [child_out[sym] for child_out in per_child],
+                data_dict[sym].index,
+            )
+            for sym in data_dict
+        }
+
+    def _weighted_blend(
+        self, per_child: List[pd.Series], index: pd.Index,
+    ) -> pd.Series:
+        signals = pd.concat(per_child, axis=1)
         signals.columns = range(len(self.children))
         w = pd.Series(self.weights, index=signals.columns)
 
-        # Re-normalize weights per bar: exclude NaN children
+        # Re-normalize weights per bar: exclude NaN children.
         valid = signals.notna()
         w_valid = valid.mul(w, axis=1)
         w_sum = w_valid.sum(axis=1).replace(0, np.nan)
         w_norm = w_valid.div(w_sum, axis=0)
 
-        # Weighted sum with re-normalized weights
+        # Weighted sum with re-normalized weights.
         result = (signals.fillna(0) * w_norm.fillna(0)).sum(axis=1)
         all_nan = valid.sum(axis=1) == 0
         result[all_nan] = np.nan
 
-        # Discretize + transition-only to prevent micro-rebalancing
+        # Discretize + transition-only to prevent micro-rebalancing.
         result = result.round(self.signal_precision)
-        return _transitions_only(result)
+        result = _transitions_only(result)
+        result = result.reindex(index)
+        return result
+
+    def _compute(self, df: pd.DataFrame) -> pd.Series:
+        # _compute is BaseStrategy's per-symbol override point — a true
+        # private method (underscore-prefixed). External code should
+        # always call generate_signals(). For any internal caller that
+        # routes through _compute, delegate to generate_signals so the
+        # full v2.5 contract (kind validation + mode dispatch) applies
+        # uniformly. Matches plan §D as written.
+        return self.generate_signals(df)
 
 
 class SelectBest(StrategyNode):
@@ -806,21 +1036,43 @@ class SelectBest(StrategyNode):
 
     name = "Select Best"
 
-    def _compute(self, df: pd.DataFrame) -> pd.Series:
-        signals = pd.concat(
-            [child._compute(df) for child in self.children], axis=1)
+    def generate_signals(self, data):
+        _validate_children_kind(SelectBest, self.children)
+        if isinstance(data, dict):
+            per_child = [
+                _resolve_child_signals(SelectBest, c, data, mode=self.mode)
+                for c in self.children
+            ]
+            _check_uniform_dict_shape(SelectBest, self.children, per_child, data)
+            return {
+                sym: self._select_best(
+                    [child_out[sym] for child_out in per_child], data[sym].index,
+                )
+                for sym in data
+            }
+        per_child = [
+            _resolve_child_signals(SelectBest, c, data, mode=self.mode)
+            for c in self.children
+        ]
+        return self._select_best(per_child, data.index)
+
+    def _select_best(
+        self, per_child: List[pd.Series], index: pd.Index,
+    ) -> pd.Series:
+        signals = pd.concat(per_child, axis=1)
         signals.columns = range(len(self.children))
-        # Vectorized: select column with max abs value per row
         abs_signals = signals.abs()
-        # Use fillna(-1) to avoid FutureWarning on all-NaN rows;
-        # all-NaN rows get idxmax=0 but are excluded by valid check below
         best_col = abs_signals.fillna(-1).idxmax(axis=1)
         has_any = abs_signals.notna().any(axis=1)
-        result = pd.Series(np.nan, index=df.index, dtype=float)
+        result = pd.Series(np.nan, index=signals.index, dtype=float)
         for col in range(len(self.children)):
             mask = (best_col == col) & has_any
             result[mask] = signals.loc[mask, col]
-        return _transitions_only(result)
+        result = _transitions_only(result).reindex(index)
+        return result
+
+    def _compute(self, df: pd.DataFrame) -> pd.Series:
+        return self.generate_signals(df)
 
 
 class PriorityCascade(StrategyNode):
@@ -832,13 +1084,47 @@ class PriorityCascade(StrategyNode):
 
     name = "Priority Cascade"
 
-    def _compute(self, df: pd.DataFrame) -> pd.Series:
-        result = pd.Series(np.nan, index=df.index, dtype=float)
-        for child in self.children:
-            sig = child._compute(df)
+    def generate_signals(self, data):
+        _validate_children_kind(PriorityCascade, self.children)
+        if isinstance(data, dict):
+            per_child = [
+                _resolve_child_signals(
+                    PriorityCascade, c, data, mode=self.mode,
+                )
+                for c in self.children
+            ]
+            _check_uniform_dict_shape(
+                PriorityCascade, self.children, per_child, data,
+            )
+            return {
+                sym: self._cascade(
+                    [child_out[sym] for child_out in per_child], data[sym].index,
+                )
+                for sym in data
+            }
+        per_child = [
+            _resolve_child_signals(
+                PriorityCascade, c, data, mode=self.mode,
+            )
+            for c in self.children
+        ]
+        _check_uniform_series_shape(
+            PriorityCascade, self.children, per_child,
+        )
+        return self._cascade(per_child, data.index)
+
+    def _cascade(
+        self, per_child: List[pd.Series], index: pd.Index,
+    ) -> pd.Series:
+        result = pd.Series(np.nan, index=index, dtype=float)
+        for sig in per_child:
+            sig = sig.reindex(index)
             mask = result.isna() & sig.notna()
             result[mask] = sig[mask]
         return _transitions_only(result)
+
+    def _compute(self, df: pd.DataFrame) -> pd.Series:
+        return self.generate_signals(df)
 
 
 class VoteEnsemble(StrategyNode):
@@ -850,18 +1136,48 @@ class VoteEnsemble(StrategyNode):
 
     name = "Vote Ensemble"
 
-    def _compute(self, df: pd.DataFrame) -> pd.Series:
-        signals = pd.concat(
-            [child._compute(df) for child in self.children], axis=1)
+    def generate_signals(self, data):
+        _validate_children_kind(VoteEnsemble, self.children)
+        if isinstance(data, dict):
+            per_child = [
+                _resolve_child_signals(VoteEnsemble, c, data, mode=self.mode)
+                for c in self.children
+            ]
+            _check_uniform_dict_shape(
+                VoteEnsemble, self.children, per_child, data,
+            )
+            return {
+                sym: self._vote(
+                    [child_out[sym] for child_out in per_child], data[sym].index,
+                )
+                for sym in data
+            }
+        per_child = [
+            _resolve_child_signals(VoteEnsemble, c, data, mode=self.mode)
+            for c in self.children
+        ]
+        _check_uniform_series_shape(
+            VoteEnsemble, self.children, per_child,
+        )
+        return self._vote(per_child, data.index)
+
+    def _vote(
+        self, per_child: List[pd.Series], index: pd.Index,
+    ) -> pd.Series:
+        signals = pd.concat(per_child, axis=1)
         signals.columns = range(len(self.children))
         votes = signals.apply(np.sign)
         vote_sum = votes.sum(axis=1)
         n_valid = votes.notna().sum(axis=1)
 
-        result = pd.Series(np.nan, index=df.index, dtype=float)
+        result = pd.Series(np.nan, index=signals.index, dtype=float)
         majority = vote_sum.abs() > n_valid / 2
         result[majority] = np.sign(vote_sum[majority])
-        return _transitions_only(result)
+        result = _transitions_only(result).reindex(index)
+        return result
+
+    def _compute(self, df: pd.DataFrame) -> pd.Series:
+        return self.generate_signals(df)
 
 
 class ConditionalSwitch(StrategyNode):
@@ -881,15 +1197,65 @@ class ConditionalSwitch(StrategyNode):
 
     name = "Conditional Switch"
 
-    def __init__(self, children: List[BaseStrategy], condition_fn):
-        super().__init__(children)
+    def __init__(
+        self, children: List[BaseStrategy], condition_fn,
+        *,
+        mode: Literal["auto", "generate_signals", "legacy_compute"] = "auto",
+    ):
+        super().__init__(children, mode=mode)
         self.condition_fn = condition_fn
 
-    def _compute(self, df: pd.DataFrame) -> pd.Series:
-        selection = self.condition_fn(df)
-        child_signals = [c._compute(df) for c in self.children]
-        result = pd.Series(np.nan, index=df.index, dtype=float)
-        for i, sig in enumerate(child_signals):
+    def generate_signals(self, data):
+        _validate_children_kind(ConditionalSwitch, self.children)
+        if isinstance(data, dict):
+            per_child = [
+                _resolve_child_signals(
+                    ConditionalSwitch, c, data, mode=self.mode,
+                )
+                for c in self.children
+            ]
+            _check_uniform_dict_shape(
+                ConditionalSwitch, self.children, per_child, data,
+            )
+            # condition_fn must accept the data shape it's invoked with.
+            # For multi-asset, expect dict[str, Series] back.
+            selection = self.condition_fn(data)
+            if not isinstance(selection, dict):
+                raise TypeError(
+                    "ConditionalSwitch.condition_fn must return "
+                    "dict[str, Series] when called with multi-asset data; "
+                    f"got {type(selection).__name__}"
+                )
+            return {
+                sym: self._switch(
+                    [child_out[sym] for child_out in per_child],
+                    selection[sym], data[sym].index,
+                )
+                for sym in data
+            }
+        per_child = [
+            _resolve_child_signals(
+                ConditionalSwitch, c, data, mode=self.mode,
+            )
+            for c in self.children
+        ]
+        _check_uniform_series_shape(
+            ConditionalSwitch, self.children, per_child,
+        )
+        return self._switch(per_child, self.condition_fn(data), data.index)
+
+    def _switch(
+        self,
+        per_child: List[pd.Series],
+        selection: pd.Series,
+        index: pd.Index,
+    ) -> pd.Series:
+        result = pd.Series(np.nan, index=index, dtype=float)
+        for i, sig in enumerate(per_child):
+            sig = sig.reindex(index)
             mask = selection == i
             result[mask] = sig[mask]
         return _transitions_only(result)
+
+    def _compute(self, df: pd.DataFrame) -> pd.Series:
+        return self.generate_signals(df)
