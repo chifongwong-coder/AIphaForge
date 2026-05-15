@@ -450,6 +450,101 @@ class BacktestEngine:
         self._target_weights_wide_config = None
         return self
 
+    def set_score_wide(
+        self,
+        score_wide: pd.DataFrame,
+        rule,
+        *,
+        warn_on_inf: bool = True,
+        strict: bool = False,
+    ) -> 'BacktestEngine':
+        """Set wide-layout scores; ``rule.transform(scores)`` → signals.
+
+        Routes raw scores through an explicit ``ScoreToSignalRule``
+        (e.g. :class:`signal_rules.ThresholdScoreRule`,
+        :class:`signal_rules.CrossSectionalQuantileRule`) before
+        delegating to :meth:`set_signals_wide`. Makes the
+        score-to-signal gate visible at the engine boundary so an ML
+        model emitting probabilities cannot be silently routed as
+        direction signals.
+
+        Parameters
+        ----------
+        score_wide
+            Wide-layout score DataFrame.
+        rule
+            Object with a ``.transform(scores) → DataFrame`` method.
+        warn_on_inf, strict
+            Forwarded to :meth:`set_signals_wide`. Same strict
+            semantics — strict + warn_on_inf=False raises immediately.
+
+        Notes
+        -----
+        Score-rule default asymmetry (per plan v3-decision #9):
+        ``ThresholdScoreRule`` defaults to ``neutral_action="hold"``
+        (NaN); ``CrossSectionalQuantileRule`` defaults to
+        ``neutral_action="flat"`` (0). The two emit different
+        post-warmup behavior on the same score frame — read each
+        rule's docstring before picking.
+        """
+        if not isinstance(score_wide, pd.DataFrame):
+            raise TypeError(
+                f"set_score_wide expects pd.DataFrame, got "
+                f"{type(score_wide).__name__}"
+            )
+        if not hasattr(rule, "transform"):
+            raise TypeError(
+                f"set_score_wide rule must have a .transform(scores) "
+                f"method (use ThresholdScoreRule, "
+                f"CrossSectionalQuantileRule, or a callable wrapped in "
+                f"such); got {type(rule).__name__}"
+            )
+        if strict and not warn_on_inf:
+            raise ValueError(
+                "set_score_wide(strict=True) is incompatible with "
+                "warn_on_inf=False; pass strict=False to opt out of "
+                "Inf checks"
+            )
+
+        # Atomicity (per plan v2-decision #6): zero out the 5 other
+        # setter fields BEFORE invoking rule.transform so a transform
+        # raise cannot leave stale _signals from a prior call.
+        self._strategy = None
+        self._signals = None
+        self._target_weights = None
+        self._target_weights_wide = None
+        self._target_weights_wide_config = None
+
+        # Wrap rule.transform so any failure clearly blames the rule.
+        try:
+            signal_wide = rule.transform(score_wide)
+        except Exception as exc:
+            raise type(exc)(
+                f"{type(rule).__name__}.transform raised: {exc}"
+            ) from exc
+
+        if not isinstance(signal_wide, pd.DataFrame):
+            raise TypeError(
+                f"{type(rule).__name__}.transform returned "
+                f"{type(signal_wide).__name__}, expected pd.DataFrame. "
+                f"set_score_wide requires a wide-DataFrame-returning "
+                f"rule (e.g. ThresholdScoreRule, "
+                f"CrossSectionalQuantileRule)."
+            )
+
+        # Delegate with re-raise wrapping so set_signals_wide-side
+        # validation failures (duplicate index, etc) blame the rule
+        # that produced the malformed frame.
+        try:
+            return self.set_signals_wide(
+                signal_wide, warn_on_inf=warn_on_inf, strict=strict,
+            )
+        except (TypeError, ValueError) as exc:
+            raise type(exc)(
+                f"{type(rule).__name__}.transform produced an invalid "
+                f"frame: {exc}"
+            ) from exc
+
     def set_target_weights(
         self,
         weights_schedule: Dict[str, Dict[str, float]],
