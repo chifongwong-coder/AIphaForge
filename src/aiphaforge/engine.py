@@ -396,7 +396,25 @@ class BacktestEngine:
 
         Returns:
             self: For method chaining.
+
+        Raises:
+            TypeError: if ``signals`` is a ``pd.DataFrame``. v2.7
+                tightens the contract — wide-layout input goes through
+                :meth:`set_signals_wide` instead. Previously a DataFrame
+                here would crash deep in the engine with a confusing
+                ``AttributeError``; v2.7 refuses cleanly at the
+                boundary. This is a breaking change from v2.6 only for
+                callers who relied on the prior crash being caught
+                upstream.
         """
+        if isinstance(signals, pd.DataFrame):
+            raise TypeError(
+                "set_signals only accepts pd.Series (single-asset) or "
+                "dict[str, pd.Series] (multi-asset). For wide-layout "
+                "DataFrame input, use set_signals_wide(df) instead. "
+                "(See README v2.7 release notes — this is a breaking "
+                "change from v2.6.)"
+            )
         self._signals = signals
         self._strategy = None
         self._target_weights = None
