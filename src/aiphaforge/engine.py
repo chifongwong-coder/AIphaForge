@@ -7,7 +7,7 @@ Main backtest executor supporting both vectorized and event-driven modes.
 import warnings
 from datetime import time
 from enum import Enum
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Literal, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -28,6 +28,7 @@ from .hooks import (
 from .latency import LatencyHook
 from .position_sizing import AllInSizer, FixedSizer, FractionSizer
 from .results import BacktestResult, Trade
+from .signals import validate_signal_wide, wide_to_signal_dict
 
 # Import utility functions
 from .utils import (
@@ -309,6 +310,15 @@ class BacktestEngine:
         self._data = None
         self._target_weights = None
 
+        # v2.7 wide-input state — see Engine state vector in v2.7 plan.
+        # Declared upfront so each setter can zero them independently
+        # without ordering coupling across commits.
+        self._signals_wide: Optional[pd.DataFrame] = None
+        self._signals_wide_inf_action: Literal["silent", "warn", "raise"] = "warn"
+        self._signals_wide_strict: bool = False
+        self._target_weights_wide: Optional[pd.DataFrame] = None
+        self._target_weights_wide_config = None  # _TargetWeightsWideConfig | None — set in v2.7 Commit C
+
     def _create_position_sizer(self):
         """Create the appropriate position sizer based on config."""
         if self.position_sizing == PositionSizing.FIXED_SIZE:
@@ -327,6 +337,16 @@ class BacktestEngine:
 
     # ========== Setup Methods ==========
 
+    def _clear_wide_input_state(self) -> None:
+        """Zero the v2.7 wide-input state fields. Called by every
+        setter for mutual exclusion across the 8-field state vector.
+        """
+        self._signals_wide = None
+        self._signals_wide_inf_action = "warn"
+        self._signals_wide_strict = False
+        self._target_weights_wide = None
+        self._target_weights_wide_config = None
+
     def set_strategy(self, strategy) -> 'BacktestEngine':
         """
         Set the trading strategy.
@@ -340,6 +360,7 @@ class BacktestEngine:
         self._strategy = strategy
         self._signals = None
         self._target_weights = None
+        self._clear_wide_input_state()
         return self
 
     def set_signals(
@@ -358,6 +379,75 @@ class BacktestEngine:
         self._signals = signals
         self._strategy = None
         self._target_weights = None
+        self._clear_wide_input_state()
+        return self
+
+    def set_signals_wide(
+        self,
+        signal_wide: pd.DataFrame,
+        *,
+        warn_on_inf: bool = True,
+        strict: bool = False,
+    ) -> 'BacktestEngine':
+        """Set pre-computed wide-layout signals (index=datetime, columns=symbol).
+
+        Materialization is deferred to ``run()``: at run time the wide
+        DataFrame is converted to ``dict[str, pd.Series]`` against the
+        actual ``data`` argument (single-asset path synthesizes the
+        dict via ``{symbol: data}``).
+
+        Parameters
+        ----------
+        signal_wide
+            Wide-layout signal DataFrame. ``index`` MUST be a
+            ``DatetimeIndex`` without duplicates (validated via
+            :func:`signals.validate_signal_wide`).
+        warn_on_inf
+            If True (default), ±Inf in the wide DF emits a warning at
+            materialization (and is coerced to NaN per the signal
+            contract). If False, coerce silently.
+        strict
+            CI / fail-fast mode. When True: ±Inf raises instead of
+            warning. **Incompatible with ``warn_on_inf=False``** —
+            passing both raises ``ValueError`` immediately at this
+            setter call (per v2.7 plan v3-decision #20: strict always
+            wins, conflicting explicit kwargs raise at setter time).
+        """
+        if not isinstance(signal_wide, pd.DataFrame):
+            raise TypeError(
+                f"set_signals_wide expects pd.DataFrame, got "
+                f"{type(signal_wide).__name__}; use set_signals for "
+                f"Series/dict input"
+            )
+        if strict and not warn_on_inf:
+            raise ValueError(
+                "set_signals_wide(strict=True) is incompatible with "
+                "warn_on_inf=False; pass strict=False to opt out of "
+                "Inf checks"
+            )
+        validate_signal_wide(signal_wide)
+
+        # Compute tri-state inf_action from (strict, warn_on_inf):
+        # (True, True) → raise (strict short-circuits)
+        # (True, False) → already rejected above
+        # (False, True) → warn
+        # (False, False) → silent
+        if strict:
+            inf_action: Literal["silent", "warn", "raise"] = "raise"
+        elif warn_on_inf:
+            inf_action = "warn"
+        else:
+            inf_action = "silent"
+
+        self._signals_wide = signal_wide
+        self._signals_wide_inf_action = inf_action
+        self._signals_wide_strict = strict
+        # Mutual exclusion against the other 5 setter groups:
+        self._strategy = None
+        self._signals = None
+        self._target_weights = None
+        self._target_weights_wide = None
+        self._target_weights_wide_config = None
         return self
 
     def set_target_weights(
@@ -384,6 +474,7 @@ class BacktestEngine:
         self._target_weights = weights_schedule
         self._signals = None
         self._strategy = None
+        self._clear_wide_input_state()
         return self
 
     def set_fee_model(self, fee_model: Union[BaseFeeModel, str]) -> 'BacktestEngine':
@@ -670,11 +761,45 @@ class BacktestEngine:
 
         return result
 
+    def _materialize_signals_wide(
+        self, data_dict: Dict[str, pd.DataFrame],
+    ) -> Dict[str, pd.Series]:
+        """v2.7: convert ``self._signals_wide`` → dict[str, Series].
+
+        Honors ``self._signals_wide_inf_action`` tri-state. Called by
+        both ``_get_signals`` (single-asset, after data_dict synthesis)
+        and ``_get_signals_multi`` (multi-asset). Per v2.7 plan
+        v3-decision #4 the wide DataFrame is RETAINED across chained
+        ``run()`` calls, so this method may be called multiple times.
+        """
+        action = self._signals_wide_inf_action
+        if action == "raise":
+            # Pre-check for Inf with a clean strict-mode error.
+            arr = self._signals_wide.to_numpy(dtype=float)
+            if np.isinf(arr).any():
+                raise ValueError(
+                    "set_signals_wide(strict=True): ±Inf values in "
+                    "signal_wide are not permitted in strict mode."
+                )
+            return wide_to_signal_dict(
+                self._signals_wide, data_dict, warn_on_inf=False,
+            )
+        return wide_to_signal_dict(
+            self._signals_wide, data_dict,
+            warn_on_inf=(action == "warn"),
+        )
+
     def _get_signals_multi(
         self,
         data_dict: Dict[str, pd.DataFrame],
     ) -> Dict[str, pd.Series]:
         """Get signals for multi-asset mode."""
+        # v2.7 wide-input materialization: must run BEFORE the existing
+        # dispatch so the materialized dict feeds the standard
+        # `isinstance(self._signals, dict)` branch below.
+        if self._signals_wide is not None:
+            self._signals = self._materialize_signals_wide(data_dict)
+
         # Target weights mode: convert schedule to signal series
         if self._target_weights is not None:
             return self._weights_to_signals(
@@ -904,6 +1029,14 @@ class BacktestEngine:
         self, data: pd.DataFrame, *, symbol: str = "default",
     ) -> pd.Series:
         """Get trading signals. NaN = hold, 0 = flat, nonzero = trade."""
+        # v2.7 wide-input materialization (single-asset path). Synthesizes
+        # data_dict = {symbol: data} per plan v3-decision #19, then
+        # extracts the per-symbol Series for the existing dispatch.
+        if self._signals_wide is not None:
+            data_dict = {symbol: data}
+            signal_dict = self._materialize_signals_wide(data_dict)
+            self._signals = signal_dict[symbol]
+
         if self._target_weights is not None:
             signals_dict = self._weights_to_signals(
                 self._target_weights, {symbol: data})
