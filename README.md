@@ -126,6 +126,58 @@ The Q&A pillar (v2.2 `knowledge_check`) is **non-transitive** with the obfuscati
 
 Every `KnowledgeCheckReport.notes` carries this warning verbatim. Reports are intentionally not aggregated into a single 🟢/🟡/🔴 verdict — `KnowledgeCheckReport.is_pillar_summary` is `False` and the `__post_init__` rejects any attempt to flip it.
 
+#### v2.7 release notes — Engine Signal-Input Widening
+
+v2.7 adds three wide-DataFrame entry points to `BacktestEngine` that route through the v2.3 / v2.4 adapters internally. The existing `set_signals(...)` contract (Series / dict[str, Series] only) is preserved. Per-bar engine loop diff: zero lines.
+
+**New entry points**:
+
+```python
+# 1. Pre-computed wide signals (single setter for the multi-asset case).
+engine.set_signals_wide(
+    signal_wide_df,          # index=datetime, columns=symbol
+    warn_on_inf=True,        # default: ±Inf in the DF emits a warning
+    strict=False,            # CI mode — see below
+).run(data)
+
+# 2. Wide ML scores + an explicit ScoreToSignalRule gate.
+from aiphaforge import ThresholdScoreRule
+engine.set_score_wide(
+    scores_df,               # raw model output (any float values)
+    ThresholdScoreRule(long_threshold=0.7, short_threshold=0.3),
+).run(data)
+
+# 3. Wide target weights with quarterly rebalancing on a daily DF.
+quarterly_dates = [df.index[0], df.index[63], df.index[126], df.index[189]]
+engine.set_target_weights_wide(
+    weights_df,
+    rebalance_dates=quarterly_dates,   # OMIT this and you fire 252 rebalances/year
+    snap="exact",
+    on_collision="warn",
+).run(data)
+```
+
+**Score-rule default asymmetry — important when picking a rule**: `ThresholdScoreRule` defaults to `neutral_action="hold"` (NaN — engine ffills the prior position). `CrossSectionalQuantileRule` defaults to `neutral_action="flat"` (0 — engine closes the position on every bar where the name is in the middle quantile). On a daily score frame with monthly rebalances, `CrossSectionalQuantileRule`'s default emits explicit closes daily, which is almost certainly NOT what you want for sparse rebalancing — pre-mask the score frame to your rebalance dates, OR compute weights yourself and use `set_target_weights_wide(rebalance_dates=...)`.
+
+**`set_score_wide` does NOT down-sample**: the rule is applied per-bar across the full input frame. If your scores are daily but rebalances are monthly, the score-to-signal gate fires daily.
+
+**NaN semantics, by entry point**:
+
+- `set_signals_wide` — NaN in the wide DF means **hold** (engine ffills prior position).
+- `set_target_weights_wide` — NaN weight in the wide DF is coerced to **0** (explicit close) by the underlying schedule adapter. This is intentional but asymmetric with `set_signals_wide`'s NaN-as-hold; document your fixture explicitly when both setters appear in one pipeline.
+
+**CI / strict mode**: `strict=True` is a one-kwarg fail-fast switch on all three setters. It promotes Inf-warnings to errors and (for `set_target_weights_wide`) defaults `on_collision` to `"raise"` and `snap` to `"exact"`. Strict ALWAYS wins — passing `strict=True` together with a conflicting explicit kwarg (e.g. `strict=True, warn_on_inf=False` or `strict=True, on_collision="warn"`) raises `ValueError` immediately at the setter call rather than silently overriding your value. If you want partial strictness, set the individual kwargs explicitly without `strict=True`.
+
+```python
+# Fail-fast for CI / production pipelines:
+engine.set_signals_wide(df, strict=True)
+engine.set_target_weights_wide(weights, strict=True)
+```
+
+**Breaking change — `set_signals(df)` now raises `TypeError`**: previously a `pd.DataFrame` passed to `set_signals` would crash deep inside `_get_signals` with a confusing `AttributeError`. v2.7 refuses cleanly at the boundary with a message pointing to `set_signals_wide`. The exception type changes from `AttributeError` to `TypeError`, and the failure point moves from inside `run()` to inside `set_signals` — downstream `try/except` handlers may notice. Migration: replace `engine.set_signals(wide_df)` with `engine.set_signals_wide(wide_df)`.
+
+**What v2.7 does NOT include**: engine integration with `IncrementalFactor` (still deferred to v3.0); no auto-inference between Series / dict / DataFrame in `set_signals` — each entry point has one accepted shape per the master plan §5.5 anti-list.
+
 #### v2.6 release notes — Incremental Factor MVP
 
 v2.6 ships the `IncrementalFactor` API for stateful per-bar factor computation alongside v2.4's batch `BaseFactor`. Engine source diff: zero lines.
