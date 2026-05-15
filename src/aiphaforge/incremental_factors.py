@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Tuple
+from typing import ClassVar, Tuple
 
 import numpy as np
 import pandas as pd
@@ -51,7 +51,7 @@ class FactorState:
     """
 
     bar_count: int = 0
-    __pickle_version__: int = 1
+    __pickle_version__: ClassVar[int] = 1
 
 
 class IncrementalFactor(ABC):
@@ -70,6 +70,15 @@ class IncrementalFactor(ABC):
     """
 
     name: str = "incremental_factor"
+
+    # Subclasses MUST declare the set of mutable parameter names that
+    # ``update_params`` is allowed to overwrite. Empty set on the ABC
+    # means an un-customized subclass rejects every keyword — which is
+    # the safe default. Without this whitelist, ``hasattr(self, k)``
+    # would happily accept method names ("update", "initial_state") or
+    # internal fields ("_state", "name") and silently corrupt the
+    # factor. See Q4 of the v2.6 design doc.
+    _PARAMS: ClassVar[frozenset[str]] = frozenset()
 
     @abstractmethod
     def initial_state(self) -> FactorState:
@@ -115,12 +124,25 @@ class IncrementalFactor(ABC):
         is a clean slate; the caller MUST call ``rewarmup(history)``
         before resuming live ``update()`` calls, otherwise the next
         ``window`` bars emit NaN.
+
+        Only keys listed in ``self._PARAMS`` are accepted; any other
+        keyword raises ``ValueError``. This prevents accidental
+        clobbering of methods or internal fields.
+
+        Multi-symbol caveat: ``self._state`` is the single-symbol
+        convenience cache. If callers manage their own per-symbol
+        ``FactorState`` instances (the design-doc-recommended pattern
+        for multi-symbol replay), those external states are NOT reset
+        by ``update_params`` and will continue to use the new params
+        with stale state. Callers must reset and rewarmup each
+        per-symbol state themselves.
         """
+        bad = set(kwargs) - self._PARAMS
+        if bad:
+            raise ValueError(
+                f"Unknown params {sorted(bad)} for {type(self).__name__}"
+            )
         for k, v in kwargs.items():
-            if not hasattr(self, k):
-                raise ValueError(
-                    f"Unknown param '{k}' for {type(self).__name__}"
-                )
             setattr(self, k, v)
         self._state = self.initial_state()
 
@@ -160,6 +182,8 @@ class RollingMeanIncremental(IncrementalFactor):
     NaN until ``window`` bars have been observed (matches
     ``pd.Series.rolling(window).mean()`` warmup convention).
     """
+
+    _PARAMS: ClassVar[frozenset[str]] = frozenset({"window"})
 
     def __init__(self, window: int):
         if window < 1:
@@ -203,6 +227,8 @@ class VolumeZScoreIncremental(IncrementalFactor):
     is a per-symbol time-series transform (NOT cross-sectional).
     Cross-sectional z-score is deferred to v2.7+ / v3.0.
     """
+
+    _PARAMS: ClassVar[frozenset[str]] = frozenset({"window"})
 
     def __init__(self, window: int):
         if window < 2:
@@ -266,12 +292,19 @@ class RSIIncremental(IncrementalFactor):
     explicit fill in v2.4 ``indicators.RSI``).
     """
 
+    _PARAMS: ClassVar[frozenset[str]] = frozenset({"period"})
+
     def __init__(self, period: int = 14):
         if period < 1:
             raise ValueError(f"period must be >= 1, got {period}")
         self.period = period
-        self.alpha = 1.0 / period
         self.name = f"rsi_{period}"
+
+    @property
+    def alpha(self) -> float:
+        # Derived from period; computed on access so update_params(period=...)
+        # can never desync alpha from period.
+        return 1.0 / self.period
 
     def initial_state(self) -> _RSIState:
         return _RSIState()
@@ -298,6 +331,9 @@ class RSIIncremental(IncrementalFactor):
         new_avg_loss = self.alpha * loss + (1.0 - self.alpha) * state.avg_loss
         new_bar_count = state.bar_count + 1
 
+        # Emit at bar (period - 1): need 'period' non-NaN inputs total,
+        # including bar 0's forced (gain=0, loss=0) pair, so condition is
+        # strict-less-than. Matches pandas ewm(min_periods=period).mean().
         if new_bar_count < self.period:
             value = float("nan")
         elif new_avg_loss == 0.0:
@@ -329,6 +365,8 @@ class MomentumIncremental(IncrementalFactor):
     the first non-NaN (because we need ``close[t-window]``,
     indexed at bar 0 when t == window).
     """
+
+    _PARAMS: ClassVar[frozenset[str]] = frozenset({"window"})
 
     def __init__(self, window: int):
         if window < 1:
@@ -381,6 +419,8 @@ class RollingStdIncremental(IncrementalFactor):
     ``bar_count < window`` to avoid the n=1 / divide-by-zero edge
     case in the variance formula at ddof=1.
     """
+
+    _PARAMS: ClassVar[frozenset[str]] = frozenset({"window", "ddof"})
 
     def __init__(self, window: int, ddof: int = 1):
         if window < 1:
