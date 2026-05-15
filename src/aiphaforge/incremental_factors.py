@@ -189,7 +189,10 @@ class RollingMeanIncremental(IncrementalFactor):
         if window < 1:
             raise ValueError(f"window must be >= 1, got {window}")
         self.window = window
-        self.name = f"rolling_mean_{window}"
+
+    @property
+    def name(self) -> str:
+        return f"rolling_mean_{self.window}"
 
     def initial_state(self) -> _RollingMeanState:
         return _RollingMeanState()
@@ -236,7 +239,10 @@ class VolumeZScoreIncremental(IncrementalFactor):
                 f"window must be >= 2 for sample std (ddof=1), got {window}"
             )
         self.window = window
-        self.name = f"volume_zscore_{window}"
+
+    @property
+    def name(self) -> str:
+        return f"volume_zscore_{self.window}"
 
     def initial_state(self) -> _VolumeZScoreState:
         return _VolumeZScoreState()
@@ -298,7 +304,10 @@ class RSIIncremental(IncrementalFactor):
         if period < 1:
             raise ValueError(f"period must be >= 1, got {period}")
         self.period = period
-        self.name = f"rsi_{period}"
+
+    @property
+    def name(self) -> str:
+        return f"rsi_{self.period}"
 
     @property
     def alpha(self) -> float:
@@ -372,7 +381,10 @@ class MomentumIncremental(IncrementalFactor):
         if window < 1:
             raise ValueError(f"window must be >= 1, got {window}")
         self.window = window
-        self.name = f"momentum_{window}"
+
+    @property
+    def name(self) -> str:
+        return f"momentum_{self.window}"
 
     def initial_state(self) -> _MomentumState:
         return _MomentumState()
@@ -429,7 +441,10 @@ class RollingStdIncremental(IncrementalFactor):
             raise ValueError(f"ddof must be >= 0, got {ddof}")
         self.window = window
         self.ddof = ddof
-        self.name = f"rolling_std_{window}"
+
+    @property
+    def name(self) -> str:
+        return f"rolling_std_{self.window}"
 
     def initial_state(self) -> _RollingStdState:
         return _RollingStdState()
