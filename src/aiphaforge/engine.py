@@ -464,7 +464,7 @@ class BacktestEngine:
                 "warn_on_inf=False; pass strict=False to opt out of "
                 "Inf checks"
             )
-        validate_signal_wide(signal_wide)
+        validate_signal_wide(signal_wide, forbid_tz=True)
 
         # Compute tri-state inf_action from (strict, warn_on_inf):
         # (True, True) → raise (strict short-circuits)
@@ -656,7 +656,7 @@ class BacktestEngine:
                 f"set_target_weights_wide expects pd.DataFrame, got "
                 f"{type(weights).__name__}"
             )
-        validate_signal_wide(weights)
+        validate_signal_wide(weights, forbid_tz=True)
 
         # Strict-conflict checks (per plan v3-decision #20).
         if strict:

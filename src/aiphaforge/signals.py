@@ -244,12 +244,26 @@ def validate_signal_series(
             )
 
 
-def validate_signal_wide(signal_wide: pd.DataFrame) -> None:
+def validate_signal_wide(
+    signal_wide: pd.DataFrame, *, forbid_tz: bool = False,
+) -> None:
     """Wide-form analog of :func:`validate_signal_series`.
 
     Checks the index + numeric dtype across all columns. Per-symbol
     semantic checks are performed by ``validate_signal_series``
     after a ``wide_to_signal_dict`` split.
+
+    Parameters
+    ----------
+    signal_wide
+        The wide-layout signal / weights DataFrame to validate.
+    forbid_tz
+        v2.7 additive opt-in (default ``False`` for backwards
+        compatibility): when ``True``, raise on tz-aware index. The
+        v2.7 engine setters call with ``forbid_tz=True`` because a
+        tz-aware wide DF reindexed against a tz-naive engine ``data``
+        would produce silent all-NaN — surfacing this at the boundary
+        is friendlier than the silent reindex result.
 
     Raises
     ------
@@ -257,7 +271,8 @@ def validate_signal_wide(signal_wide: pd.DataFrame) -> None:
         If the index is not a DatetimeIndex or any column has
         non-numeric dtype.
     ValueError
-        On duplicate timestamps.
+        On duplicate timestamps. With ``forbid_tz=True``: also on a
+        tz-aware index.
     """
     if not isinstance(signal_wide.index, pd.DatetimeIndex):
         raise TypeError(
@@ -268,6 +283,14 @@ def validate_signal_wide(signal_wide: pd.DataFrame) -> None:
         dup = signal_wide.index[signal_wide.index.duplicated()].unique()
         raise ValueError(
             f"signal_wide index has {len(dup)} duplicate timestamp(s)"
+        )
+    if forbid_tz and signal_wide.index.tz is not None:
+        raise ValueError(
+            f"signal_wide index is tz-aware ({signal_wide.index.tz}); "
+            f"the engine cannot align a tz-aware signal frame against "
+            f"tz-naive market data. Strip the timezone via "
+            f"signal_wide.tz_localize(None) before calling the engine "
+            f"setter."
         )
     non_numeric_cols = [
         col for col in signal_wide.columns
