@@ -171,7 +171,15 @@ factor.rewarmup(history)         # rebuilds state under new params
 
 **Numerical equivalence**: incremental factors are tested against the v2.4 batch reference (or a pandas one-liner where no v2.4 batch exists). Closed-form factors (`RollingMean`, `Momentum`) match within `rtol=1e-12`. Recursive factors (`RollingStd`, `RSI`, `VolumeZScore`) match within `rtol=1e-9, atol=1e-12` — pandas batch recomputes from the raw window each bar (no recursion), so even a numerically stable Welford / Wilder smoother differs at the `~1e-10` scale on adversarial price series.
 
-**What v2.6 does NOT include**: cross-sectional incremental (deferred to v2.7+ / v3.0), engine integration (v2.7), `MetaController` automated rewarmup hook (v3.0), incremental neutralization / regression-residual factors (v3.0), and dynamic universe symbol add/remove integration (v3.0). See `docs/AIphaForge_Incremental_Factor_Design_v1.0.md` for the full design rationale.
+**What v2.6 does NOT include**: cross-sectional incremental (deferred to v2.7+ / v3.0), engine integration (v2.7), `MetaController` automated rewarmup hook (v3.0), incremental neutralization / regression-residual factors (v3.0), and dynamic universe symbol add/remove integration (v3.0).
+
+**Design decisions callers should be aware of**:
+
+- **State ownership**: the caller manages one `FactorState` per `(factor, symbol)` pair. A single factor instance is meant to be reused across symbols by passing different states into `update(bar, state)`. The factor itself MUST NOT carry per-symbol state in instance fields (cross-symbol contamination risk).
+- **Parallel APIs, not subclassed**: `IncrementalFactor` (v2.6) and `BaseFactor` (v2.4) are independent. Pick one per factor based on workflow — batch for research / one-shot backtests, incremental for live trading or event-driven simulation. A future v3.0 may unify via a shared protocol.
+- **Dynamic universe**: symbols added mid-run must be warmed up via replay-from-history — caller calls `factor.rewarmup(symbol_history)` before consuming the symbol's first value. Symbols leaving the universe should have their state dropped; re-entry is treated as a fresh add (any retained stale state would be a footgun across delisting / ticker reuse).
+- **`available_at` semantics**: a factor computed from bar `t`'s OHLC is only available AFTER bar `t`'s close. The earliest decision that may use it is bar `t+1`'s open. Using bar `t`'s factor value at bar `t`'s open is lookahead bias — the v2.4 anti-lookahead invariant carries over.
+- **Hook coupling**: a hook that mutates strategy params is responsible for propagating the change to the incremental factor (`factor.update_params(...)` then `factor.rewarmup(history)`); risk-state hooks (positions, capital, exposure) have no effect on the factor cache — risk and factor computation are orthogonal subsystems.
 
 #### v2.5 release notes — StrategyNode 3-Mode Rewrite
 
