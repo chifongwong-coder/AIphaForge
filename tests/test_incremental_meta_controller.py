@@ -5,7 +5,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from aiphaforge.incremental_factors import RollingMeanIncremental
+from aiphaforge.incremental_factors import (
+    MomentumIncremental,
+    RollingMeanIncremental,
+    RollingStdIncremental,
+    RSIIncremental,
+    VolumeZScoreIncremental,
+)
 
 
 def _data(periods=50, seed=0):
@@ -80,6 +86,44 @@ def test_rewarmup_restores_state_to_match_run_all():
     val_via_run_all = out.iloc[-1]
 
     assert val_via_rewarmup == pytest.approx(val_via_run_all, rel=1e-12)
+
+
+@pytest.mark.parametrize(
+    "factory, initial_name, mutate, updated_name",
+    [
+        (
+            lambda w: RollingMeanIncremental(window=w),
+            "rolling_mean_10", {"window": 20}, "rolling_mean_20",
+        ),
+        (
+            lambda w: RollingStdIncremental(window=w),
+            "rolling_std_10", {"window": 20}, "rolling_std_20",
+        ),
+        (
+            lambda w: MomentumIncremental(window=w),
+            "momentum_10", {"window": 20}, "momentum_20",
+        ),
+        (
+            lambda w: VolumeZScoreIncremental(window=w),
+            "volume_zscore_10", {"window": 20}, "volume_zscore_20",
+        ),
+        (
+            lambda p: RSIIncremental(period=p),
+            "rsi_10", {"period": 20}, "rsi_20",
+        ),
+    ],
+    ids=["RollingMean", "RollingStd", "Momentum", "VolumeZScore", "RSI"],
+)
+def test_update_params_keeps_derived_name_in_sync(
+    factory, initial_name, mutate, updated_name,
+):
+    # Regression guard: factor.name was previously cached in __init__
+    # and went stale after update_params(...). The fix derives name
+    # on access so it always reflects current params.
+    factor = factory(10)
+    assert factor.name == initial_name
+    factor.update_params(**mutate)
+    assert factor.name == updated_name
 
 
 def test_rewarmup_with_history_shorter_than_window_emits_nan():
