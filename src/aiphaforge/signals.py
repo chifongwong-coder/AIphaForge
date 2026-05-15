@@ -649,6 +649,18 @@ def target_weight_wide_to_schedule(
                 f"Use on_collision='first' / 'last' / 'warn' to absorb."
             )
         if on_collision == "warn":
+            # NOTE: The literal word "collision" in this warning text
+            # is part of an engine-side contract — see
+            # BacktestEngine._materialize_target_weights_wide in
+            # engine.py, which substring-matches on "collision" to
+            # decide whether to emit the engine-layer enriched
+            # "pass on_collision='raise' for CI/strict use" warning.
+            # Filename-based detection is unreliable because this
+            # warning is emitted with stacklevel=2 (so the recorded
+            # WarningMessage.filename is the caller, not signals.py).
+            # If the warning text is refactored, update the engine-
+            # side substring match in
+            # `_materialize_target_weights_wide` together.
             warnings.warn(
                 f"target_weight_wide_to_schedule snap='{snap}' produced "
                 f"{len(collisions)} collision(s); using last-write-wins. "

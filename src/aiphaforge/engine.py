@@ -5,9 +5,10 @@ Main backtest executor supporting both vectorized and event-driven modes.
 """
 
 import warnings
+from dataclasses import dataclass
 from datetime import time
 from enum import Enum
-from typing import Dict, List, Literal, Optional, Tuple, Union
+from typing import Dict, Iterable, List, Literal, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -28,7 +29,11 @@ from .hooks import (
 from .latency import LatencyHook
 from .position_sizing import AllInSizer, FixedSizer, FractionSizer
 from .results import BacktestResult, Trade
-from .signals import validate_signal_wide, wide_to_signal_dict
+from .signals import (
+    target_weight_wide_to_schedule,
+    validate_signal_wide,
+    wide_to_signal_dict,
+)
 
 # Import utility functions
 from .utils import (
@@ -49,6 +54,22 @@ from .utils import (
 from .utils import (
     sortino_ratio as calc_sortino,
 )
+
+
+@dataclass(frozen=True)
+class _TargetWeightsWideConfig:
+    """v2.7 frozen bundle of set_target_weights_wide kwargs.
+
+    Frozen for pickle stability across the v2.6 parallel-backtest path.
+    Holds the EFFECTIVE values after default-resolution and strict-
+    conflict checks (the setter never stores raw kwargs — see
+    set_target_weights_wide for the resolution rules).
+    """
+    rebalance_dates: Optional[Iterable]
+    snap: Literal["exact", "next", "previous"]
+    universe_alignment: Literal["union", "intersection"]
+    on_collision: Literal["warn", "raise", "first", "last"]
+    strict: bool
 
 
 class ExecutionMode(Enum):
@@ -572,6 +593,97 @@ class BacktestEngine:
         self._clear_wide_input_state()
         return self
 
+    def set_target_weights_wide(
+        self,
+        weights: pd.DataFrame,
+        *,
+        rebalance_dates: Optional[Iterable] = None,
+        snap: Optional[Literal["exact", "next", "previous"]] = None,
+        universe_alignment: Literal["union", "intersection"] = "union",
+        on_collision: Optional[Literal["warn", "raise", "first", "last"]] = None,
+        strict: bool = False,
+    ) -> 'BacktestEngine':
+        """Set wide-layout target weights; materialized to schedule at run().
+
+        Wraps :func:`signals.target_weight_wide_to_schedule` at the
+        engine surface. ``snap`` and ``on_collision`` use ``None`` as
+        the "default not explicitly passed" sentinel (per plan
+        v3-decision #20 default-detection note) so strict-conflict
+        checks can distinguish explicit-vs-default.
+
+        Parameters
+        ----------
+        weights
+            Wide-layout target-weight DataFrame, ``index=datetime,
+            columns=symbol``. NaN weights are coerced to 0 by the
+            underlying schedule adapter (explicit close on that bar).
+        rebalance_dates
+            Optional explicit rebalance schedule. If None, every row of
+            ``weights`` is treated as a candidate rebalance date —
+            common footgun: a daily-index ``weights`` frame with no
+            ``rebalance_dates`` will fire 252 rebalances/year.
+        snap, on_collision
+            Forwarded to the adapter. Defaults are ``"exact"`` and
+            ``"warn"`` respectively (resolved inside the body).
+        strict
+            CI / fail-fast. When True: ``snap`` defaults to ``"exact"``
+            and ``on_collision`` defaults to ``"raise"`` if not
+            explicitly passed; explicit conflicting values
+            (``snap != "exact"`` or
+            ``on_collision in {"warn", "first", "last"}``) raise
+            ``ValueError`` immediately at this setter call.
+        """
+        if not isinstance(weights, pd.DataFrame):
+            raise TypeError(
+                f"set_target_weights_wide expects pd.DataFrame, got "
+                f"{type(weights).__name__}"
+            )
+        validate_signal_wide(weights)
+
+        # Strict-conflict checks (per plan v3-decision #20).
+        if strict:
+            if on_collision is None:
+                on_collision = "raise"
+            elif on_collision in {"warn", "first", "last"}:
+                raise ValueError(
+                    f"set_target_weights_wide(strict=True) is "
+                    f"incompatible with on_collision={on_collision!r}; "
+                    f"strict mode raises on collision; pass "
+                    f"strict=False to use that policy"
+                )
+            if snap is None:
+                snap = "exact"
+            elif snap != "exact":
+                raise ValueError(
+                    f"set_target_weights_wide(strict=True) is "
+                    f"incompatible with snap={snap!r}; strict requires "
+                    f"snap='exact'; pass strict=False to use that snap "
+                    f"mode"
+                )
+        else:
+            if on_collision is None:
+                on_collision = "warn"
+            if snap is None:
+                snap = "exact"
+
+        cfg = _TargetWeightsWideConfig(
+            rebalance_dates=rebalance_dates,
+            snap=snap,
+            universe_alignment=universe_alignment,
+            on_collision=on_collision,
+            strict=strict,
+        )
+        self._target_weights_wide = weights
+        self._target_weights_wide_config = cfg
+        # Mutual exclusion against the other 5 setter groups.
+        self._strategy = None
+        self._signals = None
+        self._target_weights = None
+        self._signals_wide = None
+        self._signals_wide_inf_action = "warn"
+        self._signals_wide_strict = False
+        return self
+
     def set_fee_model(self, fee_model: Union[BaseFeeModel, str]) -> 'BacktestEngine':
         """
         Set the fee model.
@@ -856,6 +968,48 @@ class BacktestEngine:
 
         return result
 
+    def _materialize_target_weights_wide(
+        self, data_dict: Dict[str, pd.DataFrame],
+    ) -> Dict:
+        """v2.7: convert ``self._target_weights_wide`` → schedule dict.
+
+        Captures helper warnings via ``catch_warnings(record=True)`` so
+        they can be re-emitted (preserving original stacklevel) AND a
+        SECOND engine-layer warning can be emitted on collision-context
+        per plan v3-decision #22.
+        """
+        cfg = self._target_weights_wide_config
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always", UserWarning)
+            schedule = target_weight_wide_to_schedule(
+                self._target_weights_wide, data_dict,
+                rebalance_dates=cfg.rebalance_dates,
+                snap=cfg.snap,
+                universe_alignment=cfg.universe_alignment,
+                on_collision=cfg.on_collision,
+            )
+        # Re-emit captured warnings at original stacklevel for downstream
+        # callers' compatibility.
+        for w in captured:
+            warnings.warn(w.message, w.category, stacklevel=2)
+        # Engine-layer enriched warning per plan v3.2: detect via
+        # substring "collision" in the captured message text. Helper at
+        # signals.py:652 uses the literal word "collision(s)" which is
+        # a controlled-text contract (doc-comment in signals.py calls
+        # this out for future maintainers). Filename-based detection
+        # is unreliable because helper warnings use stacklevel=2.
+        if cfg.on_collision == "warn" and any(
+            "collision" in str(w.message).lower() for w in captured
+        ):
+            warnings.warn(
+                "set_target_weights_wide: collision warning above "
+                "from target_weight_wide_to_schedule. For CI / strict "
+                "pipelines pass on_collision='raise' or strict=True.",
+                UserWarning,
+                stacklevel=2,
+            )
+        return schedule
+
     def _materialize_signals_wide(
         self, data_dict: Dict[str, pd.DataFrame],
     ) -> Dict[str, pd.Series]:
@@ -890,10 +1044,15 @@ class BacktestEngine:
     ) -> Dict[str, pd.Series]:
         """Get signals for multi-asset mode."""
         # v2.7 wide-input materialization: must run BEFORE the existing
-        # dispatch so the materialized dict feeds the standard
-        # `isinstance(self._signals, dict)` branch below.
+        # dispatch so the materialized dict / schedule feeds the
+        # standard `isinstance(self._signals, dict)` /
+        # `self._target_weights is not None` branches below.
         if self._signals_wide is not None:
             self._signals = self._materialize_signals_wide(data_dict)
+        if self._target_weights_wide is not None:
+            self._target_weights = self._materialize_target_weights_wide(
+                data_dict,
+            )
 
         # Target weights mode: convert schedule to signal series
         if self._target_weights is not None:
@@ -1125,12 +1284,16 @@ class BacktestEngine:
     ) -> pd.Series:
         """Get trading signals. NaN = hold, 0 = flat, nonzero = trade."""
         # v2.7 wide-input materialization (single-asset path). Synthesizes
-        # data_dict = {symbol: data} per plan v3-decision #19, then
-        # extracts the per-symbol Series for the existing dispatch.
+        # data_dict = {symbol: data} per plan v3-decision #19.
         if self._signals_wide is not None:
-            data_dict = {symbol: data}
-            signal_dict = self._materialize_signals_wide(data_dict)
+            data_dict_single = {symbol: data}
+            signal_dict = self._materialize_signals_wide(data_dict_single)
             self._signals = signal_dict[symbol]
+        if self._target_weights_wide is not None:
+            data_dict_single = {symbol: data}
+            self._target_weights = self._materialize_target_weights_wide(
+                data_dict_single,
+            )
 
         if self._target_weights is not None:
             signals_dict = self._weights_to_signals(
