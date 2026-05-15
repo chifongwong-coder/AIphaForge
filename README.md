@@ -126,6 +126,53 @@ The Q&A pillar (v2.2 `knowledge_check`) is **non-transitive** with the obfuscati
 
 Every `KnowledgeCheckReport.notes` carries this warning verbatim. Reports are intentionally not aggregated into a single 🟢/🟡/🔴 verdict — `KnowledgeCheckReport.is_pillar_summary` is `False` and the `__post_init__` rejects any attempt to flip it.
 
+#### v2.6 release notes — Incremental Factor MVP
+
+v2.6 ships the `IncrementalFactor` API for stateful per-bar factor computation alongside v2.4's batch `BaseFactor`. Engine source diff: zero lines.
+
+> **`BacktestEngine` does NOT yet consume `IncrementalFactor`** in v2.6 — engine integration ships in v2.7. Users wanting to drive incremental factors today must call `factor.update(bar, state)` manually from their own code, or use `factor.run_all(data)` for batch-mode replay.
+
+**New top-level exports**:
+
+- `IncrementalFactor` — abstract base for stateful per-bar factors
+- `FactorState` — per-(factor, symbol) state dataclass; subclassable
+- 5 concrete factors: `RollingMeanIncremental`, `RollingStdIncremental`, `MomentumIncremental`, `RSIIncremental`, `VolumeZScoreIncremental`
+
+**Usage** (single-symbol):
+
+```python
+from aiphaforge import RSIIncremental
+
+factor = RSIIncremental(period=14)
+sig = factor.run_all(df)              # batch-equivalent for full-data replay
+
+# or per-bar driven:
+state = factor.initial_state()
+for _, bar in df.iterrows():
+    value, state = factor.update(bar, state)
+```
+
+**MetaController param-change recipe** (clear+rebuild via `rewarmup`):
+
+```python
+factor.update_params(period=20)  # clears self._state
+factor.rewarmup(history)         # rebuilds state under new params
+```
+
+**Per-factor warmup** (number of leading NaN bars before the first non-NaN value):
+
+| Factor | Warmup bars |
+|---|---|
+| `RollingMeanIncremental(window)` | `window - 1` |
+| `RollingStdIncremental(window, ddof=1)` | `window - 1` |
+| `MomentumIncremental(window)` | `window` |
+| `RSIIncremental(period)` | `period - 1` (matches pandas `ewm(min_periods=period)`) |
+| `VolumeZScoreIncremental(window)` | `window - 1` |
+
+**Numerical equivalence**: incremental factors are tested against the v2.4 batch reference (or a pandas one-liner where no v2.4 batch exists). Closed-form factors (`RollingMean`, `Momentum`) match within `rtol=1e-12`. Recursive factors (`RollingStd`, `RSI`, `VolumeZScore`) match within `rtol=1e-9, atol=1e-12` — pandas batch recomputes from the raw window each bar (no recursion), so even a numerically stable Welford / Wilder smoother differs at the `~1e-10` scale on adversarial price series.
+
+**What v2.6 does NOT include**: cross-sectional incremental (deferred to v2.7+ / v3.0), engine integration (v2.7), `MetaController` automated rewarmup hook (v3.0), incremental neutralization / regression-residual factors (v3.0), and dynamic universe symbol add/remove integration (v3.0). See `docs/AIphaForge_Incremental_Factor_Design_v1.0.md` for the full design rationale.
+
 #### v2.5 release notes — StrategyNode 3-Mode Rewrite
 
 v2.5 rewrites the 5 `StrategyNode` composite classes (`WeightedBlend`, `SelectBest`, `PriorityCascade`, `VoteEnsemble`, `ConditionalSwitch`) so they can host modern `generate_signals(data)` children alongside the existing `_compute(df)` legacy children. Engine source diff: zero lines.
