@@ -114,6 +114,6 @@ class TestReportCarriesWarning:
 
 class TestVersion:
     def test_version_is_current_release(self):
-        # Updated by v2.6.0 minor bump (Incremental Factor MVP).
+        # Updated by v2.7.0 minor bump (Engine Signal-Input Widening).
         import aiphaforge
-        assert aiphaforge.__version__ == "2.6.0"
+        assert aiphaforge.__version__ == "2.7.0"
