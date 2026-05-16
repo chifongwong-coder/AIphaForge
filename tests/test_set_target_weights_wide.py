@@ -265,6 +265,41 @@ def test_target_weights_wide_config_is_frozen():
     }
 
 
+def test_target_weights_wide_config_pickle_roundtrip():
+    # The frozen=True choice was justified as pickle stability for the
+    # v2.6 parallel-backtest path. Pin the roundtrip explicitly so a
+    # future field-type change that breaks pickle is caught.
+    import pickle
+    cfg = _TargetWeightsWideConfig(
+        rebalance_dates=[pd.Timestamp("2024-01-01"),
+                         pd.Timestamp("2024-04-01")],
+        snap="next",
+        universe_alignment="intersection",
+        on_collision="raise",
+        strict=True,
+    )
+    restored = pickle.loads(pickle.dumps(cfg))
+    assert restored == cfg
+    assert restored.rebalance_dates == cfg.rebalance_dates
+
+
+def test_set_target_weights_wide_normalizes_generator_rebalance_dates():
+    # Per code review M1: passing a generator must be eagerly
+    # materialized; otherwise chained run() would see an exhausted
+    # iterator on the second call.
+    idx = _bdays()
+    weights = pd.DataFrame({"AAPL": [0.5] * len(idx)}, index=idx)
+    gen = (ts for ts in idx[::5])  # generator, NOT a list
+    engine = BacktestEngine()
+    engine.set_target_weights_wide(weights, rebalance_dates=gen)
+    cfg = engine._target_weights_wide_config
+    assert isinstance(cfg.rebalance_dates, list), (
+        "generator must be eagerly materialized to list for pickle "
+        "safety + chained-run idempotence"
+    )
+    assert len(cfg.rebalance_dates) == len(idx[::5])
+
+
 def test_set_target_weights_wide_strict_warning_text_mentions_raise():
     # Engine-layer enriched warning fires when on_collision='warn' AND
     # the helper emitted a collision warning. Per plan v3.2, detection

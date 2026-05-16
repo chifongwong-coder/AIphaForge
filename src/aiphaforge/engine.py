@@ -8,7 +8,7 @@ import warnings
 from dataclasses import dataclass
 from datetime import time
 from enum import Enum
-from typing import Dict, Iterable, List, Literal, Optional, Tuple, Union
+from typing import Dict, List, Literal, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -65,7 +65,10 @@ class _TargetWeightsWideConfig:
     conflict checks (the setter never stores raw kwargs — see
     set_target_weights_wide for the resolution rules).
     """
-    rebalance_dates: Optional[Iterable]
+    # rebalance_dates is stored as a concrete list (or None) — generators
+    # would silently break two paths: pickle (per v2.6 parallel-backtest)
+    # and chained run() (exhausted after first materialization).
+    rebalance_dates: Optional[List]
     snap: Literal["exact", "next", "previous"]
     universe_alignment: Literal["union", "intersection"]
     on_collision: Literal["warn", "raise", "first", "last"]
@@ -531,6 +534,10 @@ class BacktestEngine:
                 f"set_score_wide expects pd.DataFrame, got "
                 f"{type(score_wide).__name__}"
             )
+        # Validate the INPUT score frame here so tz-aware / duplicate-
+        # index errors are attributed to the user's score, not blamed
+        # on the rule via the downstream set_signals_wide wrapper.
+        validate_signal_wide(score_wide, forbid_tz=True)
         if not hasattr(rule, "transform"):
             raise TypeError(
                 f"set_score_wide rule must have a .transform(scores) "
@@ -615,7 +622,7 @@ class BacktestEngine:
         self,
         weights: pd.DataFrame,
         *,
-        rebalance_dates: Optional[Iterable] = None,
+        rebalance_dates: Optional[Sequence] = None,
         snap: Optional[Literal["exact", "next", "previous"]] = None,
         universe_alignment: Literal["union", "intersection"] = "union",
         on_collision: Optional[Literal["warn", "raise", "first", "last"]] = None,
@@ -684,8 +691,14 @@ class BacktestEngine:
             if snap is None:
                 snap = "exact"
 
+        # Eagerly materialize rebalance_dates to list so:
+        # (a) the frozen config is pickle-safe (generators aren't),
+        # (b) chained run() calls don't see an exhausted iterator.
+        rebalance_dates_list: Optional[List] = (
+            list(rebalance_dates) if rebalance_dates is not None else None
+        )
         cfg = _TargetWeightsWideConfig(
-            rebalance_dates=rebalance_dates,
+            rebalance_dates=rebalance_dates_list,
             snap=snap,
             universe_alignment=universe_alignment,
             on_collision=on_collision,
