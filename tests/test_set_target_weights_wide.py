@@ -79,21 +79,32 @@ def test_set_target_weights_wide_basic_3_symbols():
 
 
 def test_set_target_weights_wide_snap_next():
-    # Add a date NOT in data's index → snap='next' rolls forward.
+    # snap='next' should land a Saturday weight on the following Monday
+    # in the materialized schedule. Verify by inspecting the schedule
+    # adapter output directly.
+    from aiphaforge.signals import target_weight_wide_to_schedule
     data = _multi_data(symbols=("AAPL", "MSFT"))
     idx = next(iter(data.values())).index
-    # Insert a non-business-day timestamp in the wide DF index.
-    extra_idx = idx.tolist() + [pd.Timestamp("2024-01-13")]  # Saturday
-    extra_idx = pd.DatetimeIndex(sorted(extra_idx))
+    saturday = pd.Timestamp("2024-01-13")  # weekend, not in idx
+    monday = pd.Timestamp("2024-01-15")    # next business day in idx
+    assert saturday not in idx and monday in idx, "fixture invariant"
+    extra_idx = pd.DatetimeIndex(sorted(idx.tolist() + [saturday]))
     weights = pd.DataFrame(
         {"AAPL": [0.5] * len(extra_idx), "MSFT": [0.5] * len(extra_idx)},
         index=extra_idx,
     )
+    # Direct adapter check: the Saturday entry should land on Monday.
+    schedule = target_weight_wide_to_schedule(weights, data, snap="next")
+    assert monday in schedule, (
+        f"snap='next' must land Saturday weights on Monday; "
+        f"schedule keys: {sorted(schedule.keys())[:5]}..."
+    )
+    # And the engine path produces the same schedule.
     engine = BacktestEngine(initial_capital=100_000.0)
-    # Should NOT raise; snap='next' absorbs the misaligned date.
     engine.set_target_weights_wide(weights, snap="next")
-    result = engine.run(data)
-    assert result is not None
+    engine.run(data)
+    assert engine._target_weights is not None
+    assert monday in engine._target_weights
 
 
 def test_set_target_weights_wide_snap_exact_drops_non_aligned():
@@ -117,8 +128,10 @@ def test_set_target_weights_wide_snap_exact_drops_non_aligned():
 
 
 def test_set_target_weights_wide_universe_intersection():
-    # Two symbols with staggered listing dates → intersection only fires
-    # rebalance on dates present in BOTH.
+    # Staggered listings: AAPL trades on idx_a, MSFT starts later on
+    # idx_b. universe_alignment='intersection' must produce a STRICTLY
+    # SMALLER schedule than 'union' (intersection is a subset).
+    from aiphaforge.signals import target_weight_wide_to_schedule
     idx_a = pd.bdate_range("2024-01-01", periods=20)
     idx_b = pd.bdate_range("2024-01-08", periods=20)  # later listing
     data = {"AAPL": _ohlcv(idx_a), "MSFT": _ohlcv(idx_b, base=200)}
@@ -127,11 +140,19 @@ def test_set_target_weights_wide_universe_intersection():
         {"AAPL": [0.5] * len(full_idx), "MSFT": [0.5] * len(full_idx)},
         index=full_idx,
     )
-    engine = BacktestEngine(initial_capital=100_000.0)
-    engine.set_target_weights_wide(weights, universe_alignment="intersection")
-    # Should not crash; intersection narrows the rebalance set.
-    result = engine.run(data)
-    assert result is not None
+    schedule_union = target_weight_wide_to_schedule(
+        weights, data, universe_alignment="union",
+    )
+    schedule_intersect = target_weight_wide_to_schedule(
+        weights, data, universe_alignment="intersection",
+    )
+    assert len(schedule_intersect) < len(schedule_union), (
+        f"intersection must produce a smaller schedule than union; "
+        f"intersection={len(schedule_intersect)}, union={len(schedule_union)}"
+    )
+    # Only dates in BOTH symbols' valid sets remain under intersection.
+    expected_keys = set(idx_a).intersection(set(idx_b))
+    assert set(schedule_intersect.keys()) <= expected_keys
 
 
 def test_set_target_weights_wide_on_collision_raise():

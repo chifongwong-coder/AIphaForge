@@ -53,19 +53,30 @@ def test_wide_df_extends_beyond_data_truncates_no_lookahead():
 
 
 def test_wide_df_coarser_than_data_holds_via_NaN():
-    # Wide DF is monthly (1st of each month); data is daily.
-    # On non-month-end days the materialized signal is NaN → hold via the
-    # engine's NaN-as-hold contract.
+    # Wide DF is monthly (3 dates); data is daily.
+    # On non-month-end days the materialized signal must be NaN — the
+    # reindex against data's daily index introduces NaN on every bar
+    # not in the wide DF's index. The engine treats NaN as hold.
+    from aiphaforge.signals import wide_to_signal_dict
     daily_idx = pd.bdate_range("2024-01-01", periods=60)
     monthly_idx = pd.DatetimeIndex(["2024-01-02", "2024-02-01", "2024-03-01"])
     data = {"AAPL": _ohlcv(daily_idx)}
     signal = pd.DataFrame({"AAPL": [1.0, 0.0, 1.0]}, index=monthly_idx)
 
+    # Direct adapter behavior: only the 3 monthly dates carry non-NaN.
+    signal_dict = wide_to_signal_dict(signal, data)
+    aapl_signals = signal_dict["AAPL"]
+    non_nan_dates = aapl_signals.dropna().index
+    assert list(non_nan_dates) == list(monthly_idx), (
+        f"materialized signal must be non-NaN ONLY on the 3 monthly "
+        f"dates; got non-NaN on: {list(non_nan_dates)[:6]}..."
+    )
+    assert aapl_signals.isna().sum() == len(daily_idx) - 3
+
+    # End-to-end via engine: no crash, signal series propagates NaN-hold.
     engine = BacktestEngine(initial_capital=100_000.0)
     engine.set_signals_wide(signal)
-    # Should not crash; the holds-on-NaN contract carries through.
-    result = engine.run(data)
-    assert result is not None
+    engine.run(data)
 
 
 def test_wide_df_tz_aware_raises_at_setter():

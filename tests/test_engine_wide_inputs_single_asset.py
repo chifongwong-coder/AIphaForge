@@ -73,11 +73,21 @@ def test_set_score_wide_single_asset_with_threshold_rule():
 
 
 def test_set_target_weights_wide_single_asset_passthrough():
+    # Equivalence: set_target_weights_wide(1-col DF) ≡
+    # set_target_weights(target_weight_wide_to_schedule(df, {symbol: data})).
+    from aiphaforge.signals import target_weight_wide_to_schedule
     idx = pd.bdate_range("2024-01-01", periods=30)
     data = _ohlcv(idx)
     weights = pd.DataFrame({"default": [1.0] * len(idx)}, index=idx)
+    schedule = target_weight_wide_to_schedule(weights, {"default": data})
 
-    engine = BacktestEngine(initial_capital=100_000.0)
-    engine.set_target_weights_wide(weights)
-    result = engine.run(data)
-    assert result.total_return is not None
+    engine_baseline = BacktestEngine(initial_capital=100_000.0)
+    engine_baseline.set_target_weights(schedule)
+    baseline = engine_baseline.run(data)
+
+    engine_wide = BacktestEngine(initial_capital=100_000.0)
+    engine_wide.set_target_weights_wide(weights)
+    result = engine_wide.run(data)
+
+    assert result.total_return == pytest.approx(baseline.total_return, abs=1e-12)
+    assert len(result.trades) == len(baseline.trades)

@@ -62,6 +62,7 @@ def test_set_signals_wide_integration_3_symbol_60_bar():
 
 
 def test_set_score_wide_integration_with_threshold_rule_3_symbol():
+    # Equivalence vs explicit set_signals_wide(rule.transform) baseline.
     data = _multi_data()
     idx = next(iter(data.values())).index
     rng = np.random.default_rng(13)
@@ -71,15 +72,23 @@ def test_set_score_wide_integration_with_threshold_rule_3_symbol():
     )
     rule = ThresholdScoreRule(long_threshold=0.7, short_threshold=0.3)
 
+    engine_baseline = BacktestEngine(initial_capital=100_000.0)
+    engine_baseline.set_signals_wide(rule.transform(scores))
+    baseline = engine_baseline.run(data)
+
     engine = BacktestEngine(initial_capital=100_000.0)
     engine.set_score_wide(scores, rule)
     result = engine.run(data)
-    # Just verify it ran end-to-end and produced something.
-    assert result.total_return is not None
+
+    assert result.total_return == pytest.approx(baseline.total_return, abs=1e-12)
+    assert len(result.trades) == len(baseline.trades)
 
 
 def test_set_target_weights_wide_integration_quarterly_rebalance():
-    # 60 bars ≈ 3 months daily. Specify 3 quarterly-style rebalance dates.
+    # Verify rebalance_dates actually fires the schedule ONLY on those
+    # 3 dates (not every daily bar). Compare schedule key set vs the
+    # 3-element rebalance_dates list.
+    from aiphaforge.signals import target_weight_wide_to_schedule
     data = _multi_data(n=60)
     idx = next(iter(data.values())).index
     weights = pd.DataFrame(
@@ -87,12 +96,21 @@ def test_set_target_weights_wide_integration_quarterly_rebalance():
         index=idx,
     )
     rebalance_dates = [idx[0], idx[20], idx[40]]
+    schedule = target_weight_wide_to_schedule(
+        weights, data, rebalance_dates=rebalance_dates,
+    )
+    assert set(schedule.keys()) == set(rebalance_dates), (
+        f"rebalance_dates must produce schedule keys exactly matching "
+        f"the input dates; got {sorted(schedule.keys())} vs "
+        f"{sorted(rebalance_dates)}"
+    )
+    # End-to-end through the engine: same result.
     engine = BacktestEngine(initial_capital=100_000.0)
     engine.set_target_weights_wide(
         weights, rebalance_dates=rebalance_dates,
     )
-    result = engine.run(data)
-    assert result.total_return is not None
+    engine.run(data)
+    assert set(engine._target_weights.keys()) == set(rebalance_dates)
 
 
 # ---------------------------------------------------------------------------

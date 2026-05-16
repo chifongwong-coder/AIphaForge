@@ -75,6 +75,8 @@ def test_set_score_wide_with_threshold_rule_multi_asset():
 
 
 def test_set_score_wide_with_cross_sectional_rule():
+    # Equivalence: set_score_wide(scores, CrossSec) ≡
+    # set_signals_wide(CrossSec.transform(scores)).
     data = _multi_data()
     idx = next(iter(data.values())).index
     rng = np.random.default_rng(7)
@@ -84,13 +86,31 @@ def test_set_score_wide_with_cross_sectional_rule():
     )
     rule = CrossSectionalQuantileRule(long_quantile=0.33, short_quantile=0.33)
 
+    engine_baseline = BacktestEngine(initial_capital=100_000.0)
+    engine_baseline.set_signals_wide(rule.transform(scores))
+    baseline = engine_baseline.run(data)
+
     engine = BacktestEngine(initial_capital=100_000.0)
     engine.set_score_wide(scores, rule)
     result = engine.run(data)
-    # Cross-sectional ranks → at any bar, top 1/3 long, bottom 1/3 short,
-    # middle 1/3 flat. With 3 symbols: 1 long + 1 short + 1 flat.
-    # Just verify it ran without crashing and produced a non-trivial signal path.
-    assert result is not None
+
+    assert result.total_return == pytest.approx(baseline.total_return, abs=1e-12)
+    assert len(result.trades) == len(baseline.trades)
+
+
+def test_set_score_wide_cross_sectional_rule_single_column_degenerate():
+    # Coverage gap (plan §"CrossSec single-asset"): CrossSec ranks ACROSS
+    # columns per bar. A 1-col DF has nothing to rank against → output is
+    # the rule's neutral_action (default "flat" → 0) on every bar.
+    # Test pins the degenerate behavior so it doesn't silently change.
+    idx = _bdays(20)
+    scores = pd.DataFrame({"AAPL": np.linspace(0.1, 1.0, 20)}, index=idx)
+    rule = CrossSectionalQuantileRule(long_quantile=0.33, short_quantile=0.33)
+    transformed = rule.transform(scores)
+    # All values should be the neutral_action (0 by default).
+    assert (transformed.fillna(0) == 0).all().all(), (
+        f"1-col CrossSec should be all-neutral; got: {transformed.iloc[0].tolist()}"
+    )
 
 
 # ---------------------------------------------------------------------------
