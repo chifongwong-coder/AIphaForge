@@ -182,7 +182,7 @@ engine.set_target_weights_wide(weights, strict=True)
 
 v2.6 ships the `IncrementalFactor` API for stateful per-bar factor computation alongside v2.4's batch `BaseFactor`. Engine source diff: zero lines.
 
-> **`BacktestEngine` does NOT yet consume `IncrementalFactor`** in v2.6 — engine integration ships in v2.7. Users wanting to drive incremental factors today must call `factor.update(bar, state)` manually from their own code, or use `factor.run_all(data)` for batch-mode replay.
+> **`BacktestEngine` does NOT yet consume `IncrementalFactor`** in v2.6 (and v2.7 did not add it — that integration is deferred to v3.0; v2.7 widened the signal-input API instead, see the v2.7 release notes above). Users wanting to drive incremental factors today must call `factor.update(bar, state)` manually from their own code, or use `factor.run_all(data)` for batch-mode replay.
 
 **New top-level exports**:
 
