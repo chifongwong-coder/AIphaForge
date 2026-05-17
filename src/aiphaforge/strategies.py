@@ -71,16 +71,19 @@ def _transitions_only(raw: pd.Series) -> pd.Series:
 
     Kept for backward compatibility with any external caller that
     imported the private name from ``aiphaforge.strategies``.
-    Removal scheduled: v3.0.
+
+    **No removal scheduled.** Per master plan §4 anti-list item #7
+    and v2.8 cleanup decisions, this is a permanent zero-cost
+    compatibility shim: a one-line delegate with no logic of its
+    own, so any future fix to the canonical
+    ``signals.transitions_only`` is picked up automatically (no
+    two-place maintenance burden).
 
     Semantic preservation:
         NaN = hold
         0   = explicit flatten (transition)
         1   = long
         -1  = short
-
-    Internally delegates to :func:`aiphaforge.signals.transitions_only`
-    so any future fix lands in one place.
     """
     return _public_transitions_only(raw)
 

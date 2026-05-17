@@ -135,7 +135,10 @@ v2.8 is the final v2.x release. Three cleanups in service of the v2.x → v3.0 t
 This was the only non-underscore-prefixed alias in the v2.8 cleanup batch. It was deprecation-scheduled at the comment level since v2.2.1 but never emitted a runtime warning during the v2.x line, so the v2.8 deletion is your first concrete signal. Migration is a literal-text sed:
 
 ```bash
+# GNU sed (Linux):
 sed -i 's/bucket_delta_tango_ci/bucket_delta_ci/g' your_code.py
+# BSD sed (macOS):
+sed -i '' 's/bucket_delta_tango_ci/bucket_delta_ci/g' your_code.py
 ```
 
 `bucket_delta_ci` and `bucket_delta_tango_ci` always shared the same dict object during v2.x (cross-populated in `__post_init__`); the rename is semantic-equivalent.
@@ -145,19 +148,33 @@ sed -i 's/bucket_delta_tango_ci/bucket_delta_ci/g' your_code.py
 - `AttributeError: 'KnowledgeCheckReport' object has no attribute 'bucket_delta_tango_ci'` — direct attribute read.
 - `TypeError: __init__() got an unexpected keyword argument 'bucket_delta_tango_ci'` — constructor usage.
 - `TypeError: replace() got an unexpected keyword argument 'bucket_delta_tango_ci'` — `dataclasses.replace`.
-- `report.to_dict()` and `dataclasses.asdict(report)` no longer contain the key — silent. If your downstream JSON consumers grep for it, audit them now.
+- `report.to_dict()` and `dataclasses.asdict(report)` no longer contain the key — **silent**. Find affected consumers before upgrading:
+  ```bash
+  grep -rn 'bucket_delta_tango_ci' your_pipeline/
+  ```
 
-**3 underscore-prefixed aliases removed** (private by convention, low blast radius):
+**3 underscore-prefixed aliases removed** (private by convention, low blast radius). All three fail with `ImportError: cannot import name '<alias>' from 'aiphaforge.probes.orchestrator'` on direct import, or `AttributeError` on `getattr`-style access:
 
 - `aiphaforge.probes.orchestrator._BUCKET_ORDINAL_WEIGHTS` → import `LEAKAGE_INDEX_BUCKET_WEIGHTS` from the same module instead.
 - `aiphaforge.probes.orchestrator._apply_vol_scaling_to_question_set` → import `apply_vol_scaling_to_question_set` from `aiphaforge.probes._vol`.
 - `aiphaforge.probes.orchestrator._pair_scores_by_position` → use `_pair_scores_by_question_id` (qid-based pairing degrades gracefully on dropped/reordered questions; position-based silently misaligned).
 
-**`__all__` user contract** — v2.8 adds `__all__` to 30 previously-implicit module-level `.py` files, bringing every module under `aiphaforge.*` to declared-public-API status. **If you import a symbol from `aiphaforge.<module>` that is NOT in `<module>.__all__`, your code depends on an internal that may move in v3.0.** Check via:
+**`__all__` user contract** — v2.8 adds `__all__` to 30 previously-implicit module-level `.py` files. Combined with the 9 modules that already declared `__all__` (signals, signal_rules, signal_strategy, factors, factor_strategy, strategy_factors, diagnostics, factor_library, package `__init__`), **every** module under `aiphaforge.*` now has a declared public API. **If you import a symbol from `aiphaforge.<module>` that is NOT in `<module>.__all__`, your code depends on an internal that may move in v3.0.** Check via:
 
 ```python
 import aiphaforge.engine
 print(aiphaforge.engine.__all__)
+```
+
+To audit every module at once:
+
+```python
+import importlib, pkgutil, aiphaforge
+for m in pkgutil.iter_modules(aiphaforge.__path__):
+    if m.ispkg:
+        continue
+    mod = importlib.import_module(f"aiphaforge.{m.name}")
+    print(f"{m.name}: {getattr(mod, '__all__', '(NO __all__)')}")
 ```
 
 Subpackage `__init__.py` exports (`probes/__init__.py`, `alpha/__init__.py`, `calendars/__init__.py`) were already curated and are unchanged.
