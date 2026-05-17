@@ -213,20 +213,6 @@ class TestPairingFailedTag:
         assert report.anchor_validity != "REFUSAL_SUSPECTED"
 
 
-class TestDeprecatedPairScoresByPositionRemovalScheduled:
-    def test_docstring_announces_removal_in_v2_8(self):
-        # v2.2.1 Commit F set this to v2.3.0; v2.3 Commit A retargeted
-        # to v2.8.0 to match the master plan v1.0 §5 roadmap (v2.x
-        # line ends at v2.8 with v3.0 reserved for a separate major
-        # reformulation). The removal intent must remain visible in
-        # the source docstring so audit cycles don't lose it.
-        from aiphaforge.probes.orchestrator import (
-            _pair_scores_by_position,
-        )
-        doc = _pair_scores_by_position.__doc__ or ""
-        assert "Removal scheduled: v2.8.0" in doc
-
-
 class TestKnowledgeCheckPairByQid:
     def test_anchor_pairing_uses_qid_not_position(self):
         # End-to-end: real and anchor probes share qids by

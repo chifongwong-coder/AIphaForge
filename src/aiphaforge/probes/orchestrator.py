@@ -1417,29 +1417,6 @@ def _bucket_assignments(report: QAProbeReport) -> dict[str, int]:
     return dict(report.bands_breakdown)
 
 
-def _pair_scores_by_position(
-    real: QAProbeReport, anchor: QAProbeReport,
-) -> list[tuple[str, str]]:
-    """v2.2.0 legacy — pairs by positional index.
-
-    DEPRECATED in favor of :func:`_pair_scores_by_question_id`
-    (v2.2.1 #5). The position-based pairing silently misaligns when
-    either side has dropped or reordered questions; the qid-based
-    pairing degrades gracefully and surfaces a warning.
-
-    Removal scheduled: v2.8.0 (was v2.3.0; retargeted in v2.3 Commit
-    A). Kept through the v2.x line for any external caller that
-    imported the private name; the public ``knowledge_check``
-    orchestrator no longer references it. New code MUST use
-    ``_pair_scores_by_question_id``.
-    """
-    n = min(len(real.question_scores), len(anchor.question_scores))
-    return [
-        (real.question_scores[i].band, anchor.question_scores[i].band)
-        for i in range(n)
-    ]
-
-
 def _pair_scores_by_question_id(
     real: QAProbeReport, anchor: QAProbeReport,
 ) -> tuple[list[tuple[str, str]], list[str]]:
