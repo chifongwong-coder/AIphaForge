@@ -27,6 +27,24 @@ from typing import Any, Dict, List, Optional, Union
 import numpy as np
 import pandas as pd
 
+# v2.8: public surface lock.
+__all__ = [
+    "BaseImpactModel",
+    "CapacityResult",
+    "LinearImpactModel",
+    "PowerLawImpactModel",
+    "SquareRootImpactModel",
+    "close_volatility",
+    "compute_adv",
+    "compute_adv_series",
+    "corwin_schultz_spread",
+    "estimate_capacity",
+    "parkinson_volatility",
+    "parkinson_volatility_series",
+    "suggested_impact_params",
+]
+
+
 # ---------------------------------------------------------------------------
 # ABC
 # ---------------------------------------------------------------------------

@@ -11,6 +11,17 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
+# v2.8: public surface lock.
+__all__ = [
+    "Order",
+    "OrderManager",
+    "OrderSide",
+    "OrderStatus",
+    "OrderType",
+    "should_fill_limit",
+    "should_trigger_stop",
+]
+
 
 class OrderType(Enum):
     """Order type."""

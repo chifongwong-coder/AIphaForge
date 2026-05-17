@@ -2,7 +2,7 @@
 
 Commit E:
 - LEAKAGE_INDEX_BUCKET_WEIGHTS public export.
-- bucket_delta_ci canonical alias for bucket_delta_tango_ci.
+- bucket_delta_ci (canonical name for what was historically aliased).
 
 Commit G adds further pre-merge tests in this same file (Arrow dtype,
 optional pyarrow, JSON sentinel round-trip, numbered inline comma,
@@ -31,7 +31,6 @@ from aiphaforge.probes._rank import (
 from aiphaforge.probes.anchors import build_synthetic_anchor
 from aiphaforge.probes.models import AnswerRecord, AttestedAnswers
 from aiphaforge.probes.orchestrator import (
-    _BUCKET_ORDINAL_WEIGHTS,
     KnowledgeCheckReport,
     knowledge_check,
 )
@@ -86,13 +85,6 @@ class TestLeakageIndexBucketWeightsExport:
             LEAKAGE_INDEX_BUCKET_WEIGHTS, types.MappingProxyType,
         )
 
-    def test_internal_alias_points_to_same_object(self):
-        # _BUCKET_ORDINAL_WEIGHTS is the historic internal name; it
-        # must remain a reference to the same proxy so internal
-        # callers don't fork a private copy.
-        assert _BUCKET_ORDINAL_WEIGHTS is LEAKAGE_INDEX_BUCKET_WEIGHTS
-
-
 # ---------- Commit E: bucket_delta_ci alias ----------
 
 
@@ -143,17 +135,13 @@ class TestBucketDeltaCiAlias:
             provider_config=_provider_config(),
         )
 
-    def test_alias_populated_when_anchor_present(self):
+    def test_bucket_delta_ci_populated_when_anchor_present(self):
         report = self._build_report_with_anchor()
-        # Anchor is present → both fields should be populated and
-        # point to the SAME dict object (not just equal dicts).
+        # Anchor is present → bucket_delta_ci is populated.
         assert report.bucket_delta_ci is not None
-        assert report.bucket_delta_tango_ci is not None
-        assert report.bucket_delta_ci is report.bucket_delta_tango_ci
 
-    def test_alias_both_none_when_no_anchor(self):
-        # Without anchor, both should remain None — the alias only
-        # mirrors a present value.
+    def test_bucket_delta_ci_is_none_when_no_anchor(self):
+        # Without anchor, bucket_delta_ci remains None.
         data, ts = _multi_data()
         probe = RankContinuationProbe(
             symbols=["A", "B", "C"], context_bars=5,
@@ -177,135 +165,6 @@ class TestBucketDeltaCiAlias:
             provider_config=_provider_config(),
         )
         assert report.bucket_delta_ci is None
-        assert report.bucket_delta_tango_ci is None
-
-    def test_bucket_delta_ci_mutation_shows_in_tango_alias(self):
-        # v2.2.1 audit-fix Commit J: pin the documented shared-
-        # reference semantics. The two field names point at the
-        # SAME dict object — mutating one (against the documented
-        # "read-only" advice) must show up in the other. The
-        # existing test_alias_populated_when_anchor_present asserts
-        # `is`-identity; this test exercises the contract via an
-        # actual mutation so a future regression that switches
-        # __post_init__ to `dict(...)` (copy) is caught.
-        report = self._build_report_with_anchor()
-        assert report.bucket_delta_ci is not None
-        before = dict(report.bucket_delta_ci)
-        # Mutate via the canonical name.
-        report.bucket_delta_ci["__probe__"] = (9.0, 9.0)
-        # The historic name reflects it.
-        assert report.bucket_delta_tango_ci is not None
-        assert report.bucket_delta_tango_ci["__probe__"] == (9.0, 9.0)
-        # Clean up so we don't pollute report state for any
-        # later assertion in the build helper's shared fixture.
-        del report.bucket_delta_ci["__probe__"]
-        assert dict(report.bucket_delta_ci) == before
-
-    def test_alias_back_fills_historic_name_from_canonical(self):
-        # Forward-compat: if a downstream caller produces a report
-        # carrying only the canonical bucket_delta_ci (e.g., a v2.2.2
-        # path that drops the "tango" suffix), __post_init__ should
-        # back-fill bucket_delta_tango_ci so existing readers keep
-        # working. Use dataclasses.replace to trigger __post_init__
-        # on a fully-populated report.
-        import dataclasses
-        base = self._build_report_with_anchor()
-        ci = base.bucket_delta_ci
-        # Clear the historic name; expect back-fill via post-init.
-        replaced = dataclasses.replace(
-            base,
-            bucket_delta_tango_ci=None,
-            bucket_delta_ci=ci,
-        )
-        assert replaced.bucket_delta_ci is ci
-        assert replaced.bucket_delta_tango_ci is ci
-
-
-class TestBucketDeltaCiAliasInvariant:
-    """v2.2.2 Commit E: hard-enforce the shared-reference invariant.
-
-    The docstring promises both alias fields always point at the same
-    dict object. v2.2.1's __post_init__ cross-populated only when
-    exactly one side was None; constructing with two distinct dicts
-    silently violated the invariant.
-    """
-
-    def _valid_base(self) -> KnowledgeCheckReport:
-        # Build a real valid report so we can use dataclasses.replace
-        # to construct test states.
-        data, ts = _multi_data()
-        probe = RankContinuationProbe(
-            symbols=["A", "B", "C"], context_bars=5,
-            forward_horizon=1,
-        )
-        qs = probe.build(data, [ts])
-        qid = list(qs)[0].question_id
-        real = AttestedAnswers(
-            answers=(AnswerRecord(
-                question_id=qid, raw_answer=None,
-                parsed_answer=["A", "B", "C"],
-                parse_status="valid",
-            ),),
-            parsing_schema_hash="a" * 64,
-            parsing_schema_description="x",
-            prompt_template_hash="b" * 64,
-            prompt_template_description="y",
-        )
-        from aiphaforge.probes.anchors import build_synthetic_anchor
-        anchor_data = {
-            sym: build_synthetic_anchor(
-                df, seed=1, method="random_walk_volmatched",
-            )
-            for sym, df in data.items()
-        }
-        anchor_qs = probe.build(anchor_data, [ts])
-        anchor_qid = list(anchor_qs)[0].question_id
-        anchor_truth = list(anchor_qs)[0].truth_value
-        anchor_attested = AttestedAnswers(
-            answers=(AnswerRecord(
-                question_id=anchor_qid, raw_answer=None,
-                parsed_answer=list(anchor_truth),
-                parse_status="valid",
-            ),),
-            parsing_schema_hash="a" * 64,
-            parsing_schema_description="x",
-            prompt_template_hash="b" * 64,
-            prompt_template_description="y",
-        )
-        return knowledge_check(
-            probe, data, [ts], real,
-            anchor=anchor_data["A"],
-            anchor_answers=anchor_attested,
-            provider_config=_provider_config(),
-        )
-
-    def test_distinct_dicts_for_both_fields_raises_valueerror(self):
-        import dataclasses
-        base = self._valid_base()
-        d1 = {"exact": (-0.1, 0.2)}
-        d2 = {"exact": (-0.5, 0.5)}  # DIFFERENT dict object
-        with pytest.raises(ValueError) as exc_info:
-            dataclasses.replace(
-                base,
-                bucket_delta_ci=d1,
-                bucket_delta_tango_ci=d2,
-            )
-        # Error message points at the v2.3 migration path.
-        assert "bucket_delta_ci" in str(exc_info.value)
-        assert "bucket_delta_tango_ci" in str(exc_info.value)
-
-    def test_same_dict_for_both_fields_is_accepted(self):
-        import dataclasses
-        base = self._valid_base()
-        shared = {"exact": (-0.1, 0.2)}
-        # Same object identity → no exception.
-        replaced = dataclasses.replace(
-            base,
-            bucket_delta_ci=shared,
-            bucket_delta_tango_ci=shared,
-        )
-        assert replaced.bucket_delta_ci is shared
-        assert replaced.bucket_delta_tango_ci is shared
 
 
 # ---------- Commit G: Arrow dtype acceptance in _is_sequence_of_str ----------

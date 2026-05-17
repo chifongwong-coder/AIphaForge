@@ -8,6 +8,12 @@ import pandas as pd
 
 from .fees import BaseFeeModel
 
+# v2.8: public surface lock.
+__all__ = [
+    "BaseTradeCost",
+    "DefaultTradeCost",
+]
+
 
 class BaseTradeCost:
     """Abstract base for vectorized trade cost calculation.

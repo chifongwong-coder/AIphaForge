@@ -126,6 +126,69 @@ The Q&A pillar (v2.2 `knowledge_check`) is **non-transitive** with the obfuscati
 
 Every `KnowledgeCheckReport.notes` carries this warning verbatim. Reports are intentionally not aggregated into a single 🟢/🟡/🔴 verdict — `KnowledgeCheckReport.is_pillar_summary` is `False` and the `__post_init__` rejects any attempt to flip it.
 
+#### v2.8 release notes — Cleanup + Public API Lock
+
+v2.8 is the final v2.x release. Three cleanups in service of the v2.x → v3.0 transition: (1) hard-delete all 4 deprecated aliases scheduled for v2.8; (2) lock the public `__all__` surface on 30 previously-implicit module APIs; (3) draft a private v3.0 deprecation roadmap. Engine source diff: zero lines.
+
+**Headline breaking change — `KnowledgeCheckReport.bucket_delta_tango_ci` removed**
+
+This was the only non-underscore-prefixed alias in the v2.8 cleanup batch. It was deprecation-scheduled at the comment level since v2.2.1 but never emitted a runtime warning during the v2.x line, so the v2.8 deletion is your first concrete signal. Migration is a literal-text sed:
+
+```bash
+# GNU sed (Linux):
+sed -i 's/bucket_delta_tango_ci/bucket_delta_ci/g' your_code.py
+# BSD sed (macOS):
+sed -i '' 's/bucket_delta_tango_ci/bucket_delta_ci/g' your_code.py
+```
+
+`bucket_delta_ci` and `bucket_delta_tango_ci` always shared the same dict object during v2.x (cross-populated in `__post_init__`); the rename is semantic-equivalent.
+
+**Failure modes** (so you can pattern-match if your upgrade breaks):
+
+- `AttributeError: 'KnowledgeCheckReport' object has no attribute 'bucket_delta_tango_ci'` — direct attribute read.
+- `TypeError: __init__() got an unexpected keyword argument 'bucket_delta_tango_ci'` — constructor usage.
+- `TypeError: replace() got an unexpected keyword argument 'bucket_delta_tango_ci'` — `dataclasses.replace`.
+- `report.to_dict()` and `dataclasses.asdict(report)` no longer contain the key — **silent**. Find affected consumers before upgrading:
+  ```bash
+  grep -rn 'bucket_delta_tango_ci' your_pipeline/
+  ```
+
+**3 underscore-prefixed aliases removed** (private by convention, low blast radius). All three fail with `ImportError: cannot import name '<alias>' from 'aiphaforge.probes.orchestrator'` on direct import, or `AttributeError` on `getattr`-style access:
+
+- `aiphaforge.probes.orchestrator._BUCKET_ORDINAL_WEIGHTS` → import `LEAKAGE_INDEX_BUCKET_WEIGHTS` from the same module instead.
+- `aiphaforge.probes.orchestrator._apply_vol_scaling_to_question_set` → import `apply_vol_scaling_to_question_set` from `aiphaforge.probes._vol`.
+- `aiphaforge.probes.orchestrator._pair_scores_by_position` → use `_pair_scores_by_question_id` (qid-based pairing degrades gracefully on dropped/reordered questions; position-based silently misaligned).
+
+**`__all__` user contract** — v2.8 adds `__all__` to 30 previously-implicit module-level `.py` files. Combined with the 9 modules that already declared `__all__` (signals, signal_rules, signal_strategy, factors, factor_strategy, strategy_factors, diagnostics, factor_library, package `__init__`), **every** module under `aiphaforge.*` now has a declared public API. **If you import a symbol from `aiphaforge.<module>` that is NOT in `<module>.__all__`, your code depends on an internal that may move in v3.0.** Check via:
+
+```python
+import aiphaforge.engine
+print(aiphaforge.engine.__all__)
+```
+
+To audit every module at once:
+
+```python
+import importlib, pkgutil, aiphaforge
+for m in pkgutil.iter_modules(aiphaforge.__path__):
+    if m.ispkg:
+        continue
+    mod = importlib.import_module(f"aiphaforge.{m.name}")
+    print(f"{m.name}: {getattr(mod, '__all__', '(NO __all__)')}")
+```
+
+Subpackage `__init__.py` exports (`probes/__init__.py`, `alpha/__init__.py`, `calendars/__init__.py`) were already curated and are unchanged.
+
+**Explicit non-change callout: `BaseStrategy._compute(df)` is NOT deprecated.** Earlier drafts of the v2.x roadmap considered soft-deprecating it; that decision was reversed during v2.8 planning. `_compute` and `generate_signals` form a deliberate two-layer override surface (single-asset hook + multi-asset dispatch), not alternatives. Both are permanent public API.
+
+**What v2.8 does NOT include**:
+
+- Any new functionality. v2.8 is cleanup only.
+- IncrementalFactor engine integration (deferred to v3.0).
+- StrategyNode 5-class consolidation (deferred to v3.0).
+- `dict[str, Series]` → wide DataFrame default migration (deferred to v3.0).
+- Any DeprecationWarning emissions — v2.8 alias removals are hard deletes; the README and resulting AttributeError / TypeError are your only signals.
+
 #### v2.7 release notes — Engine Signal-Input Widening
 
 v2.7 adds three wide-DataFrame entry points to `BacktestEngine` that route through the v2.3 / v2.4 adapters internally. The existing `set_signals(...)` contract (Series / dict[str, Series] only) is preserved. Per-bar engine loop diff: zero lines.
@@ -298,7 +361,7 @@ v2.3 establishes the **Signal Layer** as a first-class abstraction without touch
 
 `SignalSpec` / `SignalFrame` typed wrappers are deferred from the original v2.3 scope to **v2.4** alongside the factor layer — they earn their keep when factor → rule → signal pipelines need typed metadata flowing through the stack.
 
-**Internal**: the four backward-compat aliases (`_BUCKET_ORDINAL_WEIGHTS`, `bucket_delta_tango_ci` field, `_apply_vol_scaling_to_question_set` re-export, `_pair_scores_by_position`) had their removal-version annotations updated from v2.3.0 to **v2.8.0** to match the revised v2.x → v3.0 roadmap (v2.x line ends at v2.8 cleanup; v3.0 reserved for a separate major reformulation).
+**Internal**: the four backward-compat aliases (`_BUCKET_ORDINAL_WEIGHTS`, `bucket_delta_tango_ci` field, `_apply_vol_scaling_to_question_set` re-export, `_pair_scores_by_position`) had their removal-version annotations updated from v2.3.0 to **v2.8.0** to match the revised v2.x → v3.0 roadmap. All four were hard-deleted in v2.8 cleanup — see v2.8 release notes above for the migration paths.
 
 `BacktestEngine` source diff: zero lines. The v2.3 release adds parallel API surface only.
 
@@ -309,7 +372,7 @@ v2.3 establishes the **Signal Layer** as a first-class abstraction without touch
 
 #### v2.2.1 patch additions
 - **`LEAKAGE_INDEX_BUCKET_WEIGHTS`** public export (`MappingProxyType`, immutable) — paper authors should import the locked weights instead of transcribing the literals so citations track the version-locked schedule (changing the weights requires a `__version__` bump per § 14).
-- **`bucket_delta_ci`** as the canonical name for `bucket_delta_tango_ci`. The historic name was misleading (the implementation is Wald-style with a sentinel-on-zero-width fallback, not real Tango). Both fields are populated to the same dict; `bucket_delta_tango_ci` is `Removal scheduled: v2.3.0`. Real Tango lands in v2.2.2.
+- **`bucket_delta_ci`** as the canonical name (the v2.2.1-historic `_tango_ci`-suffixed alias was hard-deleted in v2.8 — see v2.8 release notes above). The historic name was misleading: the implementation is Wald-style with a sentinel-on-zero-width fallback, not real Tango. Real Tango lands in v2.2.2.
 - **`anchor_validity`** typed as `Literal["NO_ANCHOR", "OK", "REFUSAL_SUSPECTED", "PAIRING_FAILED"]` (was bare `str`). `PAIRING_FAILED` is a new tag distinct from `REFUSAL_SUSPECTED` — the former fires when the real-side and anchor-side question_id sets do not overlap, the latter when one side's effective rate is much lower than the other.
 - **`parser_used_distribution_real` / `_anchor`** typed `Mapping[str, int]` fields on `KnowledgeCheckReport` (rank probes only) — per-side `Counter` of which parser path resolved each `AnswerRecord` (e.g., `user_provided_list`, `json_array`, `numbered`, `raw_text_unparseable`). When the distribution is non-degenerate (different parser paths fired across the probe set), a drift-note appears in `notes` pointing readers at `manifest.provider_config` to check for prompt-template churn.
 - **Structured-input refusal carve-out**: when `AnswerRecord.parsed_answer` is a `RankAnswer` / `Sequence[str]` / dict-with-ranking AND `parse_status == "valid"`, `compute_effective_rate` and `compute_refusal_rate` skip the refusal heuristic on `raw_answer` (the user already did the parsing work; the engine's refusal heuristic is moot for them).

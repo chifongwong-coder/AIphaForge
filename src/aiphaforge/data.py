@@ -28,6 +28,12 @@ _OHLCV_ALIASES = {
 
 _DATE_HINTS = ["date", "time", "datetime", "timestamp", "dt", "trade_date"]
 
+# v2.8: public surface lock.
+__all__ = [
+    "load_csv",
+    "load_yahoo",
+]
+
 
 def load_csv(
     path: str,

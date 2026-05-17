@@ -15,6 +15,9 @@ Event-driven mode only. Vectorized mode has no per-bar hook mechanism.
 
 from typing import Any, Dict, List, Optional, Set
 
+# v2.8: public surface lock.
+__all__ = ["MetaContext"]
+
 
 class MetaContext:
     """Mutable config proxy for Agent control within a bar.

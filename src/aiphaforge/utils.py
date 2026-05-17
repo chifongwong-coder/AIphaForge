@@ -13,6 +13,24 @@ import pandas as pd
 # Standard number of trading days per year for stock markets
 TRADING_DAYS_STOCK: int = 252
 
+# v2.8: public surface lock.
+__all__ = [
+    "TRADING_DAYS_STOCK",
+    "annualize",
+    "annualize_return",
+    "build_secondary_lookup",
+    "build_unified_timeline",
+    "calculate_returns",
+    "calculate_trade_metrics",
+    "compute_buy_and_hold",
+    "ensure_datetime_index",
+    "extract_trades_vectorized",
+    "max_drawdown",
+    "sharpe_ratio",
+    "sortino_ratio",
+    "validate_ohlcv",
+]
+
 
 def _resolve_trading_days(
     trading_days: Union[int, Dict[str, int]],

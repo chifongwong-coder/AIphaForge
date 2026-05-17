@@ -13,6 +13,14 @@ import pandas as pd
 from .broker import Broker
 from .portfolio import Portfolio
 
+# v2.8: public surface lock.
+__all__ = [
+    "BaseExitRule",
+    "PercentageStopLoss",
+    "PercentageTakeProfit",
+    "TrailingStopLoss",
+]
+
 
 class BaseExitRule:
     """Abstract base for exit rules (stop-loss, take-profit, etc.).

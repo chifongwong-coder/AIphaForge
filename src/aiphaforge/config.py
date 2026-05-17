@@ -18,6 +18,13 @@ from .fees import BaseFeeModel, SimpleFeeModel
 from .hooks import BacktestHook
 from .position_sizing import BasePositionSizer, FractionSizer
 
+# v2.8: public surface lock.
+__all__ = [
+    "BacktestConfig",
+    "TurnoverConfig",
+    "resolve_config",
+]
+
 
 @dataclass
 class BacktestConfig:

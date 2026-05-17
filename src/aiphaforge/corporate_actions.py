@@ -18,6 +18,9 @@ import pandas as pd
 
 from .hooks import BacktestHook, HookContext
 
+# v2.8: public surface lock.
+__all__ = ["CorporateActionHook"]
+
 
 class CorporateActionHook(BacktestHook):
     """Process dividends and stock splits during backtesting.

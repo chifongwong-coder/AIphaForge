@@ -114,6 +114,6 @@ class TestReportCarriesWarning:
 
 class TestVersion:
     def test_version_is_current_release(self):
-        # Updated by v2.7.0 minor bump (Engine Signal-Input Widening).
+        # Updated by v2.8.0 minor bump (Cleanup + Public API Lock).
         import aiphaforge
-        assert aiphaforge.__version__ == "2.7.0"
+        assert aiphaforge.__version__ == "2.8.0"

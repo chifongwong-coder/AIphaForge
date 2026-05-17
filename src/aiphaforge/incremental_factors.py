@@ -21,6 +21,17 @@ from typing import ClassVar, Tuple
 import numpy as np
 import pandas as pd
 
+# v2.8: public surface lock.
+__all__ = [
+    "FactorState",
+    "IncrementalFactor",
+    "MomentumIncremental",
+    "RSIIncremental",
+    "RollingMeanIncremental",
+    "RollingStdIncremental",
+    "VolumeZScoreIncremental",
+]
+
 
 @dataclass
 class FactorState:

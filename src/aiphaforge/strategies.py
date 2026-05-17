@@ -38,22 +38,52 @@ from .indicators import (
 
 _LOG = logging.getLogger(__name__)
 
+# v2.8: public surface lock. `_transitions_only` is the historical
+# private alias for signals.transitions_only — intentionally OMITTED
+# from __all__ but retained as a `_`-prefixed module symbol per
+# master plan §8 (zero-cost alias kept forever).
+__all__ = [
+    "ADXTrendFollowing",
+    "BaseStrategy",
+    "BollingerBreakout",
+    "ConditionalSwitch",
+    "DonchianBreakout",
+    "IchimokuStrategy",
+    "MACDStrategy",
+    "MACrossover",
+    "MeanReversionBollinger",
+    "MomentumRank",
+    "MultiIndicatorStrategy",
+    "PairsTrading",
+    "PriorityCascade",
+    "RSIMeanReversion",
+    "SelectBest",
+    "StrategyNode",
+    "SupertrendStrategy",
+    "VWAPReversion",
+    "VoteEnsemble",
+    "WeightedBlend",
+]
+
 
 def _transitions_only(raw: pd.Series) -> pd.Series:
     """v2.3 Commit C: thin alias for ``signals.transitions_only``.
 
     Kept for backward compatibility with any external caller that
     imported the private name from ``aiphaforge.strategies``.
-    Removal scheduled: v3.0.
+
+    **No removal scheduled.** Per master plan §4 anti-list item #7
+    and v2.8 cleanup decisions, this is a permanent zero-cost
+    compatibility shim: a one-line delegate with no logic of its
+    own, so any future fix to the canonical
+    ``signals.transitions_only`` is picked up automatically (no
+    two-place maintenance burden).
 
     Semantic preservation:
         NaN = hold
         0   = explicit flatten (transition)
         1   = long
         -1  = short
-
-    Internally delegates to :func:`aiphaforge.signals.transitions_only`
-    so any future fix lands in one place.
     """
     return _public_transitions_only(raw)
 

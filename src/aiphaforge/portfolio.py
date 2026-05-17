@@ -12,6 +12,12 @@ import pandas as pd
 from .orders import Order
 from .results import EquityPoint, PositionSnapshot, Trade
 
+# v2.8: public surface lock.
+__all__ = [
+    "Portfolio",
+    "Position",
+]
+
 
 @dataclass
 class Position:

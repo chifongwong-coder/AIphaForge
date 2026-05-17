@@ -15,6 +15,14 @@ from .fees import BaseFeeModel, SimpleFeeModel
 from .orders import Order, OrderManager, OrderSide, OrderType, should_fill_limit, should_trigger_stop
 from .portfolio import Portfolio
 
+# v2.8: public surface lock.
+__all__ = [
+    "Broker",
+    "FillModel",
+    "SimpleBroker",
+    "SlippageModel",
+]
+
 
 class FillModel(Enum):
     """Fill price model."""

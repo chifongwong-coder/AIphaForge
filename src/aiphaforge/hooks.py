@@ -21,6 +21,22 @@ import pandas as pd
 from .portfolio import Portfolio
 from .portfolio_optimizer import BasePortfolioOptimizer
 
+# v2.8: public surface lock.
+__all__ = [
+    "BacktestHook",
+    "BandRebalanceHook",
+    "CostAwareRebalanceHook",
+    "DriftRebalanceHook",
+    "HookContext",
+    "LifecycleContext",
+    "OptimizedRebalanceHook",
+    "ScheduleHook",
+    "SecondaryTimeframe",
+    "call_hook_lifecycle_end",
+    "call_hook_lifecycle_start",
+    "schedule_rebalance",
+]
+
 
 @dataclass
 class SecondaryTimeframe:

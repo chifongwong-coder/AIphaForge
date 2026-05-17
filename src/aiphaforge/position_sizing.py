@@ -4,6 +4,15 @@ Position Sizing
 Pluggable position sizing strategies for the backtest engine.
 """
 
+# v2.8: public surface lock.
+__all__ = [
+    "AllInSizer",
+    "BasePositionSizer",
+    "FixedSizer",
+    "FractionSizer",
+]
+
+
 class BasePositionSizer:
     """Abstract base for position sizing.
 

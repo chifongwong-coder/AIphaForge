@@ -28,6 +28,7 @@ from aiphaforge.probes._rank import (
     resolve_rank_answer,
     score_rank_answer,
 )
+from aiphaforge.probes._vol import apply_vol_scaling_to_question_set
 from aiphaforge.probes.models import (
     AnswerRecord,
     AttestedAnswers,
@@ -486,24 +487,17 @@ _PERSISTENCE_CAVEAT = (
 # backed constant. Paper authors should `from aiphaforge.probes
 # import LEAKAGE_INDEX_BUCKET_WEIGHTS` rather than transcribing the
 # numeric literals — that way the citation tracks the locked weights
-# across releases. The underscored name remains as a backward-compat
-# alias for existing internal callers.
-#
-# v2.3 Commit A (was v2.2.1 Commit I, retargeted): Removal scheduled:
-# v2.8.0. Internal callers should migrate to
-# ``LEAKAGE_INDEX_BUCKET_WEIGHTS``; the private alias is retained
-# through the v2.x line and removed in v2.8 cleanup.
+# across releases.
 LEAKAGE_INDEX_BUCKET_WEIGHTS: Mapping[str, float] = MappingProxyType({
     "exact": 4.0, "near": 3.0, "rough": 2.0, "miss": 1.0, "invalid": 0.0,
 })
-_BUCKET_ORDINAL_WEIGHTS = LEAKAGE_INDEX_BUCKET_WEIGHTS
 _LEAKAGE_INDEX_CAVEAT = (
     "scalar_leakage_index is a point estimate with hardcoded "
     "ordinal weighting (exact=4, near=3, rough=2, miss=1, "
     "invalid=0). Range [-4, +4]. SE accounts for paired correlation "
     "via per-question differences. Approximate significance: |z| >= "
     "1.96 corresponds to two-sided p < 0.05. For full inferential "
-    "rigor, see bucket_delta_tango_ci. COMPARABILITY: comparable "
+    "rigor, see bucket_delta_ci. COMPARABILITY: comparable "
     "WITHIN a single probe type AND configuration. NOT comparable "
     "across probe types or across ToleranceProfile configurations "
     "even within the same probe type, because bucket calibration "
@@ -698,21 +692,6 @@ def _score_rank_attested(
     return report, counter
 
 
-# v2.2.1 audit-fix Commit D: _apply_vol_scaling_to_question_set
-# moved to _vol.py (canonical home). Re-exported under the old
-# private name as a backward-compat alias. noqa: E402 — late
-# import is intentional to keep the rest of orchestrator.py's
-# import block at the top.
-#
-# v2.3 Commit A (was v2.2.1 Commit I, retargeted): Removal scheduled:
-# v2.8.0. Internal callers should migrate to
-# ``aiphaforge.probes._vol.apply_vol_scaling_to_question_set``; the
-# underscored re-export is retained through the v2.x line.
-from aiphaforge.probes._vol import (  # noqa: E402
-    apply_vol_scaling_to_question_set as _apply_vol_scaling_to_question_set,
-)
-
-
 def _compute_scalar_leakage_index_and_z(
     paired_bands: list[tuple[str, str]],
 ) -> tuple[Optional[float], Optional[float], Union[
@@ -731,8 +710,8 @@ def _compute_scalar_leakage_index_and_z(
     if n == 0:
         return None, None, None
     diffs = [
-        _BUCKET_ORDINAL_WEIGHTS.get(rb, 0.0)
-        - _BUCKET_ORDINAL_WEIGHTS.get(ab, 0.0)
+        LEAKAGE_INDEX_BUCKET_WEIGHTS.get(rb, 0.0)
+        - LEAKAGE_INDEX_BUCKET_WEIGHTS.get(ab, 0.0)
         for rb, ab in paired_bands
     ]
     index = sum(diffs) / n
@@ -768,19 +747,9 @@ class KnowledgeCheckReport:
     real_score: QAProbeReport
     anchor_score: Optional[QAProbeReport]
     bucket_delta: Optional[dict[str, float]]
-    # v2.2.1 audit-fix Commit E: ``bucket_delta_tango_ci`` is the
-    # historic field name but the implementation is Wald-style with a
-    # sentinel-on-zero-width fallback (see ``tango_paired_diff_ci``);
-    # the "tango" suffix is misleading. ``bucket_delta_ci`` is the
-    # canonical name going forward. Both fields are populated to the
-    # same dict in ``__post_init__`` so v2.2.0/v2.2.1 callers keep
-    # working. Real Tango lands in v2.2.2.
-    #
-    # v2.3 Commit A (was v2.2.1 Commit I, retargeted): Removal
-    # scheduled: v2.8.0. The canonical name is ``bucket_delta_ci``;
-    # migrate readers accordingly. The two names will continue to
-    # share the same dict object across the v2.x line.
-    bucket_delta_tango_ci: Optional[dict[str, tuple[float, float]]]
+    # bucket_delta_ci field declared below. The historic
+    # "_tango_ci"-suffixed alias added v2.2.1 was hard-deleted in
+    # v2.8 cleanup; external reads must migrate to bucket_delta_ci.
 
     # Paired sign test (per quant Q3 r2 — replaces Wilcoxon)
     paired_sign_test_p: Optional[float]
@@ -827,7 +796,7 @@ class KnowledgeCheckReport:
 
     # v2.2.1 #7: scalar leakage index + paired SE + z (typed
     # sentinel for SE==0). Range [-4, +4]. Point estimate; for
-    # inference use bucket_delta_tango_ci. Computed for ALL
+    # inference use bucket_delta_ci. Computed for ALL
     # probe types (KnowledgeProbe, ContinuationProbe,
     # RankContinuationProbe). None when no anchor.
     scalar_leakage_index: Optional[float] = None
@@ -851,18 +820,9 @@ class KnowledgeCheckReport:
     parser_used_distribution_real: Optional["Mapping[str, int]"] = None
     parser_used_distribution_anchor: Optional["Mapping[str, int]"] = None
 
-    # v2.2.1 audit-fix Commit E: canonical alias for
-    # ``bucket_delta_tango_ci``. Cross-populated in __post_init__
-    # so users can adopt the honest name without touching call sites
-    # that already read the historic name.
-    #
-    # Shared-reference semantics: ``bucket_delta_ci`` and
-    # ``bucket_delta_tango_ci`` are populated with the SAME dict
-    # object, not a copy. Mutating one is visible through the other.
-    # This is intentional — copying would let the two views silently
-    # desync under in-place updates, which is worse for a
-    # transitional alias. Treat both names as read-only and do not
-    # mutate either dict in place.
+    # v2.2.1 introduced this as the canonical name (the historic
+    # "_tango_ci"-suffixed alias was hard-deleted v2.8).
+    # Treat as read-only — do not mutate the dict in place.
     bucket_delta_ci: Optional[dict[str, tuple[float, float]]] = None
 
     # v2.2.1 #1: vol-scaling provenance keyed by (question_id, side).
@@ -953,40 +913,9 @@ class KnowledgeCheckReport:
                 self, "parser_used_distribution_anchor",
                 MappingProxyType(dict(self.parser_used_distribution_anchor)),
             )
-        # v2.2.1 audit-fix Commit E: cross-populate the canonical
-        # ``bucket_delta_ci`` alias and the historic
-        # ``bucket_delta_tango_ci`` so either field is non-None when
-        # the other is. The alias is structural — both names point
-        # at the same dict object.
-        if (self.bucket_delta_ci is None
-                and self.bucket_delta_tango_ci is not None):
-            object.__setattr__(
-                self, "bucket_delta_ci", self.bucket_delta_tango_ci,
-            )
-        elif (self.bucket_delta_tango_ci is None
-                and self.bucket_delta_ci is not None):
-            object.__setattr__(
-                self, "bucket_delta_tango_ci", self.bucket_delta_ci,
-            )
-        # v2.2.2 Commit E: enforce the shared-reference invariant.
-        # The docstring (lines 855-864) promises both fields are
-        # ALWAYS the same dict object. The cross-population above
-        # only fires when exactly one side is None. A caller that
-        # constructs the dataclass with TWO DISTINCT non-None dicts
-        # (legal under the type hints) silently violates the
-        # invariant, after which downstream reads through the two
-        # names diverge. Detect and raise.
-        elif (self.bucket_delta_ci is not None
-                and self.bucket_delta_tango_ci is not None
-                and self.bucket_delta_ci is not self.bucket_delta_tango_ci):
-            raise ValueError(
-                "bucket_delta_ci and bucket_delta_tango_ci must be the "
-                "same dict object (alias). Pass only ONE of the two "
-                "fields at construction time; __post_init__ "
-                "cross-populates the other. The historic "
-                "_tango_ci suffix is being removed in v2.8.0; new "
-                "code should use bucket_delta_ci only."
-            )
+        # v2.8: removed v2.2.1 cross-population logic for the
+        # historic "_tango_ci"-suffixed alias; bucket_delta_ci is
+        # now the only name.
 
 
 # ---------- knowledge_check orchestrator ----------
@@ -1019,7 +948,7 @@ def knowledge_check(
     to per-bucket Tango CIs + paired sign test; the bootstrap loop
     was never implemented and the parameters shipped as misleading
     API surface. Inferential primitives are now: per-bucket Tango
-    CIs (``bucket_delta_tango_ci``), paired sign test
+    CIs (``bucket_delta_ci``), paired sign test
     (``paired_sign_test_p``), and the new scalar ``scalar_leakage_index``
     + ``scalar_leakage_index_z`` per § 7.2.
 
@@ -1087,7 +1016,7 @@ def knowledge_check(
     # (question_id, side) so anchor-side rewrite (below) doesn't
     # collide.
     vol_scale_provenance: dict[str, dict[str, dict[str, Any]]] = {}
-    question_set, real_vol_prov = _apply_vol_scaling_to_question_set(
+    question_set, real_vol_prov = apply_vol_scaling_to_question_set(
         probe, question_set, data,
     )
     for qid, prov in real_vol_prov.items():
@@ -1151,7 +1080,7 @@ def knowledge_check(
         # ANCHOR sigma, not real sigma. Both sides go through
         # the same rewrite path with their own data.
         anchor_qs, anchor_vol_prov = (
-            _apply_vol_scaling_to_question_set(
+            apply_vol_scaling_to_question_set(
                 probe, anchor_qs, anchor,
             )
         )
@@ -1380,7 +1309,7 @@ def knowledge_check(
         real_score=real_report,
         anchor_score=anchor_report,
         bucket_delta=bucket_delta,
-        bucket_delta_tango_ci=bucket_delta_ci,
+        bucket_delta_ci=bucket_delta_ci,
         paired_sign_test_p=sign_test_p_val,
         paired_sign_test_n_positive=sign_test_n_pos,
         paired_sign_test_n_negative=sign_test_n_neg,
@@ -1436,29 +1365,6 @@ def _probe_kind(probe: ProbeT) -> str:
 
 def _bucket_assignments(report: QAProbeReport) -> dict[str, int]:
     return dict(report.bands_breakdown)
-
-
-def _pair_scores_by_position(
-    real: QAProbeReport, anchor: QAProbeReport,
-) -> list[tuple[str, str]]:
-    """v2.2.0 legacy — pairs by positional index.
-
-    DEPRECATED in favor of :func:`_pair_scores_by_question_id`
-    (v2.2.1 #5). The position-based pairing silently misaligns when
-    either side has dropped or reordered questions; the qid-based
-    pairing degrades gracefully and surfaces a warning.
-
-    Removal scheduled: v2.8.0 (was v2.3.0; retargeted in v2.3 Commit
-    A). Kept through the v2.x line for any external caller that
-    imported the private name; the public ``knowledge_check``
-    orchestrator no longer references it. New code MUST use
-    ``_pair_scores_by_question_id``.
-    """
-    n = min(len(real.question_scores), len(anchor.question_scores))
-    return [
-        (real.question_scores[i].band, anchor.question_scores[i].band)
-        for i in range(n)
-    ]
 
 
 def _pair_scores_by_question_id(
