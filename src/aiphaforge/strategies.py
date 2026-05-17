@@ -38,6 +38,33 @@ from .indicators import (
 
 _LOG = logging.getLogger(__name__)
 
+# v2.8: public surface lock. `_transitions_only` is the historical
+# private alias for signals.transitions_only — intentionally OMITTED
+# from __all__ but retained as a `_`-prefixed module symbol per
+# master plan §8 (zero-cost alias kept forever).
+__all__ = [
+    "ADXTrendFollowing",
+    "BaseStrategy",
+    "BollingerBreakout",
+    "ConditionalSwitch",
+    "DonchianBreakout",
+    "IchimokuStrategy",
+    "MACDStrategy",
+    "MACrossover",
+    "MeanReversionBollinger",
+    "MomentumRank",
+    "MultiIndicatorStrategy",
+    "PairsTrading",
+    "PriorityCascade",
+    "RSIMeanReversion",
+    "SelectBest",
+    "StrategyNode",
+    "SupertrendStrategy",
+    "VWAPReversion",
+    "VoteEnsemble",
+    "WeightedBlend",
+]
+
 
 def _transitions_only(raw: pd.Series) -> pd.Series:
     """v2.3 Commit C: thin alias for ``signals.transitions_only``.
