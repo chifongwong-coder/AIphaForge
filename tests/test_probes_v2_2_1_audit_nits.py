@@ -208,23 +208,11 @@ class TestRankProbeIdempotency:
 
 class TestVolScalingHelperLocation:
     def test_apply_vol_scaling_lives_in_vol_module(self):
-        # Architectural review found _apply_vol_scaling_to_question_set
-        # in orchestrator.py was probe-typed transform code in the
-        # wrong module. Commit D moves it to _vol.py (canonical home).
+        # Architectural review (v2.2.1 audit-fix Commit D) found
+        # apply_vol_scaling_to_question_set in orchestrator.py was
+        # probe-typed transform code in the wrong module. Moved it
+        # to _vol.py as the canonical home; v2.8 dropped the
+        # orchestrator-side backward-compat alias entirely.
         from aiphaforge.probes import _vol
         assert hasattr(_vol, "apply_vol_scaling_to_question_set")
 
-    def test_orchestrator_alias_still_works(self):
-        # Backward-compat: the private orchestrator alias still
-        # imports + calls correctly.
-        from aiphaforge.probes._vol import (
-            apply_vol_scaling_to_question_set,
-        )
-        from aiphaforge.probes.orchestrator import (
-            _apply_vol_scaling_to_question_set,
-        )
-        # Same callable
-        assert (
-            _apply_vol_scaling_to_question_set
-            is apply_vol_scaling_to_question_set
-        )

@@ -28,6 +28,7 @@ from aiphaforge.probes._rank import (
     resolve_rank_answer,
     score_rank_answer,
 )
+from aiphaforge.probes._vol import apply_vol_scaling_to_question_set
 from aiphaforge.probes.models import (
     AnswerRecord,
     AttestedAnswers,
@@ -691,21 +692,6 @@ def _score_rank_attested(
     return report, counter
 
 
-# v2.2.1 audit-fix Commit D: _apply_vol_scaling_to_question_set
-# moved to _vol.py (canonical home). Re-exported under the old
-# private name as a backward-compat alias. noqa: E402 — late
-# import is intentional to keep the rest of orchestrator.py's
-# import block at the top.
-#
-# v2.3 Commit A (was v2.2.1 Commit I, retargeted): Removal scheduled:
-# v2.8.0. Internal callers should migrate to
-# ``aiphaforge.probes._vol.apply_vol_scaling_to_question_set``; the
-# underscored re-export is retained through the v2.x line.
-from aiphaforge.probes._vol import (  # noqa: E402
-    apply_vol_scaling_to_question_set as _apply_vol_scaling_to_question_set,
-)
-
-
 def _compute_scalar_leakage_index_and_z(
     paired_bands: list[tuple[str, str]],
 ) -> tuple[Optional[float], Optional[float], Union[
@@ -1080,7 +1066,7 @@ def knowledge_check(
     # (question_id, side) so anchor-side rewrite (below) doesn't
     # collide.
     vol_scale_provenance: dict[str, dict[str, dict[str, Any]]] = {}
-    question_set, real_vol_prov = _apply_vol_scaling_to_question_set(
+    question_set, real_vol_prov = apply_vol_scaling_to_question_set(
         probe, question_set, data,
     )
     for qid, prov in real_vol_prov.items():
@@ -1144,7 +1130,7 @@ def knowledge_check(
         # ANCHOR sigma, not real sigma. Both sides go through
         # the same rewrite path with their own data.
         anchor_qs, anchor_vol_prov = (
-            _apply_vol_scaling_to_question_set(
+            apply_vol_scaling_to_question_set(
                 probe, anchor_qs, anchor,
             )
         )
