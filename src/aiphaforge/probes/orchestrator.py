@@ -497,7 +497,7 @@ _LEAKAGE_INDEX_CAVEAT = (
     "invalid=0). Range [-4, +4]. SE accounts for paired correlation "
     "via per-question differences. Approximate significance: |z| >= "
     "1.96 corresponds to two-sided p < 0.05. For full inferential "
-    "rigor, see bucket_delta_tango_ci. COMPARABILITY: comparable "
+    "rigor, see bucket_delta_ci. COMPARABILITY: comparable "
     "WITHIN a single probe type AND configuration. NOT comparable "
     "across probe types or across ToleranceProfile configurations "
     "even within the same probe type, because bucket calibration "
@@ -747,19 +747,9 @@ class KnowledgeCheckReport:
     real_score: QAProbeReport
     anchor_score: Optional[QAProbeReport]
     bucket_delta: Optional[dict[str, float]]
-    # v2.2.1 audit-fix Commit E: ``bucket_delta_tango_ci`` is the
-    # historic field name but the implementation is Wald-style with a
-    # sentinel-on-zero-width fallback (see ``tango_paired_diff_ci``);
-    # the "tango" suffix is misleading. ``bucket_delta_ci`` is the
-    # canonical name going forward. Both fields are populated to the
-    # same dict in ``__post_init__`` so v2.2.0/v2.2.1 callers keep
-    # working. Real Tango lands in v2.2.2.
-    #
-    # v2.3 Commit A (was v2.2.1 Commit I, retargeted): Removal
-    # scheduled: v2.8.0. The canonical name is ``bucket_delta_ci``;
-    # migrate readers accordingly. The two names will continue to
-    # share the same dict object across the v2.x line.
-    bucket_delta_tango_ci: Optional[dict[str, tuple[float, float]]]
+    # bucket_delta_ci field declared below. The historic
+    # "_tango_ci"-suffixed alias added v2.2.1 was hard-deleted in
+    # v2.8 cleanup; external reads must migrate to bucket_delta_ci.
 
     # Paired sign test (per quant Q3 r2 — replaces Wilcoxon)
     paired_sign_test_p: Optional[float]
@@ -806,7 +796,7 @@ class KnowledgeCheckReport:
 
     # v2.2.1 #7: scalar leakage index + paired SE + z (typed
     # sentinel for SE==0). Range [-4, +4]. Point estimate; for
-    # inference use bucket_delta_tango_ci. Computed for ALL
+    # inference use bucket_delta_ci. Computed for ALL
     # probe types (KnowledgeProbe, ContinuationProbe,
     # RankContinuationProbe). None when no anchor.
     scalar_leakage_index: Optional[float] = None
@@ -830,18 +820,9 @@ class KnowledgeCheckReport:
     parser_used_distribution_real: Optional["Mapping[str, int]"] = None
     parser_used_distribution_anchor: Optional["Mapping[str, int]"] = None
 
-    # v2.2.1 audit-fix Commit E: canonical alias for
-    # ``bucket_delta_tango_ci``. Cross-populated in __post_init__
-    # so users can adopt the honest name without touching call sites
-    # that already read the historic name.
-    #
-    # Shared-reference semantics: ``bucket_delta_ci`` and
-    # ``bucket_delta_tango_ci`` are populated with the SAME dict
-    # object, not a copy. Mutating one is visible through the other.
-    # This is intentional — copying would let the two views silently
-    # desync under in-place updates, which is worse for a
-    # transitional alias. Treat both names as read-only and do not
-    # mutate either dict in place.
+    # v2.2.1 introduced this as the canonical name (the historic
+    # "_tango_ci"-suffixed alias was hard-deleted v2.8).
+    # Treat as read-only — do not mutate the dict in place.
     bucket_delta_ci: Optional[dict[str, tuple[float, float]]] = None
 
     # v2.2.1 #1: vol-scaling provenance keyed by (question_id, side).
@@ -932,40 +913,9 @@ class KnowledgeCheckReport:
                 self, "parser_used_distribution_anchor",
                 MappingProxyType(dict(self.parser_used_distribution_anchor)),
             )
-        # v2.2.1 audit-fix Commit E: cross-populate the canonical
-        # ``bucket_delta_ci`` alias and the historic
-        # ``bucket_delta_tango_ci`` so either field is non-None when
-        # the other is. The alias is structural — both names point
-        # at the same dict object.
-        if (self.bucket_delta_ci is None
-                and self.bucket_delta_tango_ci is not None):
-            object.__setattr__(
-                self, "bucket_delta_ci", self.bucket_delta_tango_ci,
-            )
-        elif (self.bucket_delta_tango_ci is None
-                and self.bucket_delta_ci is not None):
-            object.__setattr__(
-                self, "bucket_delta_tango_ci", self.bucket_delta_ci,
-            )
-        # v2.2.2 Commit E: enforce the shared-reference invariant.
-        # The docstring (lines 855-864) promises both fields are
-        # ALWAYS the same dict object. The cross-population above
-        # only fires when exactly one side is None. A caller that
-        # constructs the dataclass with TWO DISTINCT non-None dicts
-        # (legal under the type hints) silently violates the
-        # invariant, after which downstream reads through the two
-        # names diverge. Detect and raise.
-        elif (self.bucket_delta_ci is not None
-                and self.bucket_delta_tango_ci is not None
-                and self.bucket_delta_ci is not self.bucket_delta_tango_ci):
-            raise ValueError(
-                "bucket_delta_ci and bucket_delta_tango_ci must be the "
-                "same dict object (alias). Pass only ONE of the two "
-                "fields at construction time; __post_init__ "
-                "cross-populates the other. The historic "
-                "_tango_ci suffix is being removed in v2.8.0; new "
-                "code should use bucket_delta_ci only."
-            )
+        # v2.8: removed v2.2.1 cross-population logic for the
+        # historic "_tango_ci"-suffixed alias; bucket_delta_ci is
+        # now the only name.
 
 
 # ---------- knowledge_check orchestrator ----------
@@ -998,7 +948,7 @@ def knowledge_check(
     to per-bucket Tango CIs + paired sign test; the bootstrap loop
     was never implemented and the parameters shipped as misleading
     API surface. Inferential primitives are now: per-bucket Tango
-    CIs (``bucket_delta_tango_ci``), paired sign test
+    CIs (``bucket_delta_ci``), paired sign test
     (``paired_sign_test_p``), and the new scalar ``scalar_leakage_index``
     + ``scalar_leakage_index_z`` per § 7.2.
 
@@ -1359,7 +1309,7 @@ def knowledge_check(
         real_score=real_report,
         anchor_score=anchor_report,
         bucket_delta=bucket_delta,
-        bucket_delta_tango_ci=bucket_delta_ci,
+        bucket_delta_ci=bucket_delta_ci,
         paired_sign_test_p=sign_test_p_val,
         paired_sign_test_n_positive=sign_test_n_pos,
         paired_sign_test_n_negative=sign_test_n_neg,

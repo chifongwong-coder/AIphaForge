@@ -428,7 +428,7 @@ class TestKnowledgeCheckWithAnchor:
         if report.anchor_validity == "OK":
             assert report.bucket_delta is not None
             assert "exact" in report.bucket_delta
-            assert report.bucket_delta_tango_ci is not None
+            assert report.bucket_delta_ci is not None
 
     def test_refusal_suspected_when_anchor_all_refusals(self):
         data = _make_real_data(n=80)
