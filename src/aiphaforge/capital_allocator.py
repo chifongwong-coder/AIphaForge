@@ -17,6 +17,15 @@ any change to the core event loop or budget-cap logic.
 
 from typing import Any, Dict, Optional
 
+# v2.8: public surface lock.
+__all__ = [
+    "BaseCapitalAllocator",
+    "EqualWeightAllocator",
+    "FixedWeightAllocator",
+    "MarginAllocator",
+    "ProRataAllocator",
+]
+
 
 class BaseCapitalAllocator:
     """Abstract base for capital allocation strategies.

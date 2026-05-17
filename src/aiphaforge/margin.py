@@ -16,6 +16,17 @@ from typing import Any, Dict, Optional, Set
 
 from .orders import OrderStatus
 
+# v2.8: public surface lock.
+__all__ = [
+    "BasePortfolioExitRule",
+    "BorrowingCostModel",
+    "FundingRateModel",
+    "MarginCallExitRule",
+    "MarginConfig",
+    "PeriodicCostModel",
+]
+
+
 # ---------------------------------------------------------------------------
 # MarginConfig
 # ---------------------------------------------------------------------------

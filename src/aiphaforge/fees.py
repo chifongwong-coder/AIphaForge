@@ -12,6 +12,19 @@ from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Optional
 
+# v2.8: public surface lock.
+__all__ = [
+    "BaseFeeModel",
+    "ChinaAShareFeeModel",
+    "CryptoFuturesFeeModel",
+    "CryptoSpotFeeModel",
+    "MarketType",
+    "SimpleFeeModel",
+    "USStockFeeModel",
+    "ZeroFeeModel",
+    "get_fee_model",
+]
+
 
 class MarketType(Enum):
     """Market type."""
