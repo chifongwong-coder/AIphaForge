@@ -55,6 +55,17 @@ from .utils import (
     sortino_ratio as calc_sortino,
 )
 
+# v2.8: public surface lock. Anything not listed here is internal and
+# may move in v3.0. `_TargetWeightsWideConfig` (v2.7) is deliberately
+# excluded as a private implementation detail; tests that need it
+# import it explicitly.
+__all__ = [
+    "BacktestEngine",
+    "ExecutionMode",
+    "PositionSizing",
+    "backtest",
+]
+
 
 @dataclass(frozen=True)
 class _TargetWeightsWideConfig:

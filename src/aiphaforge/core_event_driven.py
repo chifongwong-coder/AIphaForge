@@ -25,6 +25,10 @@ from .meta import MetaContext
 from .portfolio import Portfolio
 from .utils import build_secondary_lookup, build_unified_timeline, calculate_returns
 
+# v2.8: public surface lock.
+__all__ = ["run_event_driven"]
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------

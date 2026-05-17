@@ -12,6 +12,9 @@ import pandas as pd
 from .config import BacktestConfig
 from .utils import extract_trades_vectorized
 
+# v2.8: public surface lock.
+__all__ = ["run_vectorized"]
+
 
 def _apply_stop_loss(rule, returns: pd.Series, positions: pd.Series,
                       data: pd.DataFrame):

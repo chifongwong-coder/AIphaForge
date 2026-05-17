@@ -28,6 +28,14 @@ from .hooks import (
 )
 from .orders import Order
 
+# v2.8: public surface lock.
+__all__ = [
+    "LatencyHook",
+    "SimpleLatencyHook",
+    "SymbolRoutingLatencyHook",
+]
+
+
 # ---------------------------------------------------------------------------
 # Internal broker proxy
 # ---------------------------------------------------------------------------
