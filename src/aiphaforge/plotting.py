@@ -14,6 +14,12 @@ from typing import Any, Dict, Optional
 
 import pandas as pd
 
+# v2.8: public surface lock.
+__all__ = [
+    "plot_comparison",
+    "plot_result",
+]
+
 
 def _get_plt():
     """Import matplotlib with Agg backend. Raises ImportError if missing."""

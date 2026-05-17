@@ -17,6 +17,15 @@ from typing import Dict
 import numpy as np
 import pandas as pd
 
+# v2.8: public surface lock.
+__all__ = [
+    "AD", "ADX", "ATR", "BBANDS", "CCI", "CMF", "DEMA", "DONCHIAN",
+    "EMA", "ICHIMOKU", "KELTNER", "MACD", "MFI", "OBV", "PSAR", "ROC",
+    "RSI", "SMA", "STOCH", "STOCHRSI", "SUPERTREND", "TEMA", "VWAP",
+    "WILLR", "WMA",
+]
+
+
 # ---------------------------------------------------------------------------
 # Trend
 # ---------------------------------------------------------------------------
