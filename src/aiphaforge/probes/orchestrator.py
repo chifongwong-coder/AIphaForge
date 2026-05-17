@@ -486,17 +486,10 @@ _PERSISTENCE_CAVEAT = (
 # backed constant. Paper authors should `from aiphaforge.probes
 # import LEAKAGE_INDEX_BUCKET_WEIGHTS` rather than transcribing the
 # numeric literals — that way the citation tracks the locked weights
-# across releases. The underscored name remains as a backward-compat
-# alias for existing internal callers.
-#
-# v2.3 Commit A (was v2.2.1 Commit I, retargeted): Removal scheduled:
-# v2.8.0. Internal callers should migrate to
-# ``LEAKAGE_INDEX_BUCKET_WEIGHTS``; the private alias is retained
-# through the v2.x line and removed in v2.8 cleanup.
+# across releases.
 LEAKAGE_INDEX_BUCKET_WEIGHTS: Mapping[str, float] = MappingProxyType({
     "exact": 4.0, "near": 3.0, "rough": 2.0, "miss": 1.0, "invalid": 0.0,
 })
-_BUCKET_ORDINAL_WEIGHTS = LEAKAGE_INDEX_BUCKET_WEIGHTS
 _LEAKAGE_INDEX_CAVEAT = (
     "scalar_leakage_index is a point estimate with hardcoded "
     "ordinal weighting (exact=4, near=3, rough=2, miss=1, "
@@ -731,8 +724,8 @@ def _compute_scalar_leakage_index_and_z(
     if n == 0:
         return None, None, None
     diffs = [
-        _BUCKET_ORDINAL_WEIGHTS.get(rb, 0.0)
-        - _BUCKET_ORDINAL_WEIGHTS.get(ab, 0.0)
+        LEAKAGE_INDEX_BUCKET_WEIGHTS.get(rb, 0.0)
+        - LEAKAGE_INDEX_BUCKET_WEIGHTS.get(ab, 0.0)
         for rb, ab in paired_bands
     ]
     index = sum(diffs) / n

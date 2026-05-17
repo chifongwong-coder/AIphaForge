@@ -31,7 +31,6 @@ from aiphaforge.probes._rank import (
 from aiphaforge.probes.anchors import build_synthetic_anchor
 from aiphaforge.probes.models import AnswerRecord, AttestedAnswers
 from aiphaforge.probes.orchestrator import (
-    _BUCKET_ORDINAL_WEIGHTS,
     KnowledgeCheckReport,
     knowledge_check,
 )
@@ -85,13 +84,6 @@ class TestLeakageIndexBucketWeightsExport:
         assert isinstance(
             LEAKAGE_INDEX_BUCKET_WEIGHTS, types.MappingProxyType,
         )
-
-    def test_internal_alias_points_to_same_object(self):
-        # _BUCKET_ORDINAL_WEIGHTS is the historic internal name; it
-        # must remain a reference to the same proxy so internal
-        # callers don't fork a private copy.
-        assert _BUCKET_ORDINAL_WEIGHTS is LEAKAGE_INDEX_BUCKET_WEIGHTS
-
 
 # ---------- Commit E: bucket_delta_ci alias ----------
 
