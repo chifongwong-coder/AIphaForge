@@ -10,6 +10,15 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 
+# v2.8: public surface lock.
+__all__ = [
+    "BacktestResult",
+    "EquityPoint",
+    "PositionSnapshot",
+    "Trade",
+    "trades_to_dataframe",
+]
+
 
 @dataclass
 class Trade:

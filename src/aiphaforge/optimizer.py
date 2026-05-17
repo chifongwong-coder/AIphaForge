@@ -27,6 +27,14 @@ import pandas as pd
 from .engine import BacktestEngine
 from .results import BacktestResult
 
+# v2.8: public surface lock.
+__all__ = [
+    "BayesianResult",
+    "optimize",
+    "optimize_bayesian",
+    "walk_forward",
+]
+
 
 def optimize(
     data: Union[pd.DataFrame, Dict[str, pd.DataFrame]],

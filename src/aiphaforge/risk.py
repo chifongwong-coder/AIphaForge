@@ -12,6 +12,18 @@ from typing import Dict, List, Optional
 
 import pandas as pd
 
+# v2.8: public surface lock.
+__all__ = [
+    "BaseRiskManager",
+    "BaseRiskRule",
+    "CompositeRiskManager",
+    "ConcentrationLimit",
+    "DailyLossLimit",
+    "ExposureLimit",
+    "MaxDrawdownHalt",
+    "RiskSignal",
+]
+
 
 @dataclass
 class RiskSignal:

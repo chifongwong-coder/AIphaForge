@@ -27,6 +27,16 @@ from typing import Dict, Optional
 import numpy as np
 import pandas as pd
 
+# v2.8: public surface lock.
+__all__ = [
+    "BasePortfolioOptimizer",
+    "EqualWeightOptimizer",
+    "InverseVolatilityOptimizer",
+    "MeanVarianceOptimizer",
+    "MinimumVarianceOptimizer",
+    "RiskParityOptimizer",
+]
+
 
 class BasePortfolioOptimizer(ABC):
     """Abstract base class for portfolio optimizers.

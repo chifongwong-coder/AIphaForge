@@ -45,6 +45,26 @@ import pandas as pd
 from . import utils
 from .results import BacktestResult
 
+# v2.8: public surface lock.
+__all__ = [
+    "BootstrapResult",
+    "CorrectionResult",
+    "DSRResult",
+    "MonteCarloResult",
+    "PSRResult",
+    "PermutationResult",
+    "bootstrap_ci",
+    "bootstrap_metrics",
+    "build_returns_matrix",
+    "deflated_sharpe_ratio",
+    "generate_paths",
+    "monte_carlo_test",
+    "multiple_comparison_correction",
+    "permutation_test",
+    "probabilistic_sharpe_ratio",
+]
+
+
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------

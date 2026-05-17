@@ -25,6 +25,13 @@ from .utils import (
     sortino_ratio as calc_sortino,
 )
 
+# v2.8: public surface lock.
+__all__ = [
+    "PerformanceAnalyzer",
+    "analyze",
+    "compare_strategies",
+]
+
 
 class PerformanceAnalyzer:
     """
