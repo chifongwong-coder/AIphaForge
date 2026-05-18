@@ -83,6 +83,12 @@ select = ["E", "F", "W", "I"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v"
+# v2.8.1: silence the tango_paired_diff_ci deprecation alias inside
+# probes.orchestrator so CI output isn't drowned. v2.9 hard-removes
+# the alias and this filter.
+filterwarnings = [
+    "ignore::DeprecationWarning:aiphaforge.probes.orchestrator",
+]
 
 [tool.mypy]
 python_version = "3.10"

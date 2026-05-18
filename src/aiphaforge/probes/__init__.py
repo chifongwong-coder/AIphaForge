@@ -74,7 +74,8 @@ from aiphaforge.probes.orchestrator import (
     knowledge_check,
     looks_like_refusal,
     sign_test_p,
-    tango_paired_diff_ci,
+    tango_paired_diff_ci,  # v2.8.1: deprecation alias; v2.9 removes.
+    wald_paired_diff_ci,
 )
 from aiphaforge.probes.questions import (
     DEFAULT_TEMPLATES,
@@ -163,7 +164,8 @@ __all__ = [
     "parse_rank_answer",
     "resolve_rank_answer",
     "sign_test_p",
-    "tango_paired_diff_ci",
+    "tango_paired_diff_ci",  # v2.8.1: deprecation alias; v2.9 removes.
+    "wald_paired_diff_ci",
     "score_rank_answer",
     "tie_corrected_spearman",
     "build_question_set",

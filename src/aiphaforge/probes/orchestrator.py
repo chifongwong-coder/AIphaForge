@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import math
 import uuid
+import warnings
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -213,7 +214,7 @@ def _phi(z: float) -> float:
 # ---------- Tango (1998) paired score interval ----------
 
 
-def tango_paired_diff_ci(
+def wald_paired_diff_ci(
     n_both: int,
     n_real_only: int,
     n_anchor_only: int,
@@ -226,27 +227,25 @@ def tango_paired_diff_ci(
     p1 = (n_both + n_real_only) / N         # real success rate
     p2 = (n_both + n_anchor_only) / N       # anchor success rate
 
+    Equivalent to PropCIs::diffpropci.Wald.mp (R reference).
+    Numerically equivalent; implementation uses bisection over delta
+    rather than closed-form, but variance is delta-independent so
+    outputs match exactly.
+
     Implementation: bisection over delta ∈ [-1, 1] for which the
     score statistic for H0: p1 - p2 = delta is within the critical
     region. The variance estimator uses the standard discordant-
     cell formula (does NOT depend on delta).
 
-    KNOWN LIMITATION (v2.2.1 #3 follow-up): the implementation is
-    a Wald approximation, NOT Tango (1998) Method 10's true
-    constrained-MLE score CI. The function name is preserved for
-    backward API compatibility; v2.2.2 will swap in the proper
-    Tango implementation once the PropCIs::scoreci.mp R-source
-    reference fixture is generated. Per the v2.2.1 r7 plan, that
-    requires R + PropCIs which were not available in the v2.2.1
-    implementation environment. Documented as a v2.2.2 follow-up.
-
-    Practically: the Wald CI is conservative-vs-Tango (slightly
-    wider intervals) when the discordant-pair count is small
-    relative to N. For paper-grade rigor, users should additionally
-    run R/PropCIs::scoreci.mp on their (n_both, n_real_only,
-    n_anchor_only, n_neither) tables and compare. Until v2.2.2
-    ships the proper Tango implementation, this function provides
-    a reasonable approximation; do NOT cite it as Tango (1998).
+    HISTORICAL NOTE: v2.2.1 introduced this function as
+    ``tango_paired_diff_ci``. v2.8.1 renamed it to
+    ``wald_paired_diff_ci`` to match what it actually computes.
+    The Wald CI is conservative-vs-Tango (slightly wider intervals)
+    when the discordant-pair count is small relative to N. For
+    paper-grade rigor, users should additionally run
+    R/PropCIs::scoreci.mp on their (n_both, n_real_only,
+    n_anchor_only, n_neither) tables and compare. Do NOT cite this
+    function as implementing Tango (1998).
 
     Edge cases:
       - N = 0: raises ValueError (cannot CI an empty bucket).
@@ -258,7 +257,7 @@ def tango_paired_diff_ci(
     n = n_both + n_real_only + n_anchor_only + n_neither
     if n == 0:
         raise ValueError(
-            "tango_paired_diff_ci: empty bucket (N=0)"
+            "wald_paired_diff_ci: empty bucket (N=0)"
         )
     if n_real_only == 0 and n_anchor_only == 0:
         # Perfect agreement → point CI at zero
@@ -305,6 +304,23 @@ def tango_paired_diff_ci(
     else:
         upper_ci = _bisect(_stat_squared_minus_z, lo2, hi2)
     return float(max(-1.0, lower_ci)), float(min(1.0, upper_ci))
+
+
+def tango_paired_diff_ci(*args, **kwargs):
+    """Deprecated since v2.8.1; renamed to ``wald_paired_diff_ci``.
+
+    The implementation is unchanged (Wald-style, not Tango 1998
+    method 10). Hard removal scheduled for v2.9 (the final v2.x
+    release).
+    """
+    warnings.warn(
+        "tango_paired_diff_ci is deprecated since v2.8.1; rename to "
+        "wald_paired_diff_ci. The implementation is unchanged "
+        "(Wald-style, not Tango 1998 method 10). Hard removal: v2.9.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return wald_paired_diff_ci(*args, **kwargs)
 
 
 def _bisect(f, lo: float, hi: float, tol: float = 1e-9,
@@ -1191,7 +1207,7 @@ def knowledge_check(
                 )
                 if (n_both + n_real_only
                         + n_anchor_only + n_neither) > 0:
-                    bucket_delta_ci[bucket] = tango_paired_diff_ci(
+                    bucket_delta_ci[bucket] = wald_paired_diff_ci(
                         n_both, n_real_only, n_anchor_only, n_neither,
                     )
                 else:
@@ -1462,5 +1478,6 @@ __all__ = [
     "knowledge_check",
     "looks_like_refusal",
     "sign_test_p",
-    "tango_paired_diff_ci",
+    "tango_paired_diff_ci",  # v2.8.1: deprecation alias; v2.9 removes.
+    "wald_paired_diff_ci",
 ]
