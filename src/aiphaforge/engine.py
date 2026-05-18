@@ -176,6 +176,8 @@ class BacktestEngine:
         impact_vol_lookback: int = 20,
         trading_days: Union[int, Dict[str, int]] = TRADING_DAYS_STOCK,
         portfolio_trading_days: Optional[int] = None,
+        representative_notional: Optional[float] = None,
+        representative_size: Optional[float] = None,
     ):
         # Fee model
         if isinstance(fee_model, str):
@@ -338,6 +340,12 @@ class BacktestEngine:
         )
         self._trade_cost = DefaultTradeCost()
         self._position_sizer = self._create_position_sizer()
+
+        # v2.8.1: representative trade size for vectorized cost estimation.
+        # User-passed values win; otherwise derived from the sizer in
+        # _build_config() at run time.
+        self.representative_notional = representative_notional
+        self.representative_size = representative_size
 
         # Internal state
         self._strategy = None
@@ -1431,6 +1439,11 @@ class BacktestEngine:
         if self.mode == ExecutionMode.VECTORIZED:
             self._warn_vectorized_unsupported()
 
+        # v2.8.1: resolve representative notional/size for vectorized
+        # cost estimation. User-passed engine kwargs win; otherwise
+        # derive from the sizer.
+        rep_notional, rep_size = self._resolve_representative_trade()
+
         return BacktestConfig(
             initial_capital=self.initial_capital,
             fee_model=self.fee_model,
@@ -1474,7 +1487,32 @@ class BacktestEngine:
             impact_model=self.impact_model,
             impact_adv_lookback=self.impact_adv_lookback,
             impact_vol_lookback=self.impact_vol_lookback,
+            representative_notional=rep_notional,
+            representative_size=rep_size,
         )
+
+    def _resolve_representative_trade(self):
+        """Resolve (representative_notional, representative_size) for
+        vectorized cost estimation.
+
+        Q3 precedence: user-passed engine kwargs win. Otherwise dispatch
+        on the sizer type — Fraction/AllIn → notional via
+        ``initial_capital * min(fraction, max_position_size)`` (per
+        ``position_sizing.py``'s effective allocation); Fixed → size;
+        anything else → both None (apply_vectorized then takes the
+        zero-cost-warned degenerate branch).
+        """
+        if self.representative_notional is not None:
+            return self.representative_notional, self.representative_size
+        sizer = self._position_sizer
+        if isinstance(sizer, (FractionSizer, AllInSizer)):
+            notional = self.initial_capital * min(
+                sizer.fraction, self.max_position_size
+            )
+            return notional, None
+        if isinstance(sizer, FixedSizer):
+            return None, sizer.size
+        return None, None
 
     def _build_result(
         self,
