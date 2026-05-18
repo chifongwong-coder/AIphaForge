@@ -1030,6 +1030,7 @@ __all__ = [
     "score_answer_file",
     "score_attested_answers",
     "score_question",
+    "serialize_answer_records",
 ]
 
 

@@ -1559,6 +1559,7 @@ def _compute_persistence_baseline_report(
 
 __all__ = [
     "KnowledgeCheckReport",
+    "LEAKAGE_INDEX_BUCKET_WEIGHTS",
     "compute_effective_rate",
     "compute_refusal_rate",
     "knowledge_check",

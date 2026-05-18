@@ -1734,5 +1734,6 @@ __all__ = [
     "MACrossBaseline",
     "MeanRevBaseline",
     "MomentumBaseline",
+    "resolve_determinism_config",
     "run_ab_probe",
 ]

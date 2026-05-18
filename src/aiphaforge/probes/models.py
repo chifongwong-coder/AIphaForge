@@ -16,6 +16,33 @@ from typing import TYPE_CHECKING, Any, Literal, Optional, Sequence, TypedDict
 if TYPE_CHECKING:
     import pandas as pd
 
+# v2.8.1 H8: public surface lock.
+__all__ = [
+    "ABProbeResult",
+    "ABScenario",
+    "AgentContract",
+    "AgentImplementationContract",
+    "AnswerKeyRecord",
+    "AnswerRecord",
+    "AttestedAnswers",
+    "ContextSerializationSpec",
+    "DeterminismCheckResult",
+    "ExemplarSpec",
+    "MetricConfig",
+    "MetricDropSummary",
+    "QAProbeReport",
+    "QuestionPromptRecord",
+    "QuestionScore",
+    "QuestionSpec",
+    "RECOMMENDED_PROVIDER_CONFIG_KEYS",
+    "ResolvedDeterminismConfig",
+    "ScenarioABReport",
+    "TemplateAggregate",
+    "ToleranceProfile",
+    "UnsupportedScenarioError",
+    "VolScalingSpec",
+]
+
 # `AgentContract` describes what kind of orders the agent emits in a
 # scenario; this controls which transforms are admissible in
 # `view_only` mode (price-specific orders require invertible level
