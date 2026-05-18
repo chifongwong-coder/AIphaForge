@@ -1369,7 +1369,20 @@ class BacktestEngine:
     # risk_rules (via apply_vectorized_all), trade_cost (apply_vectorized),
     # signal_transform, and allow_short. Everything else listed here is
     # silently dropped — surface that to the user.
+    # v2.8.1 H3: expanded from 7 to 21 entries after a line-by-line audit
+    # of core_vectorized.py. The new entries fall into 4 buckets:
+    #   - portfolio-shape: fill_model, max_position_size, session_end_time,
+    #     immediate_fill_price, fee_allocation
+    #   - multi-asset: capital_allocator (H4 — special-cased), asset_fee_models,
+    #     asset_fill_models, asset_max_position_pcts, asset_lot_sizes
+    #   - per-asset limits / lots: lot_size, max_position_pct
+    #   - portfolio-level rules: portfolio_exit_rules, asset_margin_configs
+    # Note: vectorized DOES honor stop_loss (via stop_loss_rule),
+    # risk_rules (via apply_vectorized_all), trade_cost (apply_vectorized),
+    # signal_transform, and allow_short. max_position_size is partially
+    # honored — see _warn_vectorized_max_position_size_partial (H4 / FR-G2).
     _VECTORIZED_UNSUPPORTED_FIELDS: Tuple[str, ...] = (
+        # v2.8.0 (7):
         "take_profit",
         "trailing_stop_rule",
         "impact_model",
@@ -1377,7 +1390,50 @@ class BacktestEngine:
         "periodic_cost_model",
         "turnover_config",
         "risk_manager",
+        # v2.8.1 (14):
+        "fill_model",
+        "max_position_size",  # special partial-honor message
+        "session_end_time",
+        "immediate_fill_price",
+        "fee_allocation",
+        "capital_allocator",  # special divergence message
+        "asset_fee_models",
+        "asset_fill_models",
+        "asset_max_position_pcts",
+        "asset_lot_sizes",
+        "lot_size",
+        "max_position_pct",
+        "portfolio_exit_rules",
+        "asset_margin_configs",
     )
+
+    def _warn_vectorized_capital_allocator_divergence(self) -> None:
+        """v2.8.1 H4 — special message for capital_allocator.
+
+        Vectorized multi-asset uses a static equal-weight split; the
+        capital_allocator is silently ignored. This produces wrong PnL
+        for users who set up dynamic allocators.
+        """
+        warnings.warn(
+            "vectorized multi-asset mode uses static equal-weight "
+            f"capital split; your capital_allocator="
+            f"{type(self.capital_allocator).__name__} is ignored. Switch "
+            "to mode='event_driven' for dynamic per-bar allocation."
+        )
+
+    def _warn_vectorized_max_position_size_partial(self) -> None:
+        """v2.8.1 FR-G2 — special message for max_position_size.
+
+        Vectorized mode uses max_position_size only for representative
+        cost-estimation sizing via the position_sizer (per v2.8.1 H1).
+        Explicit per-bar position clamping requires event-driven mode.
+        """
+        warnings.warn(
+            "vectorized mode uses max_position_size only for "
+            "cost-estimation sizing via the position_sizer (per "
+            "v2.8.1 H1); explicit per-bar position clamping requires "
+            "mode='event_driven'."
+        )
 
     def _warn_vectorized_unsupported(self) -> None:
         """Warn when vectorized mode is given config it silently ignores.
@@ -1408,15 +1464,29 @@ class BacktestEngine:
                 "Switch to mode='event_driven' to honor sizing config."
             )
 
-        # Per-field warnings for the rest.
+        # Per-field warnings for the rest. Field-specific dispatchers
+        # take precedence over the generic message.
+        special = {
+            "capital_allocator": self._warn_vectorized_capital_allocator_divergence,
+            "max_position_size": self._warn_vectorized_max_position_size_partial,
+        }
         for field in self._VECTORIZED_UNSUPPORTED_FIELDS:
             default = init_defaults.get(field)
             value = getattr(self, field, default)
+            # Fields stored with `X or {}` / `X or []` normalization
+            # show up as {} / [] in self even when the user passed
+            # None. Treat empty collections as "not configured".
+            if isinstance(value, (dict, list)) and not value:
+                continue
             if value != default:
-                warnings.warn(
-                    f"vectorized mode ignores {field}={value!r}; "
-                    "switch to mode='event_driven' to honor it."
-                )
+                handler = special.get(field)
+                if handler is not None:
+                    handler()
+                else:
+                    warnings.warn(
+                        f"vectorized mode ignores {field}={value!r}; "
+                        "switch to mode='event_driven' to honor it."
+                    )
 
     def _build_config(
         self,
