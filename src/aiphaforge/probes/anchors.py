@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import math
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
@@ -202,12 +202,30 @@ def _build_ohlcv_from_returns(
     real_data: pd.DataFrame,
     *,
     label: str,
+    hl_spread_source: str = "real_bar_ratio",
+    spread_rng: Optional[np.random.Generator] = None,
 ) -> pd.DataFrame:
     """Integrate a return series into an OHLCV DataFrame matching
-    the real_data index. Open/high/low are constructed from close
-    using the real-data H/L/O range proportions.
+    the real_data index. Open/high/low are derived from the real
+    bar's (high - low) / close spread ratio so that Parkinson /
+    Garman-Klass volatility on the synthetic series tracks the real
+    bar's intra-bar range (v2.8.1 H5 — the v2.8.0 constant ±1.5%
+    produced deterministic noise that broke vol estimators).
 
-    The resulting DataFrame's column set matches real_data.
+    Parameters
+    ----------
+    hl_spread_source
+        ``"real_bar_ratio"`` (default) — use the real bar's H/L
+        spread per timestamp. Bar-for-bar identical spread series.
+        ``"real_distribution_shuffled"`` — permute the real spread
+        ratios with ``spread_rng``. Destroys bar-level autocorrelation
+        while preserving the marginal distribution; used as a
+        leak-verification opt-out (``autocorr(spread) ≈ 0`` after).
+    spread_rng
+        Required when ``hl_spread_source == "real_distribution_shuffled"``.
+        A fresh ``Generator`` constructed from the anchor seed in
+        ``build_synthetic_anchor`` — independent of any future
+        close-path stochasticity (defensive future-proofing per v2.1.3).
     """
     base_close = float(real_data["close"].iloc[0])
     closes = base_close * np.exp(np.cumsum(returns))
@@ -217,10 +235,36 @@ def _build_ohlcv_from_returns(
             [closes, [closes[-1]] * (len(real_data) - len(closes))]
         )
     closes = closes[: len(real_data)]
-    # Use ~1.5% intra-bar range as a conservative default.
-    highs = closes * 1.015
-    lows = closes * 0.985
+
+    # v2.8.1 H5: derive H/L from the real bar's spread ratio.
+    real_high = real_data["high"].astype(float).to_numpy()
+    real_low = real_data["low"].astype(float).to_numpy()
+    real_close = real_data["close"].astype(float).to_numpy()
+    spread_ratio = (real_high - real_low) / np.clip(
+        np.abs(real_close), 1e-9, None
+    )
+    if hl_spread_source == "real_distribution_shuffled":
+        if spread_rng is None:
+            raise ValueError(
+                "hl_spread_source='real_distribution_shuffled' requires a "
+                "spread_rng argument"
+            )
+        spread_ratio = spread_rng.permutation(spread_ratio)
+    elif hl_spread_source != "real_bar_ratio":
+        raise ValueError(
+            f"hl_spread_source must be 'real_bar_ratio' or "
+            f"'real_distribution_shuffled'; got {hl_spread_source!r}"
+        )
+
     opens = closes
+    half = spread_ratio / 2.0
+    highs = closes * (1.0 + half)
+    lows = closes * (1.0 - half)
+    # Enforce OHLC ordering. opens == closes today, so the clamp is
+    # a no-op in practice; included for defensive correctness.
+    highs = np.maximum(highs, np.maximum(opens, closes))
+    lows = np.minimum(lows, np.minimum(opens, closes))
+
     df = pd.DataFrame(
         {
             "open": opens,
@@ -232,6 +276,11 @@ def _build_ohlcv_from_returns(
         index=real_data.index,
     )
     df.attrs["synthetic_label"] = label
+    # v2.8.1 M2: key-assignment, NOT wholesale dict replace, so any
+    # vol_scale / n_anchor_bars keys set upstream survive.
+    if "vol_scale_provenance" not in df.attrs:
+        df.attrs["vol_scale_provenance"] = {}
+    df.attrs["vol_scale_provenance"]["hl_spread_source"] = hl_spread_source
     return df
 
 
@@ -271,6 +320,7 @@ def build_synthetic_anchor(
     asset_class: str = "auto",
     method: str = "garch_resample",
     label: str | None = None,
+    hl_spread_source: str = "real_bar_ratio",
 ) -> pd.DataFrame:
     """Return a fabricated OHLCV series matching real_data's
     volatility profile but with no relationship to the real symbol.
@@ -293,6 +343,15 @@ def build_synthetic_anchor(
     label
         Optional override for the synthetic ticker label. Default
         is ``SYN_<8-hex>`` derived from ``seed``.
+    hl_spread_source
+        v2.8.1: ``"real_bar_ratio"`` (default) propagates the real
+        bar's H/L spread ratio onto the synthetic series so that
+        Parkinson / Garman-Klass intra-bar volatility tracks reality.
+        ``"real_distribution_shuffled"`` permutes the real spread
+        ratios via a seed-derived RNG, destroying bar-level
+        autocorrelation while preserving the marginal distribution
+        — used as a light-weight leak-mitigation opt-out. True
+        symbol anonymization should go through ``SymbolMasker``.
 
     Returns
     -------
@@ -302,6 +361,12 @@ def build_synthetic_anchor(
         ``vol_model_chosen``, ``vol_model_provenance``,
         ``leverage_corr_provenance`` (when ``asset_class="auto"``).
     """
+    if hl_spread_source not in ("real_bar_ratio", "real_distribution_shuffled"):
+        raise ValueError(
+            f"hl_spread_source must be 'real_bar_ratio' or "
+            f"'real_distribution_shuffled'; got {hl_spread_source!r}"
+        )
+
     if label is None:
         label = _stable_label(seed)
 
@@ -392,7 +457,15 @@ def build_synthetic_anchor(
             f"'block_bootstrap', or 'random_walk_volmatched'"
         )
 
-    df = _build_ohlcv_from_returns(sim_returns, real_data, label=label)
+    # v2.8.1 H5 / M1: construct a SEPARATE rng for spread permutation,
+    # independent of any future close-path stochasticity. Today the
+    # close-path is deterministic but the separation is defensive
+    # future-proofing.
+    spread_rng = np.random.Generator(np.random.PCG64(seed))
+    df = _build_ohlcv_from_returns(
+        sim_returns, real_data, label=label,
+        hl_spread_source=hl_spread_source, spread_rng=spread_rng,
+    )
     df.attrs["vol_model_chosen"] = provenance["vol_model_chosen"]
     df.attrs["vol_model_provenance"] = provenance
     if "leverage_corr_provenance" in provenance:
