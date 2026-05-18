@@ -173,6 +173,18 @@ def validate_ohlcv(
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
 
+    # v2.8.1 H2: duplicate-timestamp check fires regardless of
+    # validation_level. The event-driven core crashes with TypeError
+    # mid-loop on dup indices (df.loc[ts, "close"] returns a Series),
+    # so we hard-fail at validation time with an actionable recipe.
+    if isinstance(data.index, pd.DatetimeIndex) and data.index.has_duplicates:
+        n_dup = int(data.index.duplicated().sum())
+        raise ValueError(
+            f"OHLCV data has {n_dup} duplicate timestamp(s); dedupe "
+            f"before passing to the engine. "
+            f"Recipe: df = df[~df.index.duplicated(keep='first')]"
+        )
+
     # If validation_level is 'none', skip data quality checks
     if validation_level == "none":
         return
@@ -230,11 +242,8 @@ def validate_ohlcv(
         if n_nonpos > 0:
             _report(f"OHLCV: {n_nonpos} rows with non-positive prices")
 
-    # Duplicate timestamps
-    if isinstance(data.index, pd.DatetimeIndex):
-        n_dup = int(data.index.duplicated().sum())
-        if n_dup > 0:
-            _report(f"OHLCV: {n_dup} duplicate timestamps in index")
+    # (Duplicate timestamps are hard-failed above, before the
+    # validation_level dispatch — see H2 block.)
 
 
 def ensure_datetime_index(data: pd.DataFrame) -> pd.DataFrame:
