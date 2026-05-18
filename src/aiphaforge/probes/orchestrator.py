@@ -750,11 +750,30 @@ def _compute_scalar_leakage_index_and_z(
     return float(index), float(se), z
 
 
-@dataclass(frozen=True)
+@dataclass(init=False, frozen=True)
 class KnowledgeCheckReport:
     """v2.2 (M6) standalone Q&A leakage diagnostic report.
 
     See ``docs/plans/v2.2-plan-r6.md`` § 7.3.
+
+    v2.8.1 (H7): switched from ``@dataclass(frozen=True)`` to
+    ``@dataclass(init=False, frozen=True)`` with a manual ``__init__``.
+    Two reasons:
+
+    1. Pickle compatibility. The dataclass holds two
+       ``MappingProxyType`` fields wrapped in ``__post_init__``.
+       Default pickling cannot round-trip these. ``__getstate__`` /
+       ``__setstate__`` below unwrap on dump and re-wrap on load.
+
+    2. Backward-compat for old pickles that still carry the
+       ``bucket_delta_tango_ci`` field name (removed in v2.8). The
+       manual ``__init__`` translates that legacy kwarg to
+       ``bucket_delta_ci`` with a DeprecationWarning.
+
+    Side effect: positional construction now raises ``TypeError``;
+    all callers must use keyword arguments. Unknown kwargs (typos,
+    obsolete field names not on the legacy-alias list) also raise
+    ``TypeError`` so silent field-drops do not happen.
     """
 
     probe_kind: str  # "knowledge" | "continuation" | "rank_continuation"
@@ -899,6 +918,52 @@ class KnowledgeCheckReport:
                 out[f.name] = v
         return out
 
+    def __init__(self, **kwargs: Any) -> None:
+        # v2.8.1 H7: manual __init__ for pickle compat + legacy-kwarg
+        # translation. Kwargs-only by design; positional construction
+        # is rejected (Python raises TypeError automatically because
+        # we declared **kwargs, no positional params).
+        from dataclasses import MISSING, fields
+
+        # Legacy kwarg translation (old pickles / external callers
+        # that still use bucket_delta_tango_ci):
+        if "bucket_delta_tango_ci" in kwargs:
+            warnings.warn(
+                "bucket_delta_tango_ci is deprecated since v2.8; "
+                "treating as legacy alias for bucket_delta_ci. "
+                "Hard removal in v2.9.",
+                DeprecationWarning, stacklevel=2,
+            )
+            legacy = kwargs.pop("bucket_delta_tango_ci")
+            kwargs.setdefault("bucket_delta_ci", legacy)
+
+        field_names = {f.name for f in fields(self)}
+        # M4: reject unknown kwargs (typos, removed fields not on the
+        # legacy-alias whitelist). Without this, the manual __init__
+        # would silently drop them — worse than the v2.7 dataclass.
+        unknown = set(kwargs) - field_names
+        if unknown:
+            raise TypeError(
+                f"KnowledgeCheckReport got unexpected keyword "
+                f"arguments: {sorted(unknown)}"
+            )
+
+        for f in fields(self):
+            if f.name in kwargs:
+                value = kwargs[f.name]
+            elif f.default is not MISSING:
+                value = f.default
+            elif f.default_factory is not MISSING:  # type: ignore[misc]
+                value = f.default_factory()  # type: ignore[misc]
+            else:
+                raise TypeError(
+                    f"KnowledgeCheckReport: missing required argument "
+                    f"{f.name!r}"
+                )
+            object.__setattr__(self, f.name, value)
+
+        self.__post_init__()
+
     def __post_init__(self):
         if self.is_pillar_summary:
             raise ValueError(
@@ -910,7 +975,8 @@ class KnowledgeCheckReport:
         # MappingProxyType so the frozen-dataclass immutability
         # claim extends to these mapping fields. Use
         # object.__setattr__ because frozen blocks direct
-        # assignment.
+        # assignment. Idempotent — re-running on already-wrapped
+        # input is a no-op, so __setstate__ can safely call this.
         if (self.parser_used_distribution_real is not None
                 and not isinstance(
                     self.parser_used_distribution_real,
@@ -932,6 +998,26 @@ class KnowledgeCheckReport:
         # v2.8: removed v2.2.1 cross-population logic for the
         # historic "_tango_ci"-suffixed alias; bucket_delta_ci is
         # now the only name.
+
+    def __getstate__(self) -> dict[str, Any]:
+        # Unwrap MappingProxyType for picklability. Pickle cannot
+        # serialize mappingproxy objects (they hold a borrowed
+        # reference to their underlying dict).
+        state = dict(self.__dict__)
+        for k in ("parser_used_distribution_real",
+                  "parser_used_distribution_anchor"):
+            v = state.get(k)
+            if isinstance(v, MappingProxyType):
+                state[k] = dict(v)
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        # Re-wrap MappingProxyType after load + replay __post_init__
+        # so any validation / wrapping side effects fire on the
+        # revived instance (v2.1.2 M5).
+        for k, v in state.items():
+            object.__setattr__(self, k, v)
+        self.__post_init__()
 
 
 # ---------- knowledge_check orchestrator ----------
