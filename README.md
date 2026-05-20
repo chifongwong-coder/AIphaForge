@@ -716,53 +716,94 @@ for diag in result.diagnostics:
 
 ## v2.8.1 Release Notes
 
-### Headline: vectorized US-stock equity curves WILL improve after upgrade
+### Two silent-correctness bugs are fixed. Your historical results may have been wrong.
 
-v2.8.0's `DefaultTradeCost.apply_vectorized` called
+**Headline 1 — vectorized US-stock equity curves WILL improve after
+upgrade (H1).** v2.8.0's `DefaultTradeCost.apply_vectorized` called
 `fee_model.estimate_commission_rate()` with no arguments, getting the
 default `(price=100, size=100)` pair. For `USStockFeeModel` with the
-$1 minimum-commission floor, that produced a ~1% trade cost — about
+`min_commission=$1` floor, that produced a ~1% trade cost — about
 100× the real per-trade rate. v2.8.1 derives a representative
-`(price, size)` from your `position_sizer + initial_capital`.
+`(price, size)` from your `position_sizer + initial_capital`. Cost
+drag drops from inflated ≈1% to correct ≈0.01-0.1%. **This is a bug
+fix, not a behavior change in your strategy.** Caveat for live
+traders: if you tuned thresholds against the inflated backtest cost,
+your live edge may now appear *worse* than your new backtest — your
+strategy was implicitly over-paying for the wrong reason.
 
-**Your vectorized US-stock backtest equity curves WILL improve after
-upgrade.** Cost drag drops from inflated ≈1% to correct ≈0.01-0.1%.
-This is a bug fix, not a behavior change in your strategy.
+**Headline 2 — vectorized multi-asset PnL with a `capital_allocator`
+was silently wrong (H4).** The vectorized core ignored
+`capital_allocator` and ran static equal-weight; the event-driven
+core honored it. Users running vectorized multi-asset backtests with
+a custom allocator got PnL that did NOT match the equivalent
+event-driven run. v2.8.1 does NOT implement dynamic allocation in
+vectorized (that's v2.8.2+); instead, it emits a loud `UserWarning`
+naming your allocator class and pointing at `mode='event_driven'`.
+**If you ran vectorized multi-asset with a non-trivial
+`capital_allocator` in v2.8.0, your historical backtest PnL is wrong
+and you should re-run on event-driven to get the right numbers.**
 
-For exact academic reproducibility of a v2.8.0-pinned run:
+### Lockfile-pin for academic reproducibility of v2.8.0-pinned runs
+
+AIphaForge is not currently published to PyPI. For exact
+reproducibility of a v2.8.0-pinned analysis, pin the git commit SHA
+directly:
 
 ```bash
-pip install aiphaforge==2.8.0
+pip install git+https://github.com/chifongwong-coder/AIphaForge@fd4b34f
 ```
 
 ```text
 # requirements.txt
-aiphaforge==2.8.0
+aiphaforge @ git+https://github.com/chifongwong-coder/AIphaForge@fd4b34f
 ```
+
+Commit `fd4b34f` is the v2.8.0 release commit (`__version__ ==
+'2.8.0'`). If you cited a v2.8.0 result in a paper, this is the SHA
+to reference.
 
 ### CI engineer triage block
 
-Four expected failure modes when CI re-baselines on v2.8.1:
+Seven expected failure modes when CI re-baselines on v2.8.1, in
+roughly decreasing frequency:
 
-1. **Equity curve drift (H1)** — most common. Cost rate fixed; rebaseline
-   golden fixtures.
-2. **Duplicate-timestamp fixture `ValueError` (H2)** — `validate_ohlcv`
-   now hard-fails on duplicate index regardless of `validation_level`.
-   Fix the test data, not the test: `df = df[~df.index.duplicated(keep='first')]`.
-3. **`DeprecationWarning` as error (H6)** — if you run `pytest -W error`,
-   external code that still imports `tango_paired_diff_ci` (renamed to
-   `wald_paired_diff_ci`) will break. Migrate the import or relax the
-   warning filter.
-4. **Pickle bytes-hash pinning (H7)** — `KnowledgeCheckReport.__getstate__`
-   changes dict shape. Any caller pinning the pickle bytes-hash needs
-   re-pinning after upgrade.
-5. **ABC additive break** — external subclasses of `BaseTradeCost` that
-   override `apply_vectorized` with the v2.8.0 (kwargs-less) signature
-   will `TypeError` on the first vectorized run:
+1. **Equity curve drift (H1)** — most common. Cost rate fixed;
+   rebaseline golden fixtures for any single-asset vectorized run.
+2. **Multi-asset PnL drift (H4)** — silent bug; previously wrong
+   numbers. If your golden fixtures cover vectorized multi-asset
+   with a `capital_allocator`, decide whether to (a) accept the new
+   `UserWarning` and re-baseline against event-driven, or (b) switch
+   the fixture to `mode='event_driven'` outright.
+3. **Duplicate-timestamp fixture `ValueError` (H2)** —
+   `validate_ohlcv` now hard-fails on duplicate index regardless of
+   `validation_level`. Fix the data, not the test:
+   `df = df[~df.index.duplicated(keep='first')]`.
+4. **New vectorized warnings break `-W error` runs (H3 + H4)** —
+   v2.8.1 expanded `_VECTORIZED_UNSUPPORTED_FIELDS` from 7 to 21.
+   Setting any of `fill_model`, `session_end_time`,
+   `immediate_fill_price`, `fee_allocation`, `capital_allocator`,
+   `lot_size`, `max_position_pct`, the multi-asset `asset_*` dicts,
+   etc. on a `vectorized` engine now warns. Under `pytest -W error`
+   these become exceptions. Either move to `event_driven` or relax
+   the warning filter for the affected modules.
+5. **`DeprecationWarning` as error (H6)** — code that still imports
+   `tango_paired_diff_ci` (renamed to `wald_paired_diff_ci`) emits a
+   `DeprecationWarning`. Under `-W error` this is a hard fail.
+   Migrate the import or relax the filter.
+6. **Pickle bytes-hash pinning (H7)** —
+   `KnowledgeCheckReport.__getstate__` changes dict shape. Any
+   caller pinning the pickle bytes-hash needs re-pinning.
+7. **ABC additive break** — external subclasses of `BaseTradeCost`
+   that override `apply_vectorized` with the v2.8.0 (kwargs-less)
+   signature will `TypeError` on the first vectorized run:
    `TypeError: apply_vectorized() got an unexpected keyword argument 'representative_notional'`.
-   Fix in your override: add `*, representative_notional=None, representative_size=None`
-   (or `**_kwargs`) to the signature. No fallback shim ships in v2.8.1
-   per the v2.8.x "no compat flag" precedent.
+   Fix in your override: add
+   `*, representative_notional=None, representative_size=None`
+   (or `**_kwargs`) to the signature. Forward both kwargs if you
+   call `super().apply_vectorized(...)` from your subclass — silently
+   dropping them re-introduces the H1 bug at the call site. No
+   fallback shim ships in v2.8.1 per the v2.8.x "no compat flag"
+   precedent.
 
 ### Per-H one-liner
 
@@ -771,28 +812,74 @@ Four expected failure modes when CI re-baselines on v2.8.1:
 | H1 | `costs.py:DefaultTradeCost.apply_vectorized` | Vectorized US-stock cost over-billed ≈100× via no-args `estimate_commission_rate()`. |
 | H2 | `utils.py:validate_ohlcv` | Duplicate-timestamp OHLCV slipped past `warn` mode and crashed event-driven mid-loop. |
 | H3 | `engine.py:_VECTORIZED_UNSUPPORTED_FIELDS` | 14 fields silently dropped by vectorized; no warning surfaced them. |
-| H4 | `engine.py:_warn_vectorized_capital_allocator_divergence` | Vectorized multi-asset ignores `capital_allocator`; PnL diverges from event-driven. |
-| H5 | `probes/anchors.py:_build_ohlcv_from_returns` | Anchor H/L hardcoded ±1.5% → Parkinson/GK vol estimates were deterministic noise. |
+| H4 | `engine.py:_warn_vectorized_capital_allocator_divergence` | Vectorized multi-asset ignored `capital_allocator`; PnL silently diverged from event-driven. |
+| H5 | `probes/anchors.py:_build_ohlcv_from_returns` | Anchor H/L hardcoded ±1.5% → Parkinson/GK vol estimates were deterministic noise. Synthetic spread ratio now bar-for-bar matches real; Parkinson is approximately (not exactly) equal — see docstring. |
 | H6 | `probes/orchestrator.py:tango_paired_diff_ci` | Function named after Tango (1998) but body is Wald — caused mis-citation. |
 | H7 | `probes/orchestrator.py:KnowledgeCheckReport` | `MappingProxyType` fields broke pickle round-trip; multiprocessing pipelines crashed. |
 | H8 | `tests/test_v2_8_public_api_lock.py` | v2.8 lock was one-way; symbols without `_` prefix slipped public. |
 
+### Anchor-probe users (H5): your reported Parkinson values will change
+
+Anchor-side Parkinson `(ln(H/L))^2` and Garman-Klass intra-bar vol
+estimates in v2.8.0 were deterministic functions of the constant
+±1.5% spread the helper hardcoded — not anything tied to your real
+symbol. v2.8.1 derives synthetic H/L from the real bar's
+`(H - L) / close` ratio per timestamp, so the anchor's vol stats now
+reflect the real bar. **Numerical impact**: any leakage-test
+sensitivity calibrated on v2.8.0 Parkinson values needs
+re-calibration. The synthetic spread RATIO is bar-for-bar identical
+to the real spread; Parkinson is approximately equal (the synthetic
+centers H/L symmetrically around close, which a real bar generally
+does not — typical relative error < 1% at spread ≤ 5%, see the
+`_build_ohlcv_from_returns` docstring).
+
 ### Breaking changes + migration recipes
 
 - **H2** dedupe: `df = df[~df.index.duplicated(keep='first')]`
-- **H6** rename (GNU sed): `sed -i 's/tango_paired_diff_ci/wald_paired_diff_ci/g' your_file.py`
-  - BSD/macOS: `sed -i '' 's/tango_paired_diff_ci/wald_paired_diff_ci/g' your_file.py`
-- **H7** pickle: old v2.7.x pickles holding `bucket_delta_tango_ci=X` load with a `DeprecationWarning`; re-save with `pickle.dump(report, ...)` after clean load to silence. **`KnowledgeCheckReport` now accepts ONLY keyword arguments** — positional construction raises `TypeError`. Convert `KnowledgeCheckReport(x, y, z, ...)` to `KnowledgeCheckReport(field_a=x, field_b=y, field_c=z, ...)`.
-- **H8** promoted symbols (your existing imports are now blessed): `serialize_answer_records`, `resolve_determinism_config`.
+- **H6** rename — GNU sed:
+  `sed -i 's/tango_paired_diff_ci/wald_paired_diff_ci/g' your_file.py`
+  BSD/macOS:
+  `sed -i '' 's/tango_paired_diff_ci/wald_paired_diff_ci/g' your_file.py`
+- **H7** pickle: old v2.7.x pickles carrying `bucket_delta_tango_ci`
+  load with a `DeprecationWarning` (the translation now fires on
+  both `__init__` and pickle restore via `__setstate__` — v2.8.1
+  Commit J fix). Re-save with `pickle.dump(report, ...)` after a
+  clean load to silence.
+- **H7** kwargs-only: `KnowledgeCheckReport` accepts ONLY keyword
+  arguments since v2.8.1. Positional construction raises `TypeError`.
+  Real-field-name example:
+  ```python
+  # v2.8.0 (worked, no longer):
+  # KnowledgeCheckReport("knowledge", real_score, anchor_score, ...)
+
+  # v2.8.1+:
+  KnowledgeCheckReport(
+      probe_kind="knowledge",
+      real_score=real_score,
+      anchor_score=anchor_score,
+      bucket_delta=bucket_delta,
+      paired_sign_test_p=sign_test_p_val,
+      # ... other 20+ fields by keyword ...
+      anchor_validity="OK",
+      parsing_schema_hash=schema_hash,
+      parsing_schema_description=schema_desc,
+      prompt_template_hash=template_hash,
+      prompt_template_description=template_desc,
+  )
+  ```
+  See `KnowledgeCheckReport` for the full field list.
+- **H8** promoted symbols (your existing imports are now blessed):
+  `serialize_answer_records`, `resolve_determinism_config`.
 
 ### Advanced knobs you might not have noticed
 
-- `BacktestEngine(representative_notional=...)` — override the
-  engine-derived cost-estimation notional. Engine default is
+- `BacktestEngine(representative_notional=...)` and / or
+  `BacktestEngine(representative_size=...)` — override the engine-
+  derived cost-estimation values. Engine default is
   `initial_capital * min(sizer.fraction, max_position_size)` for
-  Fraction/AllInSizer, or `sizer.size * data["close"].median()` for
-  FixedSizer. Pass an explicit value when your typical position
-  notional differs materially.
+  `FractionSizer` / `AllInSizer`, or `sizer.size` for `FixedSizer`.
+  Either or both kwargs can be passed independently — whatever you
+  pass wins; the engine fills only the unset side from the sizer.
 - `build_synthetic_anchor(..., hl_spread_source="real_distribution_shuffled")`
   — opt out of bar-by-bar real-spread propagation. Permutes the real
   spread ratios via a seed-derived RNG; destroys bar-level
@@ -803,19 +890,19 @@ Four expected failure modes when CI re-baselines on v2.8.1:
 ### Deprecation removal commitment
 
 `tango_paired_diff_ci` and the `bucket_delta_tango_ci` legacy kwarg
-to `KnowledgeCheckReport` ship with `DeprecationWarning` in v2.8.1
-and **hard-remove in v2.9** (the final v2.x release per the cleanup
-master plan).
+to `KnowledgeCheckReport` ship with `DeprecationWarning` in v2.8.1.
+Both **hard-remove in v2.9** — the next minor version after the
+v2.8.x patch series. If you maintain a downstream that pins
+`tango_paired_diff_ci` import, migrate before bumping past v2.8.x.
 
 ### What v2.8.1 does NOT include
 
-v2.8.1 is the **HIGH-severity batch only**. MEDIUM-severity follow-ups
-(v2.8.2 strategy pillar, v2.8.3 LLM pillar, v2.8.4 UX + API surface,
-v2.8.5 test + factor housekeeping) and architectural items
-(v2.9 — `IncrementalFactor` engine integration, `significance.py`
-split, neutral primitives module) are tracked in
-`docs/AIphaForge_v2.x_Cleanup_Master_Plan_v1.0.md`. v3.0 is reserved
-for a separate LLM/AI factor mining track.
+v2.8.1 is the **HIGH-severity batch only**. MEDIUM-severity follow-
+ups (strategy / LLM / UX-API / test-factor housekeeping) ship across
+v2.8.2 – v2.8.5; architectural work (`IncrementalFactor` engine
+integration, `significance.py` split, neutral primitives module)
+lands in v2.9 (the final v2.x release). A separate v3.0 track is
+reserved for LLM/AI factor mining.
 
 ## Installation
 
