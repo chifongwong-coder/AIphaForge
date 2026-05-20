@@ -111,10 +111,17 @@ class TestFactorSetToJsonRoundTrip:
         rebuilt = FactorSet.from_json(payload)
         assert set(rebuilt.values.keys()) == {"rsi_14", "momentum_5"}
         # Values round-trip exactly.
+        # ``check_index_type=False``: pandas's JSON date deserializer
+        # picks ``datetime64[ms]`` or ``datetime64[us]`` depending on
+        # version / build (CI ubuntu-latest produces [ms]; some
+        # local installs produce [us]). The semantic equality of the
+        # index — same timestamps, same order — is what we care about;
+        # the dtype resolution is an artifact of pandas's JSON path.
         for name in fs.values:
             pd.testing.assert_frame_equal(
                 rebuilt.values[name], fs.values[name],
                 check_freq=False,
+                check_index_type=False,
             )
         # Spec field-level equality.
         for name, spec in fs.specs.items():
