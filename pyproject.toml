@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aiphaforge"
-version = "2.8.0"
+version = "2.8.1"
 description = "A high-performance backtest engine for AI agent-driven quantitative trading"
 readme = "README.md"
 license = {text = "GPL-3.0-or-later"}
@@ -83,6 +83,12 @@ select = ["E", "F", "W", "I"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v"
+# v2.8.1: silence the tango_paired_diff_ci deprecation alias inside
+# probes.orchestrator so CI output isn't drowned. v2.9 hard-removes
+# the alias and this filter.
+filterwarnings = [
+    "ignore::DeprecationWarning:aiphaforge.probes.orchestrator",
+]
 
 [tool.mypy]
 python_version = "3.10"

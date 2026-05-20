@@ -89,6 +89,11 @@ class BacktestConfig:
     impact_model: Optional[Any] = None  # BaseImpactModel
     impact_adv_lookback: int = 20
     impact_vol_lookback: int = 20
+    # v2.8.1: representative trade size for vectorized cost estimation.
+    # Populated by engine._build_config() from BacktestEngine kwargs
+    # (user wins) or from the position_sizer (fallback).
+    representative_notional: Optional[float] = None
+    representative_size: Optional[float] = None
 
 
 @dataclass

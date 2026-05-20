@@ -80,6 +80,8 @@ def run_vectorized(
     # Apply trade costs via module
     net_returns = config.trade_cost.apply_vectorized(
         strategy_returns, positions, data, config.fee_model, config.initial_capital,
+        representative_notional=config.representative_notional,
+        representative_size=config.representative_size,
     )
 
     # Apply stop loss via module. v1.9.7 commit 7b: ask for the trigger
@@ -103,6 +105,8 @@ def run_vectorized(
         net_returns = config.trade_cost.apply_vectorized(
             strategy_returns, positions, data, config.fee_model,
             config.initial_capital,
+            representative_notional=config.representative_notional,
+            representative_size=config.representative_size,
         )
         # Re-apply stop-loss on recomputed returns (risk rules may have
         # modified positions, changing which stop-loss triggers fire).

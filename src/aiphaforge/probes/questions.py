@@ -32,6 +32,27 @@ from aiphaforge.probes.models import (
     ToleranceProfile,
 )
 
+# v2.8.1 H8: public surface lock.
+__all__ = [
+    "BarRangePct",
+    "CloseQuestion",
+    "CloseVsOpen",
+    "DEFAULT_TEMPLATES",
+    "GapVsPrevClose",
+    "HighQuestion",
+    "KnowledgeProbe",
+    "LowQuestion",
+    "OpenQuestion",
+    "QuestionSet",
+    "QuestionTemplate",
+    "ReturnSign",
+    "build_question_set",
+    "build_question_sets_multi",
+    "normalize_binary",
+    "normalize_direction",
+    "sample_dates",
+]
+
 # ---------- Default tolerance profiles per built-in template ----------
 
 # Price-level OHLC templates: relative tolerance on a price (e.g. AAPL

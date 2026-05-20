@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import math
 import uuid
+import warnings
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -213,7 +214,7 @@ def _phi(z: float) -> float:
 # ---------- Tango (1998) paired score interval ----------
 
 
-def tango_paired_diff_ci(
+def wald_paired_diff_ci(
     n_both: int,
     n_real_only: int,
     n_anchor_only: int,
@@ -226,27 +227,25 @@ def tango_paired_diff_ci(
     p1 = (n_both + n_real_only) / N         # real success rate
     p2 = (n_both + n_anchor_only) / N       # anchor success rate
 
+    Equivalent to PropCIs::diffpropci.Wald.mp (R reference).
+    Numerically equivalent; implementation uses bisection over delta
+    rather than closed-form, but variance is delta-independent so
+    outputs match exactly.
+
     Implementation: bisection over delta ∈ [-1, 1] for which the
     score statistic for H0: p1 - p2 = delta is within the critical
     region. The variance estimator uses the standard discordant-
     cell formula (does NOT depend on delta).
 
-    KNOWN LIMITATION (v2.2.1 #3 follow-up): the implementation is
-    a Wald approximation, NOT Tango (1998) Method 10's true
-    constrained-MLE score CI. The function name is preserved for
-    backward API compatibility; v2.2.2 will swap in the proper
-    Tango implementation once the PropCIs::scoreci.mp R-source
-    reference fixture is generated. Per the v2.2.1 r7 plan, that
-    requires R + PropCIs which were not available in the v2.2.1
-    implementation environment. Documented as a v2.2.2 follow-up.
-
-    Practically: the Wald CI is conservative-vs-Tango (slightly
-    wider intervals) when the discordant-pair count is small
-    relative to N. For paper-grade rigor, users should additionally
-    run R/PropCIs::scoreci.mp on their (n_both, n_real_only,
-    n_anchor_only, n_neither) tables and compare. Until v2.2.2
-    ships the proper Tango implementation, this function provides
-    a reasonable approximation; do NOT cite it as Tango (1998).
+    HISTORICAL NOTE: v2.2.1 introduced this function as
+    ``tango_paired_diff_ci``. v2.8.1 renamed it to
+    ``wald_paired_diff_ci`` to match what it actually computes.
+    The Wald CI is conservative-vs-Tango (slightly wider intervals)
+    when the discordant-pair count is small relative to N. For
+    paper-grade rigor, users should additionally run
+    R/PropCIs::scoreci.mp on their (n_both, n_real_only,
+    n_anchor_only, n_neither) tables and compare. Do NOT cite this
+    function as implementing Tango (1998).
 
     Edge cases:
       - N = 0: raises ValueError (cannot CI an empty bucket).
@@ -258,7 +257,7 @@ def tango_paired_diff_ci(
     n = n_both + n_real_only + n_anchor_only + n_neither
     if n == 0:
         raise ValueError(
-            "tango_paired_diff_ci: empty bucket (N=0)"
+            "wald_paired_diff_ci: empty bucket (N=0)"
         )
     if n_real_only == 0 and n_anchor_only == 0:
         # Perfect agreement → point CI at zero
@@ -305,6 +304,23 @@ def tango_paired_diff_ci(
     else:
         upper_ci = _bisect(_stat_squared_minus_z, lo2, hi2)
     return float(max(-1.0, lower_ci)), float(min(1.0, upper_ci))
+
+
+def tango_paired_diff_ci(*args, **kwargs):
+    """Deprecated since v2.8.1; renamed to ``wald_paired_diff_ci``.
+
+    The implementation is unchanged (Wald-style, not Tango 1998
+    method 10). Hard removal scheduled for v2.9 (the final v2.x
+    release).
+    """
+    warnings.warn(
+        "tango_paired_diff_ci is deprecated since v2.8.1; rename to "
+        "wald_paired_diff_ci. The implementation is unchanged "
+        "(Wald-style, not Tango 1998 method 10). Hard removal: v2.9.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return wald_paired_diff_ci(*args, **kwargs)
 
 
 def _bisect(f, lo: float, hi: float, tol: float = 1e-9,
@@ -734,11 +750,30 @@ def _compute_scalar_leakage_index_and_z(
     return float(index), float(se), z
 
 
-@dataclass(frozen=True)
+@dataclass(init=False, frozen=True)
 class KnowledgeCheckReport:
     """v2.2 (M6) standalone Q&A leakage diagnostic report.
 
     See ``docs/plans/v2.2-plan-r6.md`` § 7.3.
+
+    v2.8.1 (H7): switched from ``@dataclass(frozen=True)`` to
+    ``@dataclass(init=False, frozen=True)`` with a manual ``__init__``.
+    Two reasons:
+
+    1. Pickle compatibility. The dataclass holds two
+       ``MappingProxyType`` fields wrapped in ``__post_init__``.
+       Default pickling cannot round-trip these. ``__getstate__`` /
+       ``__setstate__`` below unwrap on dump and re-wrap on load.
+
+    2. Backward-compat for old pickles that still carry the
+       ``bucket_delta_tango_ci`` field name (removed in v2.8). The
+       manual ``__init__`` translates that legacy kwarg to
+       ``bucket_delta_ci`` with a DeprecationWarning.
+
+    Side effect: positional construction now raises ``TypeError``;
+    all callers must use keyword arguments. Unknown kwargs (typos,
+    obsolete field names not on the legacy-alias list) also raise
+    ``TypeError`` so silent field-drops do not happen.
     """
 
     probe_kind: str  # "knowledge" | "continuation" | "rank_continuation"
@@ -883,6 +918,52 @@ class KnowledgeCheckReport:
                 out[f.name] = v
         return out
 
+    def __init__(self, **kwargs: Any) -> None:
+        # v2.8.1 H7: manual __init__ for pickle compat + legacy-kwarg
+        # translation. Kwargs-only by design; positional construction
+        # is rejected (Python raises TypeError automatically because
+        # we declared **kwargs, no positional params).
+        from dataclasses import MISSING, fields
+
+        # Legacy kwarg translation (old pickles / external callers
+        # that still use bucket_delta_tango_ci):
+        if "bucket_delta_tango_ci" in kwargs:
+            warnings.warn(
+                "bucket_delta_tango_ci is deprecated since v2.8; "
+                "treating as legacy alias for bucket_delta_ci. "
+                "Hard removal in v2.9.",
+                DeprecationWarning, stacklevel=2,
+            )
+            legacy = kwargs.pop("bucket_delta_tango_ci")
+            kwargs.setdefault("bucket_delta_ci", legacy)
+
+        field_names = {f.name for f in fields(self)}
+        # M4: reject unknown kwargs (typos, removed fields not on the
+        # legacy-alias whitelist). Without this, the manual __init__
+        # would silently drop them — worse than the v2.7 dataclass.
+        unknown = set(kwargs) - field_names
+        if unknown:
+            raise TypeError(
+                f"KnowledgeCheckReport got unexpected keyword "
+                f"arguments: {sorted(unknown)}"
+            )
+
+        for f in fields(self):
+            if f.name in kwargs:
+                value = kwargs[f.name]
+            elif f.default is not MISSING:
+                value = f.default
+            elif f.default_factory is not MISSING:  # type: ignore[misc]
+                value = f.default_factory()  # type: ignore[misc]
+            else:
+                raise TypeError(
+                    f"KnowledgeCheckReport: missing required argument "
+                    f"{f.name!r}"
+                )
+            object.__setattr__(self, f.name, value)
+
+        self.__post_init__()
+
     def __post_init__(self):
         if self.is_pillar_summary:
             raise ValueError(
@@ -894,7 +975,8 @@ class KnowledgeCheckReport:
         # MappingProxyType so the frozen-dataclass immutability
         # claim extends to these mapping fields. Use
         # object.__setattr__ because frozen blocks direct
-        # assignment.
+        # assignment. Idempotent — re-running on already-wrapped
+        # input is a no-op, so __setstate__ can safely call this.
         if (self.parser_used_distribution_real is not None
                 and not isinstance(
                     self.parser_used_distribution_real,
@@ -916,6 +998,48 @@ class KnowledgeCheckReport:
         # v2.8: removed v2.2.1 cross-population logic for the
         # historic "_tango_ci"-suffixed alias; bucket_delta_ci is
         # now the only name.
+
+    def __getstate__(self) -> dict[str, Any]:
+        # Unwrap MappingProxyType for picklability. Pickle cannot
+        # serialize mappingproxy objects (they hold a borrowed
+        # reference to their underlying dict).
+        state = dict(self.__dict__)
+        for k in ("parser_used_distribution_real",
+                  "parser_used_distribution_anchor"):
+            v = state.get(k)
+            if isinstance(v, MappingProxyType):
+                state[k] = dict(v)
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        # v2.8.1 post-review fix: legacy alias translation. Old pickles
+        # (v2.7.x or earlier) carry `bucket_delta_tango_ci` instead of
+        # `bucket_delta_ci`. __init__'s translation block only covers
+        # construction; pickle restore goes through __setstate__, so
+        # the same translation must happen here or the revived instance
+        # has bucket_delta_tango_ci set + bucket_delta_ci missing →
+        # AttributeError on any downstream read.
+        if "bucket_delta_tango_ci" in state:
+            # stacklevel=3 lands at the user's pickle.load() / pickle.loads()
+            # site; pickle restore calls __setstate__ via _pickle.c
+            # internals, so stacklevel=2 would point at copyreg / pickle
+            # rather than the user (round-2 NIT).
+            warnings.warn(
+                "Loaded a legacy pickle carrying bucket_delta_tango_ci; "
+                "translating to bucket_delta_ci. Re-save to silence. "
+                "Hard removal in v2.9.",
+                DeprecationWarning, stacklevel=3,
+            )
+            state = dict(state)
+            state.setdefault("bucket_delta_ci",
+                             state.pop("bucket_delta_tango_ci"))
+
+        # Re-wrap MappingProxyType after load + replay __post_init__
+        # so any validation / wrapping side effects fire on the
+        # revived instance (v2.1.2 M5).
+        for k, v in state.items():
+            object.__setattr__(self, k, v)
+        self.__post_init__()
 
 
 # ---------- knowledge_check orchestrator ----------
@@ -1191,7 +1315,7 @@ def knowledge_check(
                 )
                 if (n_both + n_real_only
                         + n_anchor_only + n_neither) > 0:
-                    bucket_delta_ci[bucket] = tango_paired_diff_ci(
+                    bucket_delta_ci[bucket] = wald_paired_diff_ci(
                         n_both, n_real_only, n_anchor_only, n_neither,
                     )
                 else:
@@ -1457,10 +1581,12 @@ def _compute_persistence_baseline_report(
 
 __all__ = [
     "KnowledgeCheckReport",
+    "LEAKAGE_INDEX_BUCKET_WEIGHTS",
     "compute_effective_rate",
     "compute_refusal_rate",
     "knowledge_check",
     "looks_like_refusal",
     "sign_test_p",
-    "tango_paired_diff_ci",
+    "tango_paired_diff_ci",  # v2.8.1: deprecation alias; v2.9 removes.
+    "wald_paired_diff_ci",
 ]

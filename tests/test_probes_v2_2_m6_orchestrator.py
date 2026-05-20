@@ -18,7 +18,7 @@ from aiphaforge.probes.orchestrator import (
     knowledge_check,
     looks_like_refusal,
     sign_test_p,
-    tango_paired_diff_ci,
+    wald_paired_diff_ci,
 )
 from aiphaforge.probes.questions import (
     DEFAULT_TEMPLATES,
@@ -124,12 +124,12 @@ class TestSignTestP:
         assert p < 1e-3
 
 
-# ---------- tango_paired_diff_ci ----------
+# ---------- wald_paired_diff_ci ----------
 
 
 class TestTangoPairedDiffCi:
     def test_perfect_agreement_returns_point_zero(self):
-        lo, hi = tango_paired_diff_ci(
+        lo, hi = wald_paired_diff_ci(
             n_both=10, n_real_only=0, n_anchor_only=0, n_neither=20,
         )
         assert lo == 0.0
@@ -137,11 +137,11 @@ class TestTangoPairedDiffCi:
 
     def test_empty_bucket_raises(self):
         with pytest.raises(ValueError, match="empty bucket"):
-            tango_paired_diff_ci(0, 0, 0, 0)
+            wald_paired_diff_ci(0, 0, 0, 0)
 
     def test_real_advantage_yields_positive_ci(self):
         # 20 pairs where real succeeds 18, anchor succeeds 2
-        lo, hi = tango_paired_diff_ci(
+        lo, hi = wald_paired_diff_ci(
             n_both=2, n_real_only=16, n_anchor_only=0, n_neither=2,
         )
         assert lo > 0  # CI excludes zero on the positive side

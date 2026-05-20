@@ -52,6 +52,24 @@ if TYPE_CHECKING:
     # cyclic import at module-load time.
     from aiphaforge.calendars.core import TradingCalendar
 
+# v2.8.1 H8: public surface lock.
+__all__ = [
+    "BlockBootstrap",
+    "DataTransform",
+    "DateShift",
+    "IntegrityCheckResult",
+    "OHLCJitter",
+    "PriceRebase",
+    "PriceScale",
+    "SymbolMasker",
+    "TransformApplyResult",
+    "TransformCategory",
+    "TransformDiagnostic",
+    "TransformPipeline",
+    "WindowShuffle",
+    "validate_ohlcv_integrity",
+]
+
 
 def _import_calendar_collision_error():
     """Lazy import of CalendarSnapCollisionError to avoid the cycle.

@@ -176,6 +176,8 @@ class BacktestEngine:
         impact_vol_lookback: int = 20,
         trading_days: Union[int, Dict[str, int]] = TRADING_DAYS_STOCK,
         portfolio_trading_days: Optional[int] = None,
+        representative_notional: Optional[float] = None,
+        representative_size: Optional[float] = None,
     ):
         # Fee model
         if isinstance(fee_model, str):
@@ -338,6 +340,12 @@ class BacktestEngine:
         )
         self._trade_cost = DefaultTradeCost()
         self._position_sizer = self._create_position_sizer()
+
+        # v2.8.1: representative trade size for vectorized cost estimation.
+        # User-passed values win; otherwise derived from the sizer in
+        # _build_config() at run time.
+        self.representative_notional = representative_notional
+        self.representative_size = representative_size
 
         # Internal state
         self._strategy = None
@@ -1361,7 +1369,20 @@ class BacktestEngine:
     # risk_rules (via apply_vectorized_all), trade_cost (apply_vectorized),
     # signal_transform, and allow_short. Everything else listed here is
     # silently dropped — surface that to the user.
+    # v2.8.1 H3: expanded from 7 to 21 entries after a line-by-line audit
+    # of core_vectorized.py. The new entries fall into 4 buckets:
+    #   - portfolio-shape: fill_model, max_position_size, session_end_time,
+    #     immediate_fill_price, fee_allocation
+    #   - multi-asset: capital_allocator (H4 — special-cased), asset_fee_models,
+    #     asset_fill_models, asset_max_position_pcts, asset_lot_sizes
+    #   - per-asset limits / lots: lot_size, max_position_pct
+    #   - portfolio-level rules: portfolio_exit_rules, asset_margin_configs
+    # Note: vectorized DOES honor stop_loss (via stop_loss_rule),
+    # risk_rules (via apply_vectorized_all), trade_cost (apply_vectorized),
+    # signal_transform, and allow_short. max_position_size is partially
+    # honored — see _warn_vectorized_max_position_size_partial (H4 / FR-G2).
     _VECTORIZED_UNSUPPORTED_FIELDS: Tuple[str, ...] = (
+        # v2.8.0 (7):
         "take_profit",
         "trailing_stop_rule",
         "impact_model",
@@ -1369,7 +1390,50 @@ class BacktestEngine:
         "periodic_cost_model",
         "turnover_config",
         "risk_manager",
+        # v2.8.1 (14):
+        "fill_model",
+        "max_position_size",  # special partial-honor message
+        "session_end_time",
+        "immediate_fill_price",
+        "fee_allocation",
+        "capital_allocator",  # special divergence message
+        "asset_fee_models",
+        "asset_fill_models",
+        "asset_max_position_pcts",
+        "asset_lot_sizes",
+        "lot_size",
+        "max_position_pct",
+        "portfolio_exit_rules",
+        "asset_margin_configs",
     )
+
+    def _warn_vectorized_capital_allocator_divergence(self) -> None:
+        """v2.8.1 H4 — special message for capital_allocator.
+
+        Vectorized multi-asset uses a static equal-weight split; the
+        capital_allocator is silently ignored. This produces wrong PnL
+        for users who set up dynamic allocators.
+        """
+        warnings.warn(
+            "vectorized multi-asset mode uses static equal-weight "
+            f"capital split; your capital_allocator="
+            f"{type(self.capital_allocator).__name__} is ignored. Switch "
+            "to mode='event_driven' for dynamic per-bar allocation."
+        )
+
+    def _warn_vectorized_max_position_size_partial(self) -> None:
+        """v2.8.1 FR-G2 — special message for max_position_size.
+
+        Vectorized mode uses max_position_size only for representative
+        cost-estimation sizing via the position_sizer (per v2.8.1 H1).
+        Explicit per-bar position clamping requires event-driven mode.
+        """
+        warnings.warn(
+            "vectorized mode uses max_position_size only for "
+            "cost-estimation sizing via the position_sizer (per "
+            "v2.8.1 H1); explicit per-bar position clamping requires "
+            "mode='event_driven'."
+        )
 
     def _warn_vectorized_unsupported(self) -> None:
         """Warn when vectorized mode is given config it silently ignores.
@@ -1400,15 +1464,29 @@ class BacktestEngine:
                 "Switch to mode='event_driven' to honor sizing config."
             )
 
-        # Per-field warnings for the rest.
+        # Per-field warnings for the rest. Field-specific dispatchers
+        # take precedence over the generic message.
+        special = {
+            "capital_allocator": self._warn_vectorized_capital_allocator_divergence,
+            "max_position_size": self._warn_vectorized_max_position_size_partial,
+        }
         for field in self._VECTORIZED_UNSUPPORTED_FIELDS:
             default = init_defaults.get(field)
             value = getattr(self, field, default)
+            # Fields stored with `X or {}` / `X or []` normalization
+            # show up as {} / [] in self even when the user passed
+            # None. Treat empty collections as "not configured".
+            if isinstance(value, (dict, list)) and not value:
+                continue
             if value != default:
-                warnings.warn(
-                    f"vectorized mode ignores {field}={value!r}; "
-                    "switch to mode='event_driven' to honor it."
-                )
+                handler = special.get(field)
+                if handler is not None:
+                    handler()
+                else:
+                    warnings.warn(
+                        f"vectorized mode ignores {field}={value!r}; "
+                        "switch to mode='event_driven' to honor it."
+                    )
 
     def _build_config(
         self,
@@ -1430,6 +1508,11 @@ class BacktestEngine:
         # don't get misleading "I set X but nothing changed" results.
         if self.mode == ExecutionMode.VECTORIZED:
             self._warn_vectorized_unsupported()
+
+        # v2.8.1: resolve representative notional/size for vectorized
+        # cost estimation. User-passed engine kwargs win; otherwise
+        # derive from the sizer.
+        rep_notional, rep_size = self._resolve_representative_trade()
 
         return BacktestConfig(
             initial_capital=self.initial_capital,
@@ -1474,7 +1557,42 @@ class BacktestEngine:
             impact_model=self.impact_model,
             impact_adv_lookback=self.impact_adv_lookback,
             impact_vol_lookback=self.impact_vol_lookback,
+            representative_notional=rep_notional,
+            representative_size=rep_size,
         )
+
+    def _resolve_representative_trade(self):
+        """Resolve (representative_notional, representative_size) for
+        vectorized cost estimation.
+
+        Q3 precedence: ANY user-passed engine kwarg wins independently.
+        If only ``representative_notional`` is set, use it (size derived
+        in apply_vectorized). If only ``representative_size`` is set,
+        use it (notional derived). If both, pass both through. Sizer
+        dispatch only runs when BOTH are None.
+
+        Sizer dispatch: Fraction/AllIn → notional via ``initial_capital
+        * min(fraction, max_position_size)`` (per ``position_sizing.py``'s
+        effective allocation); Fixed → size; anything else → both None
+        (apply_vectorized then takes the zero-cost-warned degenerate
+        branch).
+        """
+        # v2.8.1 post-review fix: honor user-passed values independently.
+        # The earlier `if representative_notional is not None: return
+        # (notional, size)` branch silently dropped a user-passed
+        # representative_size when notional was unset.
+        if (self.representative_notional is not None
+                or self.representative_size is not None):
+            return self.representative_notional, self.representative_size
+        sizer = self._position_sizer
+        if isinstance(sizer, (FractionSizer, AllInSizer)):
+            notional = self.initial_capital * min(
+                sizer.fraction, self.max_position_size
+            )
+            return notional, None
+        if isinstance(sizer, FixedSizer):
+            return None, sizer.size
+        return None, None
 
     def _build_result(
         self,
