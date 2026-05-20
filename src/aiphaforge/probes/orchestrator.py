@@ -1020,11 +1020,15 @@ class KnowledgeCheckReport:
         # has bucket_delta_tango_ci set + bucket_delta_ci missing →
         # AttributeError on any downstream read.
         if "bucket_delta_tango_ci" in state:
+            # stacklevel=3 lands at the user's pickle.load() / pickle.loads()
+            # site; pickle restore calls __setstate__ via _pickle.c
+            # internals, so stacklevel=2 would point at copyreg / pickle
+            # rather than the user (round-2 NIT).
             warnings.warn(
                 "Loaded a legacy pickle carrying bucket_delta_tango_ci; "
                 "translating to bucket_delta_ci. Re-save to silence. "
                 "Hard removal in v2.9.",
-                DeprecationWarning, stacklevel=2,
+                DeprecationWarning, stacklevel=3,
             )
             state = dict(state)
             state.setdefault("bucket_delta_ci",

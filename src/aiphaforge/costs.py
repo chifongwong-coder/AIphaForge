@@ -64,6 +64,15 @@ class BaseTradeCost:
 # branch so users can pass representative_notional explicitly.
 _DEGENERATE_WARNED = False
 
+# v2.8.1 post-review (Commit L / Option D): fired once per process
+# when the user passes BOTH representative_notional AND
+# representative_size — notional takes precedence, size is dropped.
+# A warning is preferable to silent overwrite (round-2 architect
+# HIGH-1 tail). Honoring both via implied-price reconstruction was
+# considered (Option A2) and rejected as over-engineering for an
+# edge case with no user reports.
+_BOTH_KWARGS_WARNED = False
+
 
 class DefaultTradeCost(BaseTradeCost):
     """Default trade cost model for vectorized backtesting.
@@ -111,8 +120,37 @@ class DefaultTradeCost(BaseTradeCost):
         #   1. User-provided representative_notional (Q3 user-wins).
         #   2. representative_size from sizer (B1 / FixedSizer path).
         #   3. Degenerate: zero cost + one-time warning.
+        #
+        # Precedence (v2.8.1 Commit L / Option D): if the user passes
+        # BOTH representative_notional AND representative_size, notional
+        # wins (size is derived from notional/median_close); the size
+        # input is dropped with a one-time warning. The fee model's
+        # estimate_commission_rate takes only (price, size), so honoring
+        # both literally would require a synthetic implied-price
+        # reconstruction (price=notional/size) — explicit non-goal here.
         rep_notional: Optional[float] = None
         rep_size: Optional[float] = None
+        if (
+            representative_notional is not None
+            and representative_size is not None
+            and np.isfinite(representative_notional)
+            and np.isfinite(representative_size)
+            and representative_notional > 0
+            and representative_size > 0
+        ):
+            global _BOTH_KWARGS_WARNED
+            if not _BOTH_KWARGS_WARNED:
+                _BOTH_KWARGS_WARNED = True
+                warnings.warn(
+                    "DefaultTradeCost.apply_vectorized: both "
+                    "representative_notional and representative_size "
+                    "were provided. The fee model's commission-rate "
+                    "query takes (price, size) only; notional takes "
+                    "precedence and size is dropped. Pass just one to "
+                    "silence this warning.",
+                    UserWarning,
+                    stacklevel=2,
+                )
         if (
             representative_notional is not None
             and np.isfinite(representative_notional)

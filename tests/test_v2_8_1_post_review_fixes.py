@@ -162,3 +162,130 @@ def test_build_synthetic_anchor_complete_columns_does_not_raise():
     )
     # Should not raise:
     build_synthetic_anchor(df, seed=1, method="block_bootstrap")
+
+
+# --------------------------------------------------------------------
+# Commit L (Option D) — both kwargs supplied → warn + notional wins
+# --------------------------------------------------------------------
+
+def test_apply_vectorized_warns_when_both_representative_kwargs_set():
+    """When the user passes BOTH representative_notional and
+    representative_size, the fee model's commission-rate query can use
+    only one (price, size) pair. Notional wins per documented
+    precedence; size is dropped with a one-time warning."""
+    from aiphaforge import USStockFeeModel
+    from aiphaforge.costs import DefaultTradeCost
+    import aiphaforge.costs as costs_module
+
+    n = 50
+    idx = pd.date_range("2024-01-02", periods=n, freq="B")
+    close = 100.0
+    data = pd.DataFrame(
+        {"open": close, "high": close * 1.01, "low": close * 0.99,
+         "close": close, "volume": 1e6},
+        index=idx,
+    )
+    positions = pd.Series(0.0, index=idx)
+    positions.iloc[5:10] = 1.0
+    returns = pd.Series(0.0, index=idx)
+
+    # Reset module-level once-flag so this test reliably observes the
+    # warning regardless of test ordering.
+    costs_module._BOTH_KWARGS_WARNED = False
+
+    tc = DefaultTradeCost()
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter("always")
+        tc.apply_vectorized(
+            returns, positions, data,
+            USStockFeeModel(commission_per_share=0.005, min_commission=1.0),
+            initial_capital=100_000,
+            representative_notional=50_000.0,
+            representative_size=200.0,
+        )
+    msgs = [str(w.message) for w in captured
+            if issubclass(w.category, UserWarning)]
+    assert any("both representative_notional and representative_size" in m
+               and "notional takes precedence" in m for m in msgs), (
+        f"expected both-kwargs UserWarning; got {msgs!r}"
+    )
+
+
+def test_apply_vectorized_both_kwargs_notional_wins_numerically():
+    """When both kwargs are supplied, the resulting cost rate must
+    match the notional-only path (NOT the size-only path)."""
+    from aiphaforge import USStockFeeModel
+    from aiphaforge.costs import DefaultTradeCost
+    import aiphaforge.costs as costs_module
+
+    n = 50
+    idx = pd.date_range("2024-01-02", periods=n, freq="B")
+    close = 100.0
+    data = pd.DataFrame(
+        {"open": close, "high": close * 1.01, "low": close * 0.99,
+         "close": close, "volume": 1e6},
+        index=idx,
+    )
+    positions = pd.Series(0.0, index=idx)
+    positions.iloc[5:10] = 1.0  # one trade in, one out
+    returns = pd.Series(0.0, index=idx)
+
+    tc = DefaultTradeCost()
+    fee = USStockFeeModel(commission_per_share=0.005, min_commission=1.0)
+
+    # Path 1: notional only.
+    net_notional_only = tc.apply_vectorized(
+        returns.copy(), positions, data, fee,
+        initial_capital=100_000, representative_notional=50_000.0,
+    )
+    # Path 2: both supplied — size should be dropped, behavior must
+    # match notional-only.
+    costs_module._BOTH_KWARGS_WARNED = False
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        net_both = tc.apply_vectorized(
+            returns.copy(), positions, data, fee,
+            initial_capital=100_000,
+            representative_notional=50_000.0,
+            representative_size=200.0,
+        )
+    pd.testing.assert_series_equal(net_notional_only, net_both)
+
+
+def test_apply_vectorized_no_warning_when_only_one_kwarg_set():
+    """Single-kwarg paths must NOT emit the both-set warning. Pins
+    that the warning only fires in the both-set ambiguity case."""
+    from aiphaforge import USStockFeeModel
+    from aiphaforge.costs import DefaultTradeCost
+    import aiphaforge.costs as costs_module
+
+    n = 30
+    idx = pd.date_range("2024-01-02", periods=n, freq="B")
+    close = 100.0
+    data = pd.DataFrame(
+        {"open": close, "high": close * 1.01, "low": close * 0.99,
+         "close": close, "volume": 1e6},
+        index=idx,
+    )
+    positions = pd.Series(0.5, index=idx)
+    positions.iloc[0] = 0.0
+    returns = pd.Series(0.0, index=idx)
+    tc = DefaultTradeCost()
+    fee = USStockFeeModel(commission_per_share=0.005, min_commission=1.0)
+
+    for kwargs in [
+        {"representative_notional": 50_000.0},
+        {"representative_size": 500.0},
+    ]:
+        costs_module._BOTH_KWARGS_WARNED = False
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            tc.apply_vectorized(returns.copy(), positions, data, fee,
+                                initial_capital=100_000, **kwargs)
+        both_warns = [w for w in captured
+                      if issubclass(w.category, UserWarning)
+                      and "both representative" in str(w.message)]
+        assert not both_warns, (
+            f"unexpected both-kwargs warning when only {list(kwargs)} "
+            f"was set: {[str(w.message) for w in both_warns]}"
+        )

@@ -764,8 +764,9 @@ to reference.
 
 ### CI engineer triage block
 
-Seven expected failure modes when CI re-baselines on v2.8.1, in
-roughly decreasing frequency:
+Seven expected failure modes when CI re-baselines on v2.8.1, listed
+in order of impact (silent-correctness bugs first, then noisy breaks,
+then opt-in `-W error` breaks):
 
 1. **Equity curve drift (H1)** — most common. Cost rate fixed;
    rebaseline golden fixtures for any single-asset vectorized run.
@@ -847,19 +848,24 @@ does not — typical relative error < 1% at spread ≤ 5%, see the
   clean load to silence.
 - **H7** kwargs-only: `KnowledgeCheckReport` accepts ONLY keyword
   arguments since v2.8.1. Positional construction raises `TypeError`.
-  Real-field-name example:
+  The dataclass has 24 required fields plus several optional defaults;
+  the skeleton below is illustrative — copy-paste will raise
+  `TypeError: missing required argument 'paired_sign_test_n_positive'`
+  (or similar) until every required field is supplied. Inspect
+  `dataclasses.fields(KnowledgeCheckReport)` for the authoritative
+  list:
   ```python
   # v2.8.0 (worked, no longer):
   # KnowledgeCheckReport("knowledge", real_score, anchor_score, ...)
 
-  # v2.8.1+:
+  # v2.8.1+ (skeleton — supply ALL 24 required fields):
   KnowledgeCheckReport(
       probe_kind="knowledge",
       real_score=real_score,
       anchor_score=anchor_score,
       bucket_delta=bucket_delta,
       paired_sign_test_p=sign_test_p_val,
-      # ... other 20+ fields by keyword ...
+      # ... other ~14 required fields by keyword ...
       anchor_validity="OK",
       parsing_schema_hash=schema_hash,
       parsing_schema_description=schema_desc,
@@ -867,7 +873,6 @@ does not — typical relative error < 1% at spread ≤ 5%, see the
       prompt_template_description=template_desc,
   )
   ```
-  See `KnowledgeCheckReport` for the full field list.
 - **H8** promoted symbols (your existing imports are now blessed):
   `serialize_answer_records`, `resolve_determinism_config`.
 
