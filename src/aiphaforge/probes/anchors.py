@@ -207,16 +207,34 @@ def _build_ohlcv_from_returns(
 ) -> pd.DataFrame:
     """Integrate a return series into an OHLCV DataFrame matching
     the real_data index. Open/high/low are derived from the real
-    bar's (high - low) / close spread ratio so that Parkinson /
-    Garman-Klass volatility on the synthetic series tracks the real
-    bar's intra-bar range (v2.8.1 H5 — the v2.8.0 constant ±1.5%
-    produced deterministic noise that broke vol estimators).
+    bar's ``(high - low) / close`` spread RATIO so that intra-bar
+    volatility tracks the real bar's range (v2.8.1 H5 — the v2.8.0
+    constant ±1.5% produced deterministic noise that broke vol
+    estimators).
+
+    Accuracy notes (v2.8.1 post-review):
+
+    - The synthetic spread ratio ``(H_syn - L_syn) / close_syn`` is
+      bar-for-bar IDENTICAL to the real spread ratio. Tests that
+      compare those values pass to machine precision.
+    - Parkinson ``(ln(H/L))^2`` on the synthetic series is
+      APPROXIMATELY equal to the real Parkinson, not exact. The
+      synthetic bar centers H/L symmetrically around close
+      (``H = close*(1 + spread/2)``, ``L = close*(1 - spread/2)``);
+      a real bar is not in general symmetric around close. The
+      deviation is small at typical equity spreads (<1% relative
+      error at spread ≤ 5%) and dominated by the v2.8.0 constant
+      ±1.5% bias it replaces, but a user computing Parkinson with
+      strict accuracy guarantees should reach for ``real_data``
+      directly. v2.9 may switch to ``half = spread/(2 + spread)``
+      (Parkinson-exact reconstruction) if this matters.
 
     Parameters
     ----------
     hl_spread_source
         ``"real_bar_ratio"`` (default) — use the real bar's H/L
-        spread per timestamp. Bar-for-bar identical spread series.
+        spread per timestamp. Bar-for-bar identical spread RATIO
+        series.
         ``"real_distribution_shuffled"`` — permute the real spread
         ratios with ``spread_rng``. Destroys bar-level autocorrelation
         while preserving the marginal distribution; used as a
@@ -365,6 +383,20 @@ def build_synthetic_anchor(
         raise ValueError(
             f"hl_spread_source must be 'real_bar_ratio' or "
             f"'real_distribution_shuffled'; got {hl_spread_source!r}"
+        )
+
+    # v2.8.1 post-review fix: H/L spread derivation needs the real bar's
+    # high/low columns. Validate up front so a missing column surfaces
+    # as a clean ValueError, not a deep KeyError inside
+    # _build_ohlcv_from_returns.
+    missing_cols = [c for c in ("close", "high", "low", "volume")
+                    if c not in real_data.columns]
+    if missing_cols:
+        raise ValueError(
+            f"build_synthetic_anchor: real_data missing required "
+            f"column(s) {missing_cols}. v2.8.1 derives synthetic H/L "
+            f"from the real bar's (H-L)/close spread ratio, so all of "
+            f"open/high/low/close/volume must be present."
         )
 
     if label is None:

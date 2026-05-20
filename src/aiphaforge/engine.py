@@ -1565,14 +1565,24 @@ class BacktestEngine:
         """Resolve (representative_notional, representative_size) for
         vectorized cost estimation.
 
-        Q3 precedence: user-passed engine kwargs win. Otherwise dispatch
-        on the sizer type — Fraction/AllIn → notional via
-        ``initial_capital * min(fraction, max_position_size)`` (per
-        ``position_sizing.py``'s effective allocation); Fixed → size;
-        anything else → both None (apply_vectorized then takes the
-        zero-cost-warned degenerate branch).
+        Q3 precedence: ANY user-passed engine kwarg wins independently.
+        If only ``representative_notional`` is set, use it (size derived
+        in apply_vectorized). If only ``representative_size`` is set,
+        use it (notional derived). If both, pass both through. Sizer
+        dispatch only runs when BOTH are None.
+
+        Sizer dispatch: Fraction/AllIn → notional via ``initial_capital
+        * min(fraction, max_position_size)`` (per ``position_sizing.py``'s
+        effective allocation); Fixed → size; anything else → both None
+        (apply_vectorized then takes the zero-cost-warned degenerate
+        branch).
         """
-        if self.representative_notional is not None:
+        # v2.8.1 post-review fix: honor user-passed values independently.
+        # The earlier `if representative_notional is not None: return
+        # (notional, size)` branch silently dropped a user-passed
+        # representative_size when notional was unset.
+        if (self.representative_notional is not None
+                or self.representative_size is not None):
             return self.representative_notional, self.representative_size
         sizer = self._position_sizer
         if isinstance(sizer, (FractionSizer, AllInSizer)):

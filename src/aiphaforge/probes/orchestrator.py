@@ -1012,6 +1012,24 @@ class KnowledgeCheckReport:
         return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:
+        # v2.8.1 post-review fix: legacy alias translation. Old pickles
+        # (v2.7.x or earlier) carry `bucket_delta_tango_ci` instead of
+        # `bucket_delta_ci`. __init__'s translation block only covers
+        # construction; pickle restore goes through __setstate__, so
+        # the same translation must happen here or the revived instance
+        # has bucket_delta_tango_ci set + bucket_delta_ci missing →
+        # AttributeError on any downstream read.
+        if "bucket_delta_tango_ci" in state:
+            warnings.warn(
+                "Loaded a legacy pickle carrying bucket_delta_tango_ci; "
+                "translating to bucket_delta_ci. Re-save to silence. "
+                "Hard removal in v2.9.",
+                DeprecationWarning, stacklevel=2,
+            )
+            state = dict(state)
+            state.setdefault("bucket_delta_ci",
+                             state.pop("bucket_delta_tango_ci"))
+
         # Re-wrap MappingProxyType after load + replay __post_init__
         # so any validation / wrapping side effects fire on the
         # revived instance (v2.1.2 M5).
