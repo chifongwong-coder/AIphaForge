@@ -46,11 +46,19 @@ def test_validate_ohlcv_duplicate_index_raises_at_all_levels(validation_level):
 
 def test_engine_event_driven_rejects_dup_data_at_validation_not_loop():
     """Engine event-driven on dup data raises ValueError at validation,
-    NOT TypeError mid-loop (the v2.8.0 failure mode)."""
+    NOT TypeError mid-loop (the v2.8.0 failure mode).
+
+    v2.8.2 M3 added set_signals boundary validation; to keep this test
+    focused on validate_ohlcv (the H2 contract), the signals get a
+    clean (non-dup) DatetimeIndex; the OHLCV data carries the dup.
+    Engine.run validates the data and raises before the signal index
+    matters.
+    """
     df = _dup_ohlcv()
+    clean_idx = pd.date_range("2024-01-02", periods=5, freq="D")
     eng = BacktestEngine(
         initial_capital=100_000, mode="event_driven", data_validation="warn",
     )
-    eng.set_signals(pd.Series(0.0, index=df.index))
+    eng.set_signals(pd.Series(0.0, index=clean_idx))
     with pytest.raises(ValueError, match="duplicate"):
         eng.run(df)

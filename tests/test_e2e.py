@@ -743,7 +743,11 @@ class TestEdgeCases:
 
     def test_empty_data_raises(self):
         engine = BacktestEngine(fee_model=ZeroFeeModel())
-        engine.set_signals(pd.Series(dtype=float))
+        # v2.8.2 M3: set_signals validates index type; an empty Series
+        # needs a DatetimeIndex (not the default RangeIndex) to pass
+        # boundary validation. The test's intent is to verify
+        # engine.run rejects empty DATA, not to test set_signals.
+        engine.set_signals(pd.Series(dtype=float, index=pd.DatetimeIndex([])))
         with pytest.raises(ValueError):
             engine.run(make_ohlcv(10).iloc[:0])
 
