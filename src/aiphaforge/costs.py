@@ -105,6 +105,16 @@ class DefaultTradeCost(BaseTradeCost):
       material for active strategies over long horizons). The
       iteratively-correct version is a v2.9 follow-up.
 
+      **NaN handling**: ``returns.fillna(0)`` is applied before the
+      ``cumprod`` so a leading NaN (typical from ``pct_change``) does
+      not propagate and zero out the entire equity curve. Mid-run
+      NaN (e.g. from a data gap propagating through the strategy
+      returns) is also treated as a 0% bar — ``running_equity``
+      stays at the pre-gap level. This is acceptable for the
+      diagnostic-grade semantics of this mode; for backtests with
+      genuine mid-run data gaps, prefer the default
+      ``"initial_capital"`` mode.
+
       **Clip floor**: divides by ``max(running_equity, 0.01 *
       initial_capital)``. A backtest below 1% of starting capital is
       already blown up; the floor caps per-bar cost-return at a

@@ -62,9 +62,12 @@ def test_shared_strategy_instance_leaks_adjustment_across_runs():
     # Mutate through ctx_a:
     ctx_a.adjust_strategy_params(short=10)
 
-    # ctx_b sees the mutation because both reference the same object:
-    assert ctx_b._strategy is strategy
-    assert ctx_b._strategy.short == 10, (
+    # ctx_b sees the mutation because both reference the same object.
+    # Use the PUBLIC current_strategy property (not the private
+    # _strategy attribute) so a v2.8.3 refactor that renames the
+    # private slot doesn't AttributeError silently.
+    assert ctx_b.current_strategy is strategy
+    assert ctx_b.current_strategy.short == 10, (
         "shared-strategy contamination expected — if this fails, "
         "v2.8.3 may have introduced isolation; update the docstring "
         "to match the new behavior."
@@ -90,7 +93,7 @@ def test_factory_pattern_isolates_adjustments_across_runs():
     ctx_a.adjust_strategy_params(short=10)
 
     # ctx_b's strategy is a separate instance — unaffected by ctx_a's
-    # adjustment.
-    assert ctx_a._strategy is not ctx_b._strategy
-    assert ctx_a._strategy.short == 10
-    assert ctx_b._strategy.short == 5  # pristine
+    # adjustment. Use the public property here too.
+    assert ctx_a.current_strategy is not ctx_b.current_strategy
+    assert ctx_a.current_strategy.short == 10
+    assert ctx_b.current_strategy.short == 5  # pristine

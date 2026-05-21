@@ -86,6 +86,26 @@ def test_stop_loss_event_vs_vectorized_diverges_on_gap_bar():
         f"{rel_divergence:.4%} (vectorized={eq_vec:.0f}, "
         f"event_driven={eq_evt:.0f})"
     )
+    # Upper bound (round-2 test/API M-3): also pin that vectorized's
+    # equity is OPTIMISTIC vs event-driven (vectorized assumes the
+    # theoretical threshold loss; event-driven realizes the worse
+    # gap fill). If a future v2.9 fix aligns vectorized to event-
+    # driven's next-bar-open semantics, divergence collapses → fails
+    # lower bound (good). If a partial fix uses some intermediate
+    # price (e.g. trigger-bar close instead of next-bar open), this
+    # upper bound catches it.
+    assert eq_vec > eq_evt, (
+        f"vectorized equity ({eq_vec:.0f}) should be optimistic vs "
+        f"event-driven ({eq_evt:.0f}) on a gap-down trigger; "
+        f"vectorized clamps to threshold, event-driven realizes the gap"
+    )
+    # Hard upper: divergence shouldn't exceed the gap's notional
+    # impact * position size. 12% gap * 0.95 size = ~11.4% of capital.
+    # Cap at 15% to allow slippage / dividend noise.
+    assert rel_divergence < 0.15, (
+        f"divergence exceeds expected gap-impact bound; got "
+        f"{rel_divergence:.4%} — investigate before relaxing"
+    )
 
 
 # --------------------------------------------------------------------

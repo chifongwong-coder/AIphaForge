@@ -742,11 +742,17 @@ with Pool() as pool:
 If your historical v2.8.1-or-earlier results came from the
 "shared instance" pattern with mid-run `adjust_strategy_params`
 calls, those results are cross-contaminated and should be
-re-run with the factory pattern. **Performance optimization
-for this regen path (partial-timeline regen instead of full
-regen on every adjustment) ships in v2.8.3, designed jointly
-with the v2.9 `IncrementalFactor` engine integration so both
-consumers share a single opt-in incremental interface.**
+re-run with the factory pattern. **There is NO runtime
+detection in v2.8.2** — if you upgrade via dependabot / auto-pin
+without reading these release notes, silent contamination from
+prior runs persists. You must audit your parallel-backtest
+pipelines and switch to the factory pattern manually.
+
+**Performance optimization for this regen path (partial-timeline
+regen instead of full regen on every adjustment) ships in v2.8.3,
+designed jointly with the v2.9 `IncrementalFactor` engine
+integration so both consumers share a single opt-in incremental
+interface.**
 
 ### CI engineer triage block
 
@@ -775,7 +781,18 @@ order of impact:
    change; new regression test pins existing event-driven /
    vectorized divergence magnitude on a gap-bar fixture. CI
    suites mirroring that fixture pattern may need to update
-   their expected divergence range.
+   their expected divergence range. **Note for live-vs-backtest
+   users**: vectorized PnL is OPTIMISTIC vs event-driven on
+   gap-down triggers; if you tune thresholds against vectorized
+   and run live event-driven, expect realized worse fills.
+6. **New tests + test regressions fixed (Commit F + v2.8.1
+   deferred items)** — 9 new test files / additions land in
+   v2.8.2 (M1-M5 + 4 v2.8.1 follow-up pins). 2 pre-existing tests
+   were updated to honor M3's stricter `set_signals` validation
+   (`test_e2e.py::test_empty_data_raises`,
+   `test_v2_8_1_h2_dup_index.py::test_engine_event_driven_rejects_dup_data`).
+   A CI workflow running `pytest --collect-only` diff will see
+   these new entries; no behavior change in the production code.
 
 ### Per-M one-liner
 
@@ -821,13 +838,22 @@ fee = USStockFeeModel(sec_fee_rate=0)
 # Cross-boundary backtest spanning the FY2026-2 effective date
 # (2026-04-04): SEC §31 jumped from 8.00e-6 to 20.60e-6.
 # Run two segments with separate USStockFeeModel instances and
-# concatenate equity curves; a single scalar can't express both:
+# concatenate equity curves; a single scalar can't express both.
+# NOTE: this is a CALLER-side recipe — the engine has no in-engine
+# path for switching fee model mid-run. Split your data, run two
+# BacktestEngine instances, then concatenate the equity curves
+# manually.
 fee_pre  = USStockFeeModel(sec_fee_rate=8.00e-6)   # 2025-10-01..2026-04-03
 fee_post = USStockFeeModel(sec_fee_rate=20.60e-6)  # 2026-04-04..present
 ```
 
 For historic rates outside v2.8.2's defaults, consult the SEC Fee
 Rate Advisory archive and the FINRA Trading Activity Fee schedule.
+
+Add MultiIndex to the M3 rejection enumeration too (was in
+`tests/_helpers/expected_rejections.md` but missed in the README
+list): MultiIndex Series also raise `TypeError` from
+`validate_signal_series`.
 
 ### M5 decision rubric
 
@@ -852,9 +878,12 @@ iteratively-correct version is a v2.9 follow-up.
 # v2.8.1 (previous release):
 pip install git+https://github.com/chifongwong-coder/AIphaForge@5862eb7
 
-# v2.8.2 (current release — pin individual commits via
-# git log feature/v2.8.2-strategy-medium):
-pip install git+https://github.com/chifongwong-coder/AIphaForge@feature/v2.8.2-strategy-medium
+# v2.8.2 (current release): pin the immutable commit SHA below.
+# Until the v2.8.2 branch is merged to main, this is the HEAD SHA
+# of feature/v2.8.2-strategy-medium; after merge, swap to the
+# merge-commit SHA from `git log main` for the immutable reference.
+# Avoid pinning to a branch name — branch names are mutable.
+pip install git+https://github.com/chifongwong-coder/AIphaForge@2240d2b
 ```
 
 ### Deprecation removal commitment

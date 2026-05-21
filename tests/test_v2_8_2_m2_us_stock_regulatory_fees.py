@@ -111,6 +111,28 @@ def test_us_stock_regulatory_fees_opt_out_by_zero_kwargs():
 # Test 6 — min_commission and regulatory fees are independent
 # --------------------------------------------------------------------
 
+def test_us_stock_estimate_commission_rate_side_average_halves_reg_fees():
+    """side='average' is the value used by the vectorized cost path's
+    representative-rate query. It computes ``(buy + sell) / (2 * notional)``,
+    which naturally picks up HALF of the sell-only regulatory fees.
+    Pin this — a regression that "fixes" average to apply full sell-side
+    regulatory fees would silently double-bill vectorized costs."""
+    fee = USStockFeeModel()
+    price = 100.0
+    size = 1000.0
+
+    rate_buy = fee.estimate_commission_rate(price=price, size=size, side="buy")
+    rate_sell = fee.estimate_commission_rate(price=price, size=size, side="sell")
+    rate_avg = fee.estimate_commission_rate(price=price, size=size, side="average")
+
+    # The base-class average implementation is (buy_commission +
+    # sell_commission) / (2 * notional). So rate_avg should equal
+    # (rate_buy + rate_sell) / 2 exactly.
+    assert rate_avg == pytest.approx((rate_buy + rate_sell) / 2)
+    # And rate_avg sits strictly between buy and sell:
+    assert rate_buy < rate_avg < rate_sell
+
+
 def test_us_stock_reg_fees_independent_of_broker_min_commission():
     """Tiny sell hits broker min_commission floor; regulatory fees
     still accrue on top — they are statutory, not subject to the

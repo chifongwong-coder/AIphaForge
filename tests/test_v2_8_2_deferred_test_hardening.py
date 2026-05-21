@@ -65,16 +65,20 @@ def test_h1_apply_vectorized_calls_estimate_commission_rate_with_named_kwargs():
         initial_capital=100_000, representative_notional=50_000.0,
     )
 
-    # Asserts: estimate_commission_rate called at least once with
-    # explicit price=, size=, side= kwargs.
-    fake_fee.estimate_commission_rate.assert_called_once()
-    call_kwargs = fake_fee.estimate_commission_rate.call_args.kwargs
-    assert set(call_kwargs.keys()) == {"price", "size", "side"}
-    assert call_kwargs["side"] == "average"
-    # price and size are derived from data + representative_notional,
-    # specific values aren't pinned here (numerical-correctness covered
-    # elsewhere). The PIN is on the call SHAPE — protect against a
-    # regression that drops kwargs and reverts to v2.8.0 no-args bug.
+    # Asserts: estimate_commission_rate was called at least once and
+    # EVERY call used the explicit price=/size=/side= named kwargs.
+    # (Not `assert_called_once` — a future refactor that queries
+    # per-side or per-trade would legitimately produce multiple calls,
+    # and we want the test to keep passing as long as the call SHAPE
+    # is right. The PIN is on the call shape — protect against a
+    # regression that drops kwargs and reverts to v2.8.0 no-args bug.)
+    assert fake_fee.estimate_commission_rate.call_count >= 1
+    for call in fake_fee.estimate_commission_rate.call_args_list:
+        assert set(call.kwargs.keys()) == {"price", "size", "side"}, (
+            f"unexpected call signature: args={call.args}, "
+            f"kwargs={call.kwargs}"
+        )
+        assert call.kwargs["side"] == "average"
 
 
 # --------------------------------------------------------------------
