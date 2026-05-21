@@ -55,6 +55,36 @@ class PercentageStopLoss(BaseExitRule):
 
     Parameters:
         threshold: Maximum allowed loss as a positive fraction (e.g. 0.05 = 5%).
+
+    Mode divergence (v2.8.2)
+    ------------------------
+    Event-driven and vectorized modes compute the EXIT PRICE
+    differently when a stop is triggered:
+
+    - **Event-driven**: ``check_event_driven`` submits a market order
+      at the trigger bar. The broker fills at the **next bar's open**
+      per the engine fill model. On a gap-down trigger, the realized
+      exit is WORSE than the theoretical stop threshold; the loss
+      shown in the equity curve reflects the gap.
+
+    - **Vectorized**: ``apply_vectorized`` clamps the trigger-bar
+      return to approximately ``-threshold`` — i.e. assumes the exit
+      filled at the theoretical stop level on the trigger bar.
+      Gap-down losses BELOW threshold are NOT modeled.
+
+    For strategies running in markets with material gap risk (US
+    equities overnight, crypto weekends, single-stock earnings),
+    the two modes can diverge by 0.1 to several percent per stopped
+    trade. PnL summaries built off vectorized will look optimistic
+    relative to event-driven runs of the same data + strategy.
+
+    Two paths to consistency:
+
+    - Run event-driven for the final equity curve when realized fills
+      matter (research → live).
+    - Aligning vectorized to use next-bar open requires plumbing
+      access to next-bar OHLC into the vectorized cost path; that
+      is a v2.9 architectural item and not in v2.8.x scope.
     """
 
     def __init__(self, threshold: float):

@@ -428,6 +428,15 @@ class BacktestEngine:
                 boundary. This is a breaking change from v2.6 only for
                 callers who relied on the prior crash being caught
                 upstream.
+            TypeError: if ``signals`` is neither ``pd.Series`` nor
+                ``dict[str, pd.Series]`` (v2.8.2).
+            TypeError: from ``validate_signal_series`` if the Series
+                (or any dict value) has a non-``DatetimeIndex`` or
+                non-numeric dtype (v2.8.2).
+            ValueError: from ``validate_signal_series`` on duplicate
+                timestamps (v2.8.2). Engine-level ``data_validation
+                ="none"`` skips this validation for parity with
+                :func:`aiphaforge.utils.validate_ohlcv`.
         """
         if isinstance(signals, pd.DataFrame):
             raise TypeError(
@@ -437,6 +446,28 @@ class BacktestEngine:
                 "(See README v2.7 release notes — this is a breaking "
                 "change from v2.6.)"
             )
+        # v2.8.2 M3: boundary validation. set_signals_wide already
+        # calls validate_signal_wide; this closes the gap on the
+        # single-Series / per-symbol-dict path. Respects engine
+        # data_validation="none" for parity with validate_ohlcv.
+        if self.data_validation != "none":
+            from .signals import validate_signal_series
+            if isinstance(signals, dict):
+                for sym, s in signals.items():
+                    try:
+                        validate_signal_series(s)
+                    except (ValueError, TypeError) as exc:
+                        raise type(exc)(
+                            f"set_signals: invalid signals[{sym!r}] — {exc}"
+                        ) from exc
+            elif isinstance(signals, pd.Series):
+                validate_signal_series(signals)
+            else:
+                raise TypeError(
+                    f"set_signals expected pd.Series or "
+                    f"dict[str, pd.Series]; got "
+                    f"{type(signals).__name__}"
+                )
         self._signals = signals
         self._strategy = None
         self._target_weights = None

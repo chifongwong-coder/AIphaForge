@@ -73,9 +73,37 @@ class MetaContext:
         self._log('set_strategy', strategy.name)
 
     def adjust_strategy_params(self, **kwargs: Any) -> None:
-        """Adjust current strategy parameters via update_params().
+        """Adjust current strategy parameters via ``update_params()``.
 
         Triggers signal regeneration so new params take effect.
+
+        WARNING (v2.8.2 — silent-correctness): MUTATES
+        ``self._strategy`` IN PLACE via the strategy's
+        ``update_params`` method. If a single strategy instance is
+        shared across parallel-backtest workers (``multiprocessing
+        .Pool``, threading, or simple loop reuse), the adjustment
+        from one run becomes visible to ALL other callers holding
+        the same reference — silent cross-contamination of results.
+
+        Parallel-backtest recipe — use a factory, NOT a shared
+        instance::
+
+            # WRONG — shared instance leaks adjustment across runs:
+            strategy = MACrossover(short=5, long=20)
+            with Pool() as pool:
+                pool.map(lambda d: run(d, strategy), datasets)
+
+            # RIGHT — factory per worker isolates state:
+            def make_strategy():
+                return MACrossover(short=5, long=20)
+            with Pool() as pool:
+                pool.map(lambda d: run(d, make_strategy()), datasets)
+
+        Performance note: regeneration runs over the FULL timeline
+        each call (O(N·K) for N bars × K adjustments).
+        Partial-timeline regeneration is planned for v2.8.3, designed
+        jointly with the v2.9 ``IncrementalFactor`` engine integration
+        so both consumers share a single opt-in incremental interface.
         """
         if self._strategy is not None:
             self._strategy.update_params(**kwargs)

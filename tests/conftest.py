@@ -89,6 +89,25 @@ def make_probe_ohlcv(
     )
 
 
+@pytest.fixture(autouse=True)
+def _reset_costs_module_warning_flags():
+    """v2.8.2 round-2 test/API M-1: ``aiphaforge.costs`` keeps two
+    process-global flags (``_BOTH_KWARGS_WARNED`` and
+    ``_DEGENERATE_WARNED``) that fire each at most once per process,
+    so duplicate warnings don't spam in long-running pipelines.
+
+    For tests, this once-per-process behavior leaks state across
+    test files (the first test to trip the flag silences subsequent
+    tests' warnings). Reset both flags to False before every test.
+    The v2.8.1 tests do this manually inline; this autouse fixture
+    makes the behavior uniform and prevents divergence.
+    """
+    import aiphaforge.costs as _costs_mod
+    _costs_mod._BOTH_KWARGS_WARNED = False
+    _costs_mod._DEGENERATE_WARNED = False
+    yield
+
+
 @pytest.fixture
 def sample_data() -> pd.DataFrame:
     """100-bar OHLCV DataFrame with moderate upward trend."""

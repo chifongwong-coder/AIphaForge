@@ -5,7 +5,7 @@ Pluggable trade cost framework for vectorized backtesting.
 """
 
 import warnings
-from typing import Optional
+from typing import Literal, Optional
 
 import numpy as np
 import pandas as pd
@@ -85,7 +85,58 @@ class DefaultTradeCost(BaseTradeCost):
     rather than the bare-default (100, 100) that v2.8.0 used. The
     bare-default produced ~1% cost rates for US stock fee models with
     min-commission floors — see v2.8.1 plan H1.
+
+    v2.8.2: opt-in ``cost_normalization``:
+
+    - ``"initial_capital"`` (default, preserves v2.8.1 semantics):
+      ``trade_cost = gross_cost / initial_capital``. Path-independent;
+      cost-as-return is anchored to starting capital.
+    - ``"current_equity"``: ``trade_cost = gross_cost / running_equity``
+      where ``running_equity = initial_capital * (1 + returns).cumprod()``.
+      Reports cost as a fraction of CURRENT equity, which is more
+      faithful for drawn-down portfolios (a $50 fee on $30k equity is
+      a 0.17% return contribution, not the 0.05% the "initial_capital"
+      mode would report).
+
+      **First-order approximation**: ``running_equity`` is computed
+      from GROSS (pre-cost) returns, not true realized equity. The
+      systematic bias UNDER-states cost; magnitude grows with
+      turnover × horizon (small for low-turnover / short backtests,
+      material for active strategies over long horizons). The
+      iteratively-correct version is a v2.9 follow-up.
+
+      **NaN handling**: ``returns.fillna(0)`` is applied before the
+      ``cumprod`` so a leading NaN (typical from ``pct_change``) does
+      not propagate and zero out the entire equity curve. Mid-run
+      NaN (e.g. from a data gap propagating through the strategy
+      returns) is also treated as a 0% bar — ``running_equity``
+      stays at the pre-gap level. This is acceptable for the
+      diagnostic-grade semantics of this mode; for backtests with
+      genuine mid-run data gaps, prefer the default
+      ``"initial_capital"`` mode.
+
+      **Clip floor**: divides by ``max(running_equity, 0.01 *
+      initial_capital)``. A backtest below 1% of starting capital is
+      already blown up; the floor caps per-bar cost-return at a
+      finite interpretable value.
+
+    Parameters:
+        cost_normalization: ``"initial_capital"`` (default) or
+            ``"current_equity"``. See class docstring for semantics.
     """
+
+    def __init__(
+        self,
+        cost_normalization: Literal[
+            "initial_capital", "current_equity"
+        ] = "initial_capital",
+    ):
+        if cost_normalization not in ("initial_capital", "current_equity"):
+            raise ValueError(
+                f"cost_normalization must be 'initial_capital' or "
+                f"'current_equity'; got {cost_normalization!r}"
+            )
+        self.cost_normalization = cost_normalization
 
     def apply_vectorized(
         self,
@@ -199,10 +250,23 @@ class DefaultTradeCost(BaseTradeCost):
 
         # Notional value of each trade (trade_size * price)
         trade_notional = trade_size * data["close"]
+        gross_cost = trade_notional * (commission_rate + slippage_rate)
 
-        # Single-side cost for each position change
-        trade_cost = (
-            trade_notional * (commission_rate + slippage_rate) / initial_capital
-        )
+        # v2.8.2 M5: cost_normalization dispatch.
+        if self.cost_normalization == "current_equity":
+            # Running equity from cumulative PRE-cost (gross) returns.
+            # First-order approximation: true realized equity is
+            # smaller in cost-positive runs; under-states cost. See
+            # class docstring + v2.8.2 plan.
+            cum_returns = (1 + returns.fillna(0)).cumprod()
+            running_equity = initial_capital * cum_returns
+            # Clip to 1% of initial capital — a blown-up backtest's
+            # cost-return is capped at gross_cost / (0.01 *
+            # initial_capital) instead of diverging to inf.
+            trade_cost = gross_cost / running_equity.clip(
+                lower=0.01 * initial_capital
+            )
+        else:  # "initial_capital" (default, v2.8.1 semantics)
+            trade_cost = gross_cost / initial_capital
 
         return returns - trade_cost
