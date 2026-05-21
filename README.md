@@ -790,7 +790,7 @@ order of impact:
    v2.8.2 (M1-M5 + 4 v2.8.1 follow-up pins). 2 pre-existing tests
    were updated to honor M3's stricter `set_signals` validation
    (`test_e2e.py::test_empty_data_raises`,
-   `test_v2_8_1_h2_dup_index.py::test_engine_event_driven_rejects_dup_data`).
+   `test_v2_8_1_h2_dup_index.py::test_engine_event_driven_rejects_dup_data_at_validation_not_loop`).
    A CI workflow running `pytest --collect-only` diff will see
    these new entries; no behavior change in the production code.
 
@@ -809,7 +809,7 @@ order of impact:
 `set_signals` now rejects these Series shapes at the boundary
 (authoritative source: `tests/_helpers/expected_rejections.md`):
 
-- Non-`DatetimeIndex` (e.g. `RangeIndex`, `Int64Index`) → `TypeError`
+- Non-`DatetimeIndex` (e.g. `RangeIndex`, `Int64Index`, `MultiIndex`) → `TypeError`
 - Duplicate `DatetimeIndex` timestamps → `ValueError`
 - Non-numeric dtype (e.g. `object`, `string`) → `TypeError`
 
@@ -849,11 +849,6 @@ fee_post = USStockFeeModel(sec_fee_rate=20.60e-6)  # 2026-04-04..present
 
 For historic rates outside v2.8.2's defaults, consult the SEC Fee
 Rate Advisory archive and the FINRA Trading Activity Fee schedule.
-
-Add MultiIndex to the M3 rejection enumeration too (was in
-`tests/_helpers/expected_rejections.md` but missed in the README
-list): MultiIndex Series also raise `TypeError` from
-`validate_signal_series`.
 
 ### M5 decision rubric
 
