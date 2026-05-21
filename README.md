@@ -714,6 +714,171 @@ for diag in result.diagnostics:
         print(f"dropped {diag.details['collision_count']} rows")
 ```
 
+## v2.8.2 Release Notes
+
+### Headline — parallel-backtest users: your strategy instance is mutated in place
+
+If you used `MetaContext.adjust_strategy_params` with a shared
+strategy instance across parallel backtest workers
+(`multiprocessing.Pool`, threading, or a simple loop), the
+adjustment from one worker leaked to ALL other workers holding
+the same reference. v2.8.2 documents this in the
+`adjust_strategy_params` docstring + ships the
+factory-per-worker recipe.
+
+```python
+# WRONG — shared instance leaks adjustments across workers:
+strategy = MACrossover(short=5, long=20)
+with Pool() as pool:
+    pool.map(lambda d: run(d, strategy), datasets)
+
+# RIGHT — factory per worker isolates state:
+def make_strategy():
+    return MACrossover(short=5, long=20)
+with Pool() as pool:
+    pool.map(lambda d: run(d, make_strategy()), datasets)
+```
+
+If your historical v2.8.1-or-earlier results came from the
+"shared instance" pattern with mid-run `adjust_strategy_params`
+calls, those results are cross-contaminated and should be
+re-run with the factory pattern. **Performance optimization
+for this regen path (partial-timeline regen instead of full
+regen on every adjustment) ships in v2.8.3, designed jointly
+with the v2.9 `IncrementalFactor` engine integration so both
+consumers share a single opt-in incremental interface.**
+
+### CI engineer triage block
+
+Five expected failure modes when CI re-baselines on v2.8.2, in
+order of impact:
+
+1. **US-stock sell-side cost shift (M2)** — `USStockFeeModel`
+   sell commission rises by ~$2.3 per $100k due to FY2026 SEC §31
+   + 2026 FINRA TAF defaults now applying. Buy-side unchanged.
+   Golden fixtures with US-stock sell-heavy strategies will
+   rebaseline. Opt out (e.g., pre-2003 backtests):
+   `USStockFeeModel(sec_fee_rate=0, finra_taf_per_share=0)`.
+2. **`set_signals` validation (M3)** — duplicate-index Series,
+   non-`DatetimeIndex` Series, and non-numeric dtype now raise at
+   `set_signals` time. Tests that worked silently in v2.8.1 with
+   these shapes now fail at the boundary instead of crashing
+   later. See "M3 rejection set" below for the enumerated cases.
+   Escape hatch: `BacktestEngine(data_validation="none")`.
+3. **Parallel-backtest contamination (M4)** — covered in the
+   headline above. No automatic detection ships in v2.8.2; the
+   migration is to switch to the factory-per-worker pattern.
+4. **`cost_normalization` opt-in (M5)** — `DefaultTradeCost` now
+   accepts `cost_normalization="current_equity"` (default
+   `"initial_capital"` preserves v2.8.1). Decision rubric below.
+5. **`PercentageStopLoss` divergence pin (M1)** — no behavior
+   change; new regression test pins existing event-driven /
+   vectorized divergence magnitude on a gap-bar fixture. CI
+   suites mirroring that fixture pattern may need to update
+   their expected divergence range.
+
+### Per-M one-liner
+
+| ID | File | Symptom |
+|----|------|---------|
+| M1 | `exit_rules.py:PercentageStopLoss` | Event-driven submits market order (next-bar open fill); vectorized exits at theoretical threshold on trigger bar. Documents-only fix; alignment requires next-bar OHLC plumbing into vectorized (v2.9). |
+| M2 | `fees.py:USStockFeeModel` | Sell side now includes SEC §31 (FY2026 `20.60e-6`) + FINRA TAF (2026 `0.000195/share, cap $9.79`). Buy-side unchanged. Opt out with zeros. |
+| M3 | `engine.py:set_signals` | Single-Series + per-symbol-dict path now calls `validate_signal_series`. Respects `data_validation="none"`. |
+| M4 | `meta.py:MetaContext.adjust_strategy_params` | In-place mutation documented. Perf optimization moved to v2.8.3 (partial-regen requires opt-in interface, designed jointly with IncrementalFactor). |
+| M5 | `costs.py:DefaultTradeCost` | Opt-in `cost_normalization="current_equity"`. Default unchanged. First-order approximation (uses pre-cost gross returns). |
+
+### M3 rejection set
+
+`set_signals` now rejects these Series shapes at the boundary
+(authoritative source: `tests/_helpers/expected_rejections.md`):
+
+- Non-`DatetimeIndex` (e.g. `RangeIndex`, `Int64Index`) → `TypeError`
+- Duplicate `DatetimeIndex` timestamps → `ValueError`
+- Non-numeric dtype (e.g. `object`, `string`) → `TypeError`
+
+These shapes PASS default validation (NOT rejected):
+- All-NaN Series
+- Out-of-order timestamps
+- Empty Series
+- Fractional values (when `allow_fractional=True`, the default)
+
+Escape hatch: `BacktestEngine(data_validation="none")` skips boundary
+validation for parity with the `validate_ohlcv` convention.
+
+### M2 era-specific overrides
+
+Recipes for backtests outside the FY2026 default era:
+
+```python
+# Pre-2003-04-01 (no NASD/FINRA TAF; fee introduced 2003-04):
+# FINRA TAF was originally the NASD TAF, renamed in 2007 when
+# FINRA was formed from NASD + NYSE Regulation. Same fee math.
+fee = USStockFeeModel(finra_taf_per_share=0)
+
+# Pre-1971 (no SEC §31; fee introduced 1971):
+fee = USStockFeeModel(sec_fee_rate=0)
+
+# Cross-boundary backtest spanning the FY2026-2 effective date
+# (2026-04-04): SEC §31 jumped from 8.00e-6 to 20.60e-6.
+# Run two segments with separate USStockFeeModel instances and
+# concatenate equity curves; a single scalar can't express both:
+fee_pre  = USStockFeeModel(sec_fee_rate=8.00e-6)   # 2025-10-01..2026-04-03
+fee_post = USStockFeeModel(sec_fee_rate=20.60e-6)  # 2026-04-04..present
+```
+
+For historic rates outside v2.8.2's defaults, consult the SEC Fee
+Rate Advisory archive and the FINRA Trading Activity Fee schedule.
+
+### M5 decision rubric
+
+When to use which `cost_normalization`:
+
+- **`"initial_capital"` (default)** — path-independent cost
+  reporting (most use cases); your strategy stays within ±50%
+  of starting capital; you compare across strategies and want
+  apples-to-apples cost figures.
+- **`"current_equity"`** — backtest has > 50% expected drawdown;
+  you compute Sharpe / max-drawdown over deep-loss regimes; you
+  need cost ratio to reflect realized equity at each bar.
+
+The `"current_equity"` mode is a first-order approximation
+(`running_equity` uses gross pre-cost returns). The bias under-
+states cost; magnitude grows with turnover × horizon. The
+iteratively-correct version is a v2.9 follow-up.
+
+### Lockfile-pin
+
+```bash
+# v2.8.1 (previous release):
+pip install git+https://github.com/chifongwong-coder/AIphaForge@5862eb7
+
+# v2.8.2 (current release — pin individual commits via
+# git log feature/v2.8.2-strategy-medium):
+pip install git+https://github.com/chifongwong-coder/AIphaForge@feature/v2.8.2-strategy-medium
+```
+
+### Deprecation removal commitment
+
+`tango_paired_diff_ci` alias + `bucket_delta_tango_ci` kwarg
+hard-removal stays on v2.9 schedule (unchanged from v2.8.1).
+
+### What v2.8.2 does NOT include
+
+- **M4 perf optimization** — partial-timeline regen requires an
+  opt-in `BaseStrategy.regen_from_bar` interface that must be
+  designed jointly with v2.9 IncrementalFactor engine integration
+  so both consumers share a single API. Deferred to v2.8.3.
+- **LLM probe MEDIUMs** (anchors, orchestrator, scoring) —
+  v2.8.3.
+- **UX + API hygiene** (CHANGELOG, mypy CI) — v2.8.4.
+- **Test fixture consolidation + factor LOWs** — v2.8.5.
+- **Architectural items** (`IncrementalFactor` engine integration,
+  `significance.py` split, neutral primitives module) — v2.9
+  (the final v2.x release).
+- **v3.0 LLM/AI factor mining** — separate major track.
+
+---
+
 ## v2.8.1 Release Notes
 
 ### Two silent-correctness bugs are fixed. Your historical results may have been wrong.
