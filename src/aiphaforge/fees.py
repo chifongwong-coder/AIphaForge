@@ -236,19 +236,58 @@ class USStockFeeModel(BaseFeeModel):
     """
     US stock fee model.
 
-    Typical broker fee structure:
-    - Per-share commission (e.g. $0.005/share)
-    - Minimum commission
-    - No stamp duty
+    Broker fee + regulatory sell-side fees (v2.8.2):
+
+    - **Broker commission**: per-share, with a per-trade minimum
+      (e.g. $0.005/share with a $1 minimum).
+    - **SEC §31 fee** (sell-only): a regulatory transaction fee on
+      sell transactions, computed as ``price * size *
+      sec_fee_rate``. The rate is set periodically by the SEC Fee
+      Rate Advisory. v2.8.2 ships the FY2026 post-2026-04-04 rate
+      ``20.60e-6`` as the default. Pass ``sec_fee_rate=0`` for
+      backtests in periods before SEC §31 existed (pre-1971) or
+      override with the period-specific rate from the SEC archive.
+    - **FINRA TAF** (sell-only): the FINRA Trading Activity Fee,
+      computed as ``min(size * finra_taf_per_share, finra_taf_cap)``.
+      Originally the NASD TAF (effective 2003-04-01); renamed to
+      FINRA TAF in 2007 when FINRA was formed. v2.8.2 ships the 2026
+      schedule (``0.000195/share, cap $9.79``) as defaults. Pass
+      ``finra_taf_per_share=0`` for pre-2003-04 backtests.
+
+    Buy-side: only the broker commission applies (no regulatory
+    fees on buys).
+
+    The regulatory fees are ADDED on top of the broker commission,
+    independently of the broker's ``min_commission`` floor. The
+    SEC and FINRA charges are statutory and unaffected by broker
+    minimums.
 
     Parameters:
-        commission_per_share: Per-share commission, default $0.005.
-        min_commission: Minimum commission, default $1.0.
+        commission_per_share: Per-share broker commission, default
+            $0.005.
+        min_commission: Minimum broker commission per trade,
+            default $1.0.
         slippage_pct: Slippage percentage, default 0.1%.
+        sec_fee_rate: SEC §31 fee as a fraction of notional, default
+            ``20.60e-6`` (FY2026 schedule, effective 2026-04-04 per
+            the SEC Fee Rate Advisory FY2026-2).
+        finra_taf_per_share: FINRA TAF per-share rate (sell-only),
+            default ``0.000195`` (2026 schedule, effective
+            2026-01-01).
+        finra_taf_cap: FINRA TAF per-trade cap, default ``9.79``
+            (2026 schedule).
 
     Example:
         >>> fee_model = USStockFeeModel()
-        >>> cost = fee_model.total_cost(150.0, 100, 'buy')
+        >>> cost = fee_model.total_cost(150.0, 100, 'sell')
+
+    Notes
+    -----
+    ``side="average"`` queries (used by the vectorized cost path's
+    representative commission rate) yield ``(buy + sell) / 2``,
+    which naturally picks up HALF of the sell-side regulatory fees.
+    That is the correct estimator for "expected cost per trade
+    when buys and sells are equally likely".
     """
 
     name = "us_stock"
@@ -258,11 +297,18 @@ class USStockFeeModel(BaseFeeModel):
         self,
         commission_per_share: float = 0.005,
         min_commission: float = 1.0,
-        slippage_pct: float = 0.001
+        slippage_pct: float = 0.001,
+        # v2.8.2: SEC §31 + FINRA TAF (sell-only, FY2026 / 2026 schedule)
+        sec_fee_rate: float = 20.60e-6,
+        finra_taf_per_share: float = 0.000195,
+        finra_taf_cap: float = 9.79,
     ):
         super().__init__(slippage_pct)
         self.commission_per_share = commission_per_share
         self.min_commission = min_commission
+        self.sec_fee_rate = sec_fee_rate
+        self.finra_taf_per_share = finra_taf_per_share
+        self.finra_taf_cap = finra_taf_cap
 
     def calculate_commission(
         self,
@@ -270,13 +316,32 @@ class USStockFeeModel(BaseFeeModel):
         size: float,
         side: str
     ) -> float:
-        """Commission = max(shares * per_share_fee, min_commission)."""
-        commission = size * self.commission_per_share
-        return max(commission, self.min_commission)
+        """Commission = broker fee + (sell-only) SEC §31 + FINRA TAF.
+
+        Broker fee: ``max(shares * per_share_fee, min_commission)``.
+        Regulatory fees apply only when ``side == "sell"`` and are
+        added on top of the broker fee — independent of the
+        broker's minimum.
+        """
+        broker_commission = max(
+            size * self.commission_per_share, self.min_commission
+        )
+        if side == "sell":
+            sec_fee = price * size * self.sec_fee_rate
+            finra_taf = min(
+                size * self.finra_taf_per_share, self.finra_taf_cap
+            )
+            return broker_commission + sec_fee + finra_taf
+        return broker_commission
 
     def __repr__(self):
-        return (f"USStockFeeModel(per_share=${self.commission_per_share:.4f}, "
-                f"min=${self.min_commission:.2f})")
+        return (
+            f"USStockFeeModel(per_share=${self.commission_per_share:.4f}, "
+            f"min=${self.min_commission:.2f}, "
+            f"sec=${self.sec_fee_rate * 1e6:.2f}/$1M [FY2026], "
+            f"finra_taf=${self.finra_taf_per_share:.6f}/share "
+            f"cap=${self.finra_taf_cap:.2f} [2026])"
+        )
 
 
 class ChinaAShareFeeModel(BaseFeeModel):
