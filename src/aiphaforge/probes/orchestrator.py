@@ -123,15 +123,22 @@ def looks_like_refusal(raw_text: str) -> bool:
     """Heuristic: True if raw answer text looks like a refusal
     paragraph rather than a numeric/structured answer.
 
-    Locked v2.2 (per § 7.4):
+    v2.8.3 Commit D (M9): leading-window widened 50 → 80 characters.
+    The 50-char window missed refusals that begin with a polite
+    preface (``"As an AI language model, I don't have access to..."``
+    — the keyword ``"don't have access"`` starts past character 50).
+    80 captures the common preface-then-refusal shape without
+    materially increasing false positives from in-quote refusal
+    phrases (those typically appear deeper in the reply).
+
       1. Apply _normalize_for_hash + lowercase.
       2. SHORT-CIRCUIT: if any keyword in _REFUSAL_KEYWORDS_LEADING
-         appears in the LEADING 50 CHARACTERS, return True.
+         appears in the LEADING 80 CHARACTERS, return True.
          Restricting to leading text removes the false-positive class
          where the LLM quotes a refusal-shaped phrase inside a valid
          answer (e.g., 'the article says "I don't have access..."
          but the close was $147.20').
-      3. FALLBACK (no keyword in leading 50): if length > 120 AND
+      3. FALLBACK (no keyword in leading 80): if length > 120 AND
          digit ratio < 5%, return True.
       4. Otherwise return False.
 
@@ -141,7 +148,7 @@ def looks_like_refusal(raw_text: str) -> bool:
     if not raw_text:
         return False
     s = _normalize_for_hash(raw_text).lower()
-    leading = s[:50]
+    leading = s[:80]
     for kw in _REFUSAL_KEYWORDS_LEADING:
         if kw in leading:
             return True

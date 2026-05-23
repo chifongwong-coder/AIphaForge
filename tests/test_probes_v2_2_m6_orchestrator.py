@@ -60,13 +60,42 @@ def _make_real_data(n: int = 60, seed: int = 0) -> pd.DataFrame:
 
 
 class TestLooksLikeRefusal:
-    def test_keyword_in_leading_50_chars_returns_true(self):
+    # v2.8.3 Commit D (M9): leading window widened 50 → 80 characters.
+    def test_keyword_in_leading_80_chars_returns_true(self):
         assert looks_like_refusal("I don't have access to that data.")
 
-    def test_keyword_at_position_60_returns_false(self):
-        # "i don't know" placed beyond first 50 chars
-        text = ("The price was approximately 100. " * 2
-                + "I don't know more.")
+    def test_keyword_at_position_66_now_caught_under_widen_80(self):
+        # "i don't know" starts at position 66 in the prefix below.
+        # Under the prior 50-char window this missed the refusal;
+        # under the M9-widened 80-char window it is correctly caught.
+        prefix = "The price was approximately 100. " * 2  # 66 chars
+        text = prefix + "I don't know more."
+        assert len(prefix) == 66
+        assert looks_like_refusal(text)
+
+    def test_keyword_past_position_80_returns_false(self):
+        # Push the keyword far enough that it lies past the widened
+        # 80-char window. The digit ratio is intentionally high so
+        # the length-based fallback also does not trigger.
+        prefix = "Price 100.55 close 100.60 open 100.40 vol 1000. " * 2
+        text = prefix + "I don't know more."
+        assert len(prefix) > 80
+        assert not looks_like_refusal(text)
+
+    def test_in_quote_refusal_phrase_past_window_still_excluded(self):
+        # Regression: the leading-window restriction's whole purpose
+        # is to avoid flagging numeric answers that quote a
+        # refusal-shaped phrase mid-reply. Widening to 80 must not
+        # break that property — a quoted refusal that begins after
+        # position 80 inside a digit-rich answer must still return
+        # False.
+        prefix = "Open 100.55, high 100.80, low 100.20, close 100.65. " * 2
+        text = (
+            prefix
+            + "The article says 'I don't have access' but the "
+            + "close was 100.65."
+        )
+        assert len(prefix) > 80
         assert not looks_like_refusal(text)
 
     def test_short_numeric_answer_returns_false(self):
