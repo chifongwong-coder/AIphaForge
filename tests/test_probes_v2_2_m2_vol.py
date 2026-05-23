@@ -153,11 +153,76 @@ class TestEstimateSigma:
         assert "fallback_reason" in prov
         assert prov["h_eq_l_fraction"] == pytest.approx(0.55, abs=1e-9)
         assert "underestimate_formula" in prov
-        # Per F2 follow-up (heuristic labeling)
-        assert "heuristic" in prov["underestimate_formula"].lower()
-        assert "not empirically calibrated" in (
-            prov["underestimate_formula"].lower()
+        # Closed-form Parkinson degeneracy: sigma_hat = sqrt(1-f) sigma_true.
+        assert "sqrt(1 - h_eq_l_fraction)" in prov["underestimate_formula"]
+        assert "Parkinson (1980)" in prov["underestimate_formula"]
+        # At f=0.55, under-estimate = 1 - sqrt(0.45) ≈ 0.3292.
+        assert prov["estimated_underestimate_pct"] == pytest.approx(
+            1.0 - math.sqrt(0.45), abs=1e-12,
         )
+
+    def test_underestimate_formula_matches_closed_form_at_canonical_f(self):
+        """Pin the closed-form 1 - sqrt(1-f) at f in {0.50, 0.70, 0.90}.
+
+        Confirms the formula matches the Parkinson degeneracy derivation
+        (NOT the v2.2-era linear `f * 0.30` heuristic that under-predicted
+        the magnitude by ~2x at f=0.5 and ~2.5x at f=0.9).
+        """
+        for h_eq_l_fraction, expected in [
+            (0.50, 1.0 - math.sqrt(0.50)),  # ≈ 0.2929
+            (0.70, 1.0 - math.sqrt(0.30)),  # ≈ 0.4523
+            (0.90, 1.0 - math.sqrt(0.10)),  # ≈ 0.6838
+        ]:
+            n = 20
+            n_eq = int(round(h_eq_l_fraction * n))
+            idx = _bdates(n)
+            df = pd.DataFrame(
+                {
+                    "open": [100.0] * n,
+                    "high": [100.0] * n_eq + [101.0] * (n - n_eq),
+                    "low": [100.0] * n_eq + [99.0] * (n - n_eq),
+                    "close": [100.0] * n,
+                    "volume": [1e6] * n,
+                },
+                index=idx,
+            )
+            _, prov = estimate_sigma(df, "parkinson")
+            assert prov["h_eq_l_fraction"] == pytest.approx(
+                h_eq_l_fraction, abs=1e-12,
+            )
+            assert prov["estimated_underestimate_pct"] == pytest.approx(
+                expected, abs=1e-12,
+            )
+
+    def test_underestimate_concave_strictly_above_linear_for_f_ge_0_5(
+        self,
+    ):
+        """Regression guard: the closed-form is strictly concave and
+        exceeds the legacy linear `f * 0.30` at every f in the
+        fallback range [0.5, 1.0). Catches an accidental revert to
+        the pre-fix linear heuristic.
+        """
+        for f in [0.50, 0.55, 0.70, 0.85, 0.95]:
+            n = 20
+            n_eq = int(round(f * n))
+            idx = _bdates(n)
+            df = pd.DataFrame(
+                {
+                    "open": [100.0] * n,
+                    "high": [100.0] * n_eq + [101.0] * (n - n_eq),
+                    "low": [100.0] * n_eq + [99.0] * (n - n_eq),
+                    "close": [100.0] * n,
+                    "volume": [1e6] * n,
+                },
+                index=idx,
+            )
+            _, prov = estimate_sigma(df, "parkinson")
+            closed_form = prov["estimated_underestimate_pct"]
+            legacy_linear = prov["h_eq_l_fraction"] * 0.30
+            assert closed_form > legacy_linear, (
+                f"f={f}: closed-form {closed_form:.4f} "
+                f"must exceed legacy linear {legacy_linear:.4f}"
+            )
 
     def test_parkinson_event_day_warning_fires(self):
         # 19 normal bars + 1 event-day bar with |return| > 5σ
