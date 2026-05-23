@@ -122,15 +122,21 @@ def estimate_sigma(
                 f"H==L for {h_eq_l_fraction:.0%} of window bars; "
                 f"{method} degenerates. Fell back to stdev_returns."
             )
+            # Parkinson estimator with H==L on fraction f of bars
+            # captures only (1-f) of true variance. Derivation:
+            #   σ²_P = (1/(4 ln 2)) · E[(ln H/L)²]
+            # H==L bars contribute 0 to the mean → σ̂² = (1-f)·σ²_true
+            # → σ̂/σ_true = √(1-f) → under-estimate = 1 - √(1-f).
+            # Closed-form, not heuristic; cite Parkinson (1980).
             provenance["estimated_underestimate_pct"] = (
-                h_eq_l_fraction * 0.30
+                1.0 - math.sqrt(1.0 - h_eq_l_fraction)
             )
             provenance["underestimate_formula"] = (
-                "h_eq_l_fraction * 0.30 (Parkinson) — heuristic, "
-                "NOT empirically calibrated. Provided as a rough "
-                "sanity-check magnitude; users should validate "
-                "against a side-by-side stdev_returns run if the "
-                "under-estimate matters for their analysis."
+                "1 - sqrt(1 - h_eq_l_fraction) — closed-form derivation "
+                "from the Parkinson (1980) estimator: H==L bars "
+                "contribute 0 to mean((ln H/L)^2), so the empirical "
+                "estimator captures only (1-f) of true variance, "
+                "giving sigma_hat / sigma_true = sqrt(1-f)."
             )
 
     # Compute close-to-close log returns (used by stdev_returns and
