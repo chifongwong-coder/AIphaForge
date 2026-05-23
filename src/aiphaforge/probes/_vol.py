@@ -140,6 +140,33 @@ def estimate_sigma(
                 "estimator captures only (1-f) of true variance, "
                 "giving sigma_hat / sigma_true = sqrt(1-f)."
             )
+        elif 0.4 <= h_eq_l_fraction < 0.5:
+            # v2.8.3 Commit C (M8): warning band just below the
+            # fallback threshold. The estimator does not switch to
+            # stdev_returns (insufficient evidence of degeneracy
+            # given the 50% gate), but the empirical bias is already
+            # material (10-13% under-estimate at f=0.4-0.5 by the
+            # closed-form 1 - sqrt(1-f)). Surface a provenance entry
+            # so users can audit borderline windows. Does NOT change
+            # the chosen estimator.
+            provenance["h_eq_l_warning_band"] = {
+                "h_eq_l_fraction": h_eq_l_fraction,
+                "estimated_underestimate_pct": (
+                    1.0 - math.sqrt(1.0 - h_eq_l_fraction)
+                ),
+                "underestimate_formula": (
+                    "1 - sqrt(1 - h_eq_l_fraction) — closed-form "
+                    "Parkinson (1980) bias estimate."
+                ),
+                "guidance": (
+                    f"H==L for {h_eq_l_fraction:.0%} of window bars "
+                    f"(below the {50:.0%} fallback threshold). "
+                    f"{method} is still in use but its sigma is "
+                    f"likely under-estimated by "
+                    f"{(1.0 - math.sqrt(1.0 - h_eq_l_fraction)) * 100:.1f}%. "
+                    f"Consider stdev_returns for sensitivity analysis."
+                ),
+            }
 
     # Compute close-to-close log returns (used by stdev_returns and
     # by event-day warning math regardless of chosen method).
