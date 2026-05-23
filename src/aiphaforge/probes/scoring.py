@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import re
+import warnings
 from dataclasses import asdict
 from statistics import median
 from typing import Any, Literal, Optional, Sequence, Union
@@ -251,6 +252,27 @@ def parse_numeric_answer(
                 f"input matches don't-know pattern {raw!r}",
             )
         return None
+
+    # v2.8.3 Commit B (M7): warn-only European decimal-comma
+    # detection. Inputs like "1,5" or "12,50" are usually European
+    # decimals (comma-as-decimal-point), but `_NUMBER_RE` only treats
+    # comma as a thousands separator when followed by exactly three
+    # digits. So "1,5" tokenizes as ["1", "5"] and (under the default
+    # `permissive=False`) returns None — a silent loss. Warn so the
+    # caller can pre-localize. Parser output is intentionally
+    # unchanged (LOCKED scope, v2.8.3 plan §3 #12).
+    if re.search(r"(?<!\d)-?\d+,\d{1,2}(?!\d)", raw):
+        warnings.warn(
+            f"parse_numeric_answer: input {raw!r} contains a "
+            "comma followed by 1-2 digits, which looks like a "
+            "European decimal-comma (e.g. '1,5' meaning 1.5). "
+            "The parser treats commas as thousands separators and "
+            "may drop the value or split it into multiple tokens. "
+            "Pre-process with str.replace(',', '.') if you intend "
+            "decimal-comma input.",
+            UserWarning,
+            stacklevel=2,
+        )
 
     # Strip currency / approximation prefixes BEFORE percent
     # detection so hedged or currency-prefixed percent strings
