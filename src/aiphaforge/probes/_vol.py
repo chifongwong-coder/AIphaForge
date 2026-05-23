@@ -66,8 +66,10 @@ def estimate_sigma(
     H==L fallback (per § 3.3): when ``method`` ∈ {parkinson,
     garman_klass} and high == low for ≥ 50% of window bars,
     automatically falls back to ``stdev_returns`` and records the
-    fallback in provenance with a heuristic bias estimate (per F2
-    follow-up — labeled heuristic, not empirically calibrated).
+    fallback in provenance, along with the closed-form Parkinson
+    under-estimate ``1 - sqrt(1 - h_eq_l_fraction)`` derived from
+    the (1-f) variance loss of the empirical estimator on H==L
+    bars (Parkinson 1980).
 
     Parkinson event-day warning: when |return| > 5σ in any window
     bar, provenance gains a ``parkinson_event_day_warning`` entry.
