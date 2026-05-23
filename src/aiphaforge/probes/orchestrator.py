@@ -1060,6 +1060,18 @@ class KnowledgeCheckReport:
             state.setdefault("bucket_delta_ci",
                              state.pop("bucket_delta_tango_ci"))
 
+        # v2.8.3 Commit F (M10b): persistence_validity field was
+        # added in v2.8.3 Commit E. Pickles produced by v2.8.2 and
+        # earlier carry no such key. Backfill to "UNKNOWN" so the
+        # revived instance still satisfies the Literal contract
+        # (rather than producing AttributeError on downstream
+        # reads). UNKNOWN is a distinct tag — not silently coerced
+        # to NO_PERSISTENCE — so consumers can detect the legacy
+        # provenance and re-run the orchestrator to upgrade.
+        if "persistence_validity" not in state:
+            state = dict(state)
+            state["persistence_validity"] = "UNKNOWN"
+
         # Re-wrap MappingProxyType after load + replay __post_init__
         # so any validation / wrapping side effects fire on the
         # revived instance (v2.1.2 M5).

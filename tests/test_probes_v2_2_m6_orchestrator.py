@@ -587,3 +587,33 @@ class TestPersistenceBaseline:
         # Downstream stats populated under OK.
         assert report.real_minus_persistence_bucket_delta is not None
         assert report.real_vs_persistence_sign_test_p is not None
+
+    # v2.8.3 Commit F (M10b): __setstate__ backfill for legacy pickles.
+    def test_legacy_pickle_without_persistence_validity_backfills_unknown(
+        self,
+    ):
+        import pickle
+        data = _make_real_data(n=80)
+        probe = ContinuationProbe(
+            symbol="AAPL", context_bars=10, forward_horizon=1,
+            templates=[NextCloseContinuation],
+        )
+        anchors = list(data.index[20:25])
+        question_set = probe.build(data, anchors)
+        attested = _build_perfect_attested(question_set)
+        report = knowledge_check(
+            probe, data, anchors, attested,
+            provider_config=_provider_config(),
+        )
+        # Simulate a pickle produced by v2.8.2 by stripping the new
+        # field before pickling. __setstate__ on load must backfill
+        # to "UNKNOWN" so the Literal contract holds.
+        state = report.__getstate__()
+        state.pop("persistence_validity", None)
+        revived = KnowledgeCheckReport.__new__(KnowledgeCheckReport)
+        revived.__setstate__(state)
+        assert revived.persistence_validity == "UNKNOWN"
+        # A round-trip through pickle.dumps / pickle.loads on a state
+        # *with* the field should preserve the original value.
+        roundtripped = pickle.loads(pickle.dumps(report))
+        assert roundtripped.persistence_validity == "OK"
