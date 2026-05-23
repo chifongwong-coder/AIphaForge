@@ -551,3 +551,39 @@ class TestPersistenceBaseline:
         )
         assert report.persistence_baseline_score is None
         assert report.persistence_caveat is None
+
+    # v2.8.3 Commit E (M10a): persistence_validity gate.
+    def test_persistence_validity_no_persistence_for_pointintime(self):
+        # Non-continuation probes have no persistence baseline.
+        data = _make_real_data()
+        probe = KnowledgeProbe(symbol="AAPL",
+                                templates=DEFAULT_TEMPLATES)
+        anchors = list(data.index[10:15])
+        question_set = probe.build(data, anchors)
+        attested = _build_perfect_attested(question_set)
+        report = knowledge_check(
+            probe, data, anchors, attested,
+            provider_config=_provider_config(),
+        )
+        assert report.persistence_validity == "NO_PERSISTENCE"
+        # Gated downstream stats stay None.
+        assert report.real_minus_persistence_bucket_delta is None
+        assert report.real_vs_persistence_sign_test_p is None
+
+    def test_persistence_validity_ok_for_clean_continuation(self):
+        data = _make_real_data(n=80)
+        probe = ContinuationProbe(
+            symbol="AAPL", context_bars=10, forward_horizon=1,
+            templates=[NextCloseContinuation],
+        )
+        anchors = list(data.index[20:25])
+        question_set = probe.build(data, anchors)
+        attested = _build_perfect_attested(question_set)
+        report = knowledge_check(
+            probe, data, anchors, attested,
+            provider_config=_provider_config(),
+        )
+        assert report.persistence_validity == "OK"
+        # Downstream stats populated under OK.
+        assert report.real_minus_persistence_bucket_delta is not None
+        assert report.real_vs_persistence_sign_test_p is not None

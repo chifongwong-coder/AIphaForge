@@ -883,6 +883,25 @@ class KnowledgeCheckReport:
 
     is_pillar_summary: bool = False  # ENFORCED False
 
+    # v2.8.3 Commit E (M10a): persistence-baseline pairing validity,
+    # mirrors anchor_validity so downstream consumers can dispatch on
+    # whether real_minus_persistence_bucket_delta and
+    # real_vs_persistence_sign_test_p carry meaningful values.
+    #   "NO_PERSISTENCE" — probe is not a ContinuationProbe; the
+    #                      persistence baseline does not apply.
+    #   "OK"             — pairing succeeded; downstream stats are
+    #                      populated.
+    #   "PAIRING_FAILED" — real/persistence question_id sets do not
+    #                      overlap; derived stats suppressed.
+    #   "UNKNOWN"        — legacy pickle restored without this field;
+    #                      backfilled by __setstate__ (Commit F).
+    # Conceptually grouped with the persistence_* fields above; placed
+    # at the end of the field list because dataclass field ordering
+    # interacts with default values across the file's history.
+    persistence_validity: Literal[
+        "NO_PERSISTENCE", "OK", "PAIRING_FAILED", "UNKNOWN",
+    ] = "NO_PERSISTENCE"
+
     def to_dict(self) -> dict[str, Any]:
         """Convert this report to a plain-dict representation
         suitable for JSON serialization.
@@ -1360,6 +1379,13 @@ def knowledge_check(
     persistence_caveat_field: Optional[str] = None
     real_minus_persistence_delta: Optional[dict[str, float]] = None
     real_vs_persistence_p: Optional[float] = None
+    # v2.8.3 Commit E (M10a): pairing-validity tag. Non-continuation
+    # probes have no persistence baseline → NO_PERSISTENCE. For
+    # ContinuationProbe we compute the baseline below and set OK
+    # or PAIRING_FAILED based on the actual qid overlap.
+    persistence_validity_field: Literal[
+        "NO_PERSISTENCE", "OK", "PAIRING_FAILED", "UNKNOWN",
+    ] = "NO_PERSISTENCE"
 
     if isinstance(probe, ContinuationProbe):
         persistence_report = _compute_persistence_baseline_report(
@@ -1391,15 +1417,27 @@ def knowledge_check(
             )
         )
         notes.extend(persistence_pairing_notes)
-        rp_pos = sum(
-            1 for (rb, pb) in paired_rp
-            if ordinal_map.get(rb, 0) > ordinal_map.get(pb, 0)
-        )
-        rp_neg = sum(
-            1 for (rb, pb) in paired_rp
-            if ordinal_map.get(rb, 0) < ordinal_map.get(pb, 0)
-        )
-        real_vs_persistence_p, _ = sign_test_p(rp_pos, rp_neg)
+        # v2.8.3 Commit E (M10a): if the qid-paired list is empty the
+        # real and persistence reports share no question_ids; the
+        # sign-test would degenerate to sign_test_p(0, 0) = (1.0,
+        # "trivial_n_zero"), a meaningless p-value that callers
+        # cannot distinguish from a genuine null result. Suppress
+        # derived stats and tag PAIRING_FAILED instead.
+        if not paired_rp:
+            persistence_validity_field = "PAIRING_FAILED"
+            real_minus_persistence_delta = None
+            real_vs_persistence_p = None
+        else:
+            persistence_validity_field = "OK"
+            rp_pos = sum(
+                1 for (rb, pb) in paired_rp
+                if ordinal_map.get(rb, 0) > ordinal_map.get(pb, 0)
+            )
+            rp_neg = sum(
+                1 for (rb, pb) in paired_rp
+                if ordinal_map.get(rb, 0) < ordinal_map.get(pb, 0)
+            )
+            real_vs_persistence_p, _ = sign_test_p(rp_pos, rp_neg)
 
     notes.insert(0, _NON_TRANSITIVITY_NOTE)
 
@@ -1462,6 +1500,7 @@ def knowledge_check(
             real_minus_persistence_delta
         ),
         real_vs_persistence_sign_test_p=real_vs_persistence_p,
+        persistence_validity=persistence_validity_field,
         parsing_schema_hash=answers.parsing_schema_hash,
         parsing_schema_description=answers.parsing_schema_description,
         prompt_template_hash=answers.prompt_template_hash,
