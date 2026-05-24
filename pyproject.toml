@@ -94,3 +94,9 @@ filterwarnings = [
 python_version = "3.10"
 warn_return_any = true
 warn_unused_configs = true
+# v2.8.4 M14: third-party stubs (older pandas, scipy, etc.) are not
+# uniformly available across CI matrix entries; suppress missing-import
+# noise so the advisory mypy step surfaces real type issues rather than
+# missing-stub clutter.  The scoped-blocking sub-step on
+# ``src/aiphaforge/alpha/`` runs under the same config.
+ignore_missing_imports = true

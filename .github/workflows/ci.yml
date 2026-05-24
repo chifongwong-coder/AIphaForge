@@ -15,4 +15,9 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: pip install -e ".[dev]"
       - run: ruff check src/
+      - name: Type check (advisory, non-blocking)
+        run: mypy src/aiphaforge/
+        continue-on-error: true
+      - name: Type check (strict, scoped blocking gate)
+        run: mypy src/aiphaforge/alpha/
       - run: pytest tests/ -v
