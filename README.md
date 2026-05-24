@@ -825,6 +825,108 @@ report: KnowledgeCheckReport = knowledge_check(
 assert report.anchor_validity == "OK"
 ```
 
+## v2.8.4 Release Notes
+
+### Headline — UX + API hygiene
+
+v2.8.4 ships six docs-and-CI items grouped under "UX + API hygiene"
+plus one carve-out from v2.8.3.  The engine is untouched; the surface
+public API is unchanged.  Single user-visible behavior change:
+`parse_numeric_answer` gains a `decimal_separator` kwarg that defaults
+to `"us"` (preserving v2.8.3 behavior verbatim).
+
+### Per-M one-liner
+
+| M | Site | What changed | User impact |
+|---|---|---|---|
+| M11 | `README.md` -> `CHANGELOG.md` | Release notes for v2.8.1, v2.8.2, v2.8.3 moved into a new root-level `CHANGELOG.md` (Keep-a-Changelog 1.1.0 format).  README keeps thin anchor-preserving stubs linking to the new file.  Sub-anchors within each release block are preserved by verbatim copy. | Loud if external links pinned to `README#v281` / `#v282` / `#v283`; silent otherwise (anchors survive). |
+| M11b | `src/aiphaforge/fees.py:360-366` | `USStockFeeModel.__repr__` parameterizes the SEC FY2026 and FINRA 2026 schedule labels via module-level constants (`_REPR_SEC_SCHEDULE_LABEL`, `_REPR_FINRA_SCHEDULE_LABEL`).  Default text unchanged. | Loud only for tests pinning the verbatim repr; none in the public tree. |
+| M12 | `README.md:#pick-your-entry-point` | New "Pick Your Entry Point" h3 with a 6-row decision table for the input-shape `set_*` family on `BacktestEngine`.  A companion parity test pins every public setter to either appear in the table or sit on the explicit allowlist. | Loud for line-pinned tools (line numbers shifted); silent for anchor-pinned tools. |
+| M13 | `README.md` Quick Start | Three new quickstart h3 sections: factor research (AlphaScreener / FactorReport / FactorRuleStrategy), hook-driven order submission (`BacktestHook.on_pre_signal` + `context.broker.submit_order(order, timestamp=...)`), and `knowledge_check` orchestrator.  A companion parity test asserts every documented symbol imports. | Silent unless downstream tooling scrapes README for code blocks. |
+| M14 | `.github/workflows/ci.yml`, `pyproject.toml` | Two new mypy steps in CI: an **advisory broad** `mypy src/aiphaforge/` (`continue-on-error: true`) so the type-check signal is visible without blocking, and a **scoped blocking** `mypy src/aiphaforge/alpha/` (no `continue-on-error`) that gates the currently 0-error `alpha/` subpackage.  Phase 2 (per-file allowlist + blocking on the top modules) is deferred to v2.9. | Loud (visible in CI output).  Local: `mypy src/aiphaforge/` shows ~200 errors / ~50 files at v2.8.4 baseline; `mypy src/aiphaforge/alpha/` must be clean. |
+| M15 | `src/aiphaforge/probes/scoring.py:50-344` | `parse_numeric_answer` gains a `decimal_separator: Literal["us", "eu"] = "us"` kwarg.  Default `"us"` preserves v2.8.3 behavior exactly (including the known silent-wrong outputs on European-style inputs).  Under `"eu"` the comma/period roles swap: `,` is the decimal point and `.` is the thousands separator.  Bracketed ranges accept BOTH `;` (canonical, silent) and `,` (parses, emits a `UserWarning` per R5).  The v2.8.3 M7 broad warn-shim is REMOVED under default US mode — its role is replaced by the EU opt-in. | Loud for EU users on opt-in (parser now correct on `"1,5"`-style inputs; warning surfaces on `,`-separated bracket ranges); SILENT for US default users (unchanged — backward-compat outputs pinned by `tests/test_probes_parse_locale.py::test_us_default_preserves_v2_8_3_silent_wrong_outputs`). |
+
+### URL changes in v2.8.4
+
+- `README#v281`, `README#v282`, `README#v283` -> the release-notes
+  blocks moved into `CHANGELOG.md`.  Each README anchor still exists
+  as a thin h2 stub pointing at the new canonical URLs
+  `CHANGELOG.md#283---2026-05-24` (and `#282-...`, `#281-...`).
+- Sub-anchors inside the v2.8.3 block (e.g.,
+  `### Lost-data playbook for v2.8.2 ContinuationProbe users`) are
+  preserved verbatim inside `CHANGELOG.md`, so the resolved URL
+  inside the new file is still `CHANGELOG.md#lost-data-playbook-...`.
+
+### CI engineer triage block
+
+Upgrading from v2.8.3:
+
+- **ruff**: no new rules; `ruff check src/` passes CLEAN at v2.8.4.
+- **pytest**: +18 tests across 6 new test files
+  (`test_changelog_exists_and_pins_anchors.py`,
+  `test_fees_repr_year_parameterized.py`,
+  `test_readme_entry_point_table_parity.py`,
+  `test_readme_quickstart_imports_resolve.py`,
+  `test_ci_workflow_pins_mypy_step.py`,
+  `test_probes_parse_locale.py`).
+  Total collected: 1762 -> 1780.
+- **mypy**: new advisory step lands in `.github/workflows/ci.yml`.
+  NON-BLOCKING for the broad `mypy src/aiphaforge/` invocation.  NEW
+  scoped-blocking step `mypy src/aiphaforge/alpha/` IS blocking.
+  Local invocation: `mypy src/aiphaforge/` reports ~200 errors at
+  v2.8.4; `mypy src/aiphaforge/alpha/` MUST be clean (zero errors).
+- **Version pin**: if you pin AIphaForge by SHA, re-pin to the v2.8.4
+  release commit.  `AttestedAnswers` users re-attest against the new
+  release string (`__version__ == '2.8.4'`).
+- **MED-C caveat**: opting into `decimal_separator="eu"` means
+  US-style inputs may silently parse differently (e.g., `"1.5"`
+  under EU is processed under the EU regex).  Pick the locale
+  matching your data.
+- **MED-D caveat**: under EU, scientific notation requires the
+  EU-locale form (e.g., `"1,5e3"`); a US-style `"1.5e3"` under EU
+  may return None or an unexpected value.
+- **MED-E caveat (silent shape risk)**: under
+  `decimal_separator="eu"`, the input `"[1,234, 5,678]"` (a
+  US thousands-separator pair) parses as `(1.234, 5.678)` — a
+  **1000x smaller pair** than the US default `(1234.0, 5678.0)`.
+  A UserWarning IS emitted (per R5), but if your data may include
+  US-style 1,234-formatted numbers, stay on US default or
+  pre-validate magnitudes before feeding to EU mode.
+
+### Lockfile-pin recipe
+
+```bash
+# Pin to v2.8.4 by merge SHA (the SHA is set when the v2.8.4 branch
+# lands on main; until then pin to the feature branch HEAD).
+pip install git+https://github.com/chifongwong-coder/AIphaForge@<v2.8.4-merge-sha>
+
+# requirements.txt
+aiphaforge @ git+https://github.com/chifongwong-coder/AIphaForge@<v2.8.4-merge-sha>
+```
+
+Reproduce CI locally:
+
+```bash
+pip install -e ".[dev]"
+ruff check src/
+mypy src/aiphaforge/        # advisory broad
+mypy src/aiphaforge/alpha/  # scoped blocking gate (MUST be clean)
+pytest tests/ -v
+```
+
+### What v2.8.4 does NOT include
+
+- LLM probe MEDIUMs beyond the M15 locale work (shipped in v2.8.3).
+- Reverse-lock skip-rule tightening (v2.8.5).
+- Test fixture consolidation `tests/_helpers/ohlcv.py` (v2.8.5 L1).
+- `aiphaforge.stats` neutral-primitives module (v2.9).
+- `significance.py` subpackage split (v2.9).
+- `IncrementalSMA` / `IncrementalEMA` / partial-timeline regeneration
+  (no committed milestone).
+- mypy Phase 2 (per-file allowlist + blocking on the top modules) —
+  deferred to v2.9.
+- v3.0 LLM / AI factor mining (separate major track).
+
 ## v2.8.3 Release Notes
 
 See [CHANGELOG.md](./CHANGELOG.md#283---2026-05-24).

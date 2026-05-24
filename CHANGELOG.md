@@ -10,6 +10,58 @@ Releases prior to v2.8.1 are not documented here; consult the git history
 
 ## [Unreleased]
 
+## [2.8.4] - 2026-05-24
+
+### Headline — UX + API hygiene
+
+Six docs-and-CI items grouped as "UX + API hygiene" plus one carve-out
+from v2.8.3.  The engine source is untouched; the surface public API
+is unchanged.  Single user-visible behavior change:
+`parse_numeric_answer` gains a `decimal_separator: Literal["us", "eu"]`
+kwarg that defaults to `"us"` (preserves v2.8.3 behavior verbatim).
+
+### Per-M one-liner
+
+| M | What changed |
+|---|---|
+| M11 | v2.8.1 / v2.8.2 / v2.8.3 release notes extracted from `README.md` into this `CHANGELOG.md` (Keep-a-Changelog 1.1.0 format).  README keeps thin anchor-preserving stubs. |
+| M11b | `USStockFeeModel.__repr__` parameterizes SEC FY2026 and FINRA 2026 schedule labels via two module-level constants in `fees.py`.  Default repr text unchanged. |
+| M12 | New "Pick Your Entry Point" decision table in README listing all six input-shape `BacktestEngine.set_*` setters with shape, when-to-use, and mutual-exclusion cells.  Parity test pins setter coverage. |
+| M13 | Three new Quick Start sub-sections: factor research (AlphaScreener + FactorReport + FactorRuleStrategy), hook-driven order submission (BacktestHook.on_pre_signal + context.broker.submit_order), and `knowledge_check` orchestrator.  Parity test pins symbol imports. |
+| M14 | New mypy step in `.github/workflows/ci.yml` — advisory broad `mypy src/aiphaforge/` (continue-on-error: true) + scoped-blocking `mypy src/aiphaforge/alpha/` (no continue-on-error; gates the currently-clean subpackage). |
+| M15 | `parse_numeric_answer` gains `decimal_separator: Literal["us", "eu"] = "us"`.  Default `"us"` preserves v2.8.3 behavior (including known silent-wrong outputs).  Under `"eu"`: comma=decimal, period=thousands.  Bracketed ranges accept both `;` (canonical) and `,` (warns).  v2.8.3 M7 broad warn-shim removed under default. |
+
+### URL changes in v2.8.4
+
+- README.md anchors `#v281`, `#v282`, `#v283` still resolve (the h2 stubs are preserved); each stub links to the canonical CHANGELOG.md anchor.
+- Sub-anchors inside the v2.8.3 block (e.g., `### Lost-data playbook for v2.8.2 ContinuationProbe users`) are preserved verbatim inside CHANGELOG.md so existing deep-links continue to resolve inside the new file.
+
+### CI engineer triage block
+
+Upgrading from v2.8.3:
+
+- ruff: no new rules; `ruff check src/` passes CLEAN at v2.8.4.
+- pytest: +18 tests; total 1762 -> 1780.
+- mypy: new advisory step `mypy src/aiphaforge/` (non-blocking); new scoped-blocking `mypy src/aiphaforge/alpha/` (blocking, 0 errors at v2.8.4 release).
+- AttestedAnswers users re-attest against the new release string (`__version__ == '2.8.4'`).
+- **MED-E silent-shape caveat**: under `decimal_separator="eu"`, the input `"[1,234, 5,678]"` (US thousands-separator pair) parses as `(1.234, 5.678)` — a 1000x smaller pair than the US default `(1234.0, 5678.0)`.  A UserWarning IS emitted (R5), but pick the locale matching your inputs to avoid the trap.
+
+### Lockfile-pin recipe
+
+```bash
+pip install git+https://github.com/chifongwong-coder/AIphaForge@<v2.8.4-merge-sha>
+```
+
+### What v2.8.4 does NOT include
+
+- Reverse-lock skip-rule tightening (v2.8.5).
+- Test fixture consolidation (v2.8.5 L1).
+- `aiphaforge.stats` neutral-primitives module (v2.9).
+- `significance.py` subpackage split (v2.9).
+- `IncrementalSMA` / `IncrementalEMA` (no committed milestone).
+- mypy Phase 2 (per-file allowlist + blocking on top modules) — v2.9.
+- v3.0 LLM / AI factor mining (separate major track).
+
 ## [2.8.3] - 2026-05-24
 
 ### Headline — LLM-pillar diagnostic patches + a fabricated-roadmap retraction
