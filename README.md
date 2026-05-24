@@ -732,6 +732,99 @@ for diag in result.diagnostics:
         print(f"dropped {diag.details['collision_count']} rows")
 ```
 
+### Factor Research (alpha screening)
+
+Use the alpha layer to rank a custom factor before plugging it into a
+`FactorRuleStrategy`.  `AlphaScreener.compute_ic` returns the
+information-coefficient series across forward-return horizons;
+`FactorReport` summarises IC stats, decile spreads, and turnover.
+
+```python
+from aiphaforge.alpha.evaluator import AlphaScreener
+from aiphaforge.alpha.report import FactorReport
+from aiphaforge.factor_strategy import FactorRuleStrategy
+from aiphaforge.factors import BaseFactor
+
+
+class MyMomentum(BaseFactor):
+    def compute(self, df):
+        return df["close"].pct_change(20)
+
+
+screener = AlphaScreener(prices=price_df)
+ic_series = screener.compute_ic(MyMomentum())
+report = FactorReport.from_screener(screener, factor=MyMomentum())
+# Once the factor passes screening, drop it into a strategy:
+strategy = FactorRuleStrategy(factor=MyMomentum(), top_k=10)
+```
+
+### Hook-driven Order Submission
+
+`BacktestHook.on_pre_signal` runs each bar before the engine processes
+its own signals, so a hook can inject orders into the broker for that
+bar.  The hook calls `context.broker.submit_order(order, timestamp=...)`
+directly — `BacktestHook` itself does not expose `submit_order`.
+
+```python
+from aiphaforge.hooks import BacktestHook
+from aiphaforge.orders import Order, OrderSide, OrderType
+
+
+class CustomEntryHook(BacktestHook):
+    def on_pre_signal(self, context):
+        # context.broker, context.timestamp, context.portfolio, etc.
+        # are available to inspect; submit an Order when your rule fires.
+        if my_condition(context):
+            order = Order(
+                symbol="AAPL",
+                side=OrderSide.BUY,
+                order_type=OrderType.MARKET,
+                size=100,
+            )
+            context.broker.submit_order(order, timestamp=context.timestamp)
+
+
+engine.add_hook(CustomEntryHook())
+```
+
+### LLM Memory Probes — `knowledge_check` orchestrator
+
+`knowledge_check` is the high-level entry point for the LLM memory
+probe pillar: feed it a `KnowledgeProbe`, an `AttestedAnswers` bundle,
+and a provider config, and it runs the probe + comparison and returns
+a `KnowledgeCheckReport` with leakage indices, anchor validity, and
+persistence validity.
+
+```python
+from aiphaforge.probes import (
+    AttestedAnswers,
+    KnowledgeCheckReport,
+    KnowledgeProbe,
+    knowledge_check,
+)
+
+probe = KnowledgeProbe(name="AAPL_Q1_2024_close", ...)
+answers = AttestedAnswers.attest(...)
+provider_config = {
+    "endpoint": "...",
+    "api_key": "...",
+    "model": "your-llm-model",
+    "temperature": 0.0,
+    "max_tokens": 100,
+    "max_retries": 3,
+    "request_timeout_seconds": 30,
+    "rate_limit_rps": 5,
+    "system_prompt": "...",
+}
+
+report: KnowledgeCheckReport = knowledge_check(
+    probe=probe,
+    attested=answers,
+    provider_config=provider_config,
+)
+assert report.anchor_validity == "OK"
+```
+
 ## v2.8.3 Release Notes
 
 See [CHANGELOG.md](./CHANGELOG.md#283---2026-05-24).
