@@ -15,4 +15,13 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: pip install -e ".[dev]"
       - run: ruff check src/
+      - name: Type check (advisory, non-blocking)
+        run: mypy --config-file pyproject.toml src/aiphaforge/
+        continue-on-error: true
+      - name: Type check (strict, scoped blocking gate)
+        # --follow-imports=silent isolates the gate to alpha/ source
+        # files only, so a type error reachable via import from
+        # engine.py/probes/etc. does NOT fail the alpha/ gate. The
+        # advisory step above still surfaces all errors.
+        run: mypy --config-file pyproject.toml --follow-imports=silent src/aiphaforge/alpha/
       - run: pytest tests/ -v

@@ -44,12 +44,32 @@ from aiphaforge.probes.questions import (
 
 # ---------- v2.0.1 user-facing parser helpers ----------
 
-# Regex for a signed scientific-notation float. Accepts ASCII '-' and
-# Unicode minus '−' (U+2212). Anchored matches happen via .fullmatch
-# at use sites; this is the building block.
-_NUMBER_RE = re.compile(
+# v2.8.4 M15: locale-aware number regex.  US convention treats ``,`` as a
+# thousands separator and ``.`` as the decimal point; EU convention is
+# the mirror image — ``.`` is the thousands separator and ``,`` is the
+# decimal point.  Both regexes accept ASCII ``-`` and Unicode minus
+# ``−`` (U+2212) and optional scientific-notation tails.
+_NUMBER_RE_US = re.compile(
     r"[-−]?\d+(?:,\d{3})*(?:\.\d+)?(?:[eE][-+]?\d+)?"
 )
+_NUMBER_RE_EU = re.compile(
+    r"[-−]?\d+(?:\.\d{3})*(?:,\d+)?(?:[eE][-+]?\d+)?"
+)
+
+# Backward-compat alias for any external caller importing the v2.8.3
+# name.  US default preserves v2.8.3 behavior verbatim.
+_NUMBER_RE = _NUMBER_RE_US
+
+
+def _number_re(decimal_separator: Literal["us", "eu"]) -> "re.Pattern[str]":
+    """Pick the locale-specific number regex."""
+    if decimal_separator == "us":
+        return _NUMBER_RE_US
+    if decimal_separator == "eu":
+        return _NUMBER_RE_EU
+    raise ValueError(
+        f"decimal_separator must be 'us' or 'eu', got {decimal_separator!r}"
+    )
 
 # Currency symbols / unit suffixes to strip before number parsing.
 _CURRENCY_SYMBOLS = ("$", "€", "£", "¥", "₿")
@@ -96,12 +116,30 @@ def _strip_approximation(s: str) -> str:
     return out
 
 
-def _try_float(token: str) -> Optional[float]:
+def _try_float(
+    token: str,
+    *,
+    decimal_separator: Literal["us", "eu"] = "us",
+) -> Optional[float]:
     """Parse a single numeric token to float, returning None on failure.
 
-    Handles thousands separators and Unicode minus.
+    Handles thousands separators and Unicode minus.  Under ``"us"``
+    mode (the v2.8.3 behavior) the comma is a thousands separator and
+    the period is the decimal point.  Under ``"eu"`` mode the roles
+    swap: the period is the thousands separator and the comma is the
+    decimal point.
     """
-    cleaned = _normalize_minus(token).replace(",", "").strip()
+    cleaned = _normalize_minus(token).strip()
+    if decimal_separator == "us":
+        cleaned = cleaned.replace(",", "")
+    elif decimal_separator == "eu":
+        # Drop thousands periods first, then map decimal commas to '.'.
+        cleaned = cleaned.replace(".", "").replace(",", ".")
+    else:
+        raise ValueError(
+            f"decimal_separator must be 'us' or 'eu', got "
+            f"{decimal_separator!r}"
+        )
     if not cleaned:
         return None
     try:
@@ -110,17 +148,25 @@ def _try_float(token: str) -> Optional[float]:
         return None
 
 
-def _extract_numbers(s: str) -> list[float]:
-    """Find all numeric tokens in `s` and return them parsed."""
+def _extract_numbers(
+    s: str,
+    *,
+    decimal_separator: Literal["us", "eu"] = "us",
+) -> list[float]:
+    """Find all numeric tokens in ``s`` and return them parsed."""
     out: list[float] = []
-    for m in _NUMBER_RE.finditer(_normalize_minus(s)):
-        v = _try_float(m.group(0))
+    for m in _number_re(decimal_separator).finditer(_normalize_minus(s)):
+        v = _try_float(m.group(0), decimal_separator=decimal_separator)
         if v is not None:
             out.append(v)
     return out
 
 
-def _try_range(s: str) -> Optional[tuple[float, float]]:
+def _try_range(
+    s: str,
+    *,
+    decimal_separator: Literal["us", "eu"] = "us",
+) -> Optional[tuple[float, float]]:
     """Detect a numeric-range answer; return (lo, hi) or None.
 
     Conventions (documented in the public docstring):
@@ -130,20 +176,86 @@ def _try_range(s: str) -> Optional[tuple[float, float]]:
       both ranges (r5 §2.1: parser is an answer parser, not an
       expression evaluator).
     - En/em-dash with or without spaces: ``lo–hi``, ``lo — hi``.
+
+    Under ``decimal_separator="eu"`` the bracketed-range form accepts
+    BOTH ``;`` (canonical, no warning) and ``,`` (parses, emits a
+    ``UserWarning`` flagging the comma-ambiguity) as the value
+    separator (v2.8.4 M15 R5 user-locked).
     """
     raw = s.strip()
     norm = raw.lower()
 
-    # Bracketed forms.
+    # Bracketed forms.  Under EU mode we try the semicolon separator
+    # first (canonical, silent), then fall back to the comma separator
+    # which emits a UserWarning before returning the parsed pair.
+    if decimal_separator == "eu":
+        semi_match = re.fullmatch(
+            r"[\[(]\s*([-−]?\d[\d.,eE+\-−]*)"
+            r"\s*;\s*([-−]?\d[\d.,eE+\-−]*)\s*[\])]",
+            raw,
+        )
+        if semi_match:
+            lo = _try_float(
+                semi_match.group(1), decimal_separator=decimal_separator,
+            )
+            hi = _try_float(
+                semi_match.group(2), decimal_separator=decimal_separator,
+            )
+            if lo is not None and hi is not None:
+                return (lo, hi)
+
     bracket_match = re.fullmatch(
-        r"[\[(]\s*([-−]?\d[\d.,eE+\-−]*)\s*,\s*([-−]?\d[\d.,eE+\-−]*)\s*[\])]",
+        r"[\[(]\s*([-−]?\d[\d.,eE+\-−]*)\s*,"
+        r"\s*([-−]?\d[\d.,eE+\-−]*)\s*[\])]",
         raw,
     )
     if bracket_match:
-        lo = _try_float(bracket_match.group(1))
-        hi = _try_float(bracket_match.group(2))
-        if lo is not None and hi is not None:
-            return (lo, hi)
+        if decimal_separator == "eu":
+            # v2.8.4 R5 — under EU mode the comma is the decimal
+            # point, so ``[1,5]`` is the bracketed-scalar form
+            # ``1.5`` rather than a range pair.  Disambiguate by
+            # counting commas inside the brackets: exactly one
+            # comma -> single decimal scalar (fall through to the
+            # scalar path); two or more commas -> range, accepted
+            # with a UserWarning (the form is ambiguous with two
+            # decimal-comma scalars and ';' is preferred).
+            inner = raw[1:-1]
+            if inner.count(",") < 2:
+                # Single comma: bracketed-scalar form. Fall through
+                # to the scalar extractor by NOT returning here.
+                pass
+            else:
+                lo = _try_float(
+                    bracket_match.group(1),
+                    decimal_separator=decimal_separator,
+                )
+                hi = _try_float(
+                    bracket_match.group(2),
+                    decimal_separator=decimal_separator,
+                )
+                if lo is not None and hi is not None:
+                    warnings.warn(
+                        f"parse_numeric_answer: bracketed range "
+                        f"{raw!r} under decimal_separator='eu' uses "
+                        "a comma between the two values; this is "
+                        "ambiguous with the EU decimal-comma.  Use "
+                        "';' (e.g., '[1,5; 2,5]') for a clean "
+                        "range; the comma-separator form is "
+                        "accepted for compatibility but may be "
+                        "tightened in a future release.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                    return (lo, hi)
+        else:
+            lo = _try_float(
+                bracket_match.group(1), decimal_separator=decimal_separator,
+            )
+            hi = _try_float(
+                bracket_match.group(2), decimal_separator=decimal_separator,
+            )
+            if lo is not None and hi is not None:
+                return (lo, hi)
 
     # Worded forms.
     for pattern in (
@@ -153,30 +265,44 @@ def _try_range(s: str) -> Optional[tuple[float, float]]:
     ):
         m = re.match(pattern, norm)
         if m:
-            lo = _try_float(m.group(1))
-            hi = _try_float(m.group(2))
+            lo = _try_float(
+                m.group(1), decimal_separator=decimal_separator,
+            )
+            hi = _try_float(
+                m.group(2), decimal_separator=decimal_separator,
+            )
             if lo is not None and hi is not None:
                 return (lo, hi)
 
     # En/em-dash range (with or without surrounding spaces).
     em_match = re.fullmatch(
-        r"\s*([-−]?\d[\d.,eE+\-−]*)\s*[\u2013\u2014]\s*([-−]?\d[\d.,eE+\-−]*)\s*",
+        r"\s*([-−]?\d[\d.,eE+\-−]*)\s*[\u2013\u2014]\s*"
+        r"([-−]?\d[\d.,eE+\-−]*)\s*",
         raw,
     )
     if em_match:
-        lo = _try_float(em_match.group(1))
-        hi = _try_float(em_match.group(2))
+        lo = _try_float(
+            em_match.group(1), decimal_separator=decimal_separator,
+        )
+        hi = _try_float(
+            em_match.group(2), decimal_separator=decimal_separator,
+        )
         if lo is not None and hi is not None:
             return (lo, hi)
 
     # Hyphen, with OR without surrounding spaces (r5 §2.1).
     direct = re.fullmatch(
-        r"\s*([-−]?\d[\d.,eE+]*(?:\.\d+)?)\s*-\s*(\d[\d.,eE+]*(?:\.\d+)?)\s*",
+        r"\s*([-−]?\d[\d.,eE+]*(?:\.\d+)?)\s*-\s*"
+        r"(\d[\d.,eE+]*(?:\.\d+)?)\s*",
         raw,
     )
     if direct:
-        lo = _try_float(direct.group(1))
-        hi = _try_float(direct.group(2))
+        lo = _try_float(
+            direct.group(1), decimal_separator=decimal_separator,
+        )
+        hi = _try_float(
+            direct.group(2), decimal_separator=decimal_separator,
+        )
         if lo is not None and hi is not None:
             return (lo, hi)
 
@@ -199,6 +325,7 @@ def parse_numeric_answer(
     strict: bool = False,
     permissive: bool = False,
     percent: Literal["reject", "decimal", "number"] = "reject",
+    decimal_separator: Literal["us", "eu"] = "us",
 ) -> Union[float, tuple[float, float], None]:
     """Parse a raw LLM reply string into a typed numeric value.
 
@@ -219,6 +346,22 @@ def parse_numeric_answer(
         (``2.5``). Default ``"reject"`` returns ``None`` (or raises
         in strict mode). ``"decimal"`` divides by 100; ``"number"``
         keeps the raw value. Apply consistently per-template.
+
+    Locale handling (``decimal_separator``, v2.8.4 M15):
+        Default ``"us"`` treats ``,`` as a thousands separator and
+        ``.`` as the decimal point — the v2.8.3 behavior, preserved
+        verbatim for backward compatibility (including a handful of
+        known silent-wrong outputs on European-style inputs like
+        ``"1,5"``).  Opt in to ``"eu"`` to swap the roles: ``.`` is
+        the thousands separator and ``,`` is the decimal point.
+        Under ``"eu"`` mode the bracketed-range form accepts BOTH
+        ``;`` (canonical, no warning) AND ``,`` (parses, emits a
+        ``UserWarning`` because under EU rules the comma is also the
+        decimal point and the form is ambiguous).  See the v2.8.4
+        release notes for the EU-mode silent-shape risk caveat (e.g.,
+        the US thousands-separator pair ``"[1,234, 5,678]"`` parses as
+        ``(1.234, 5.678)`` under EU mode — pick the locale matching
+        your inputs).
 
     Hedging signal:
         ``"about 172"`` returns ``172.0`` and **drops the hedging
@@ -253,26 +396,15 @@ def parse_numeric_answer(
             )
         return None
 
-    # v2.8.3 Commit B (M7): warn-only European decimal-comma
-    # detection. Inputs like "1,5" or "12,50" are usually European
-    # decimals (comma-as-decimal-point), but `_NUMBER_RE` only treats
-    # comma as a thousands separator when followed by exactly three
-    # digits. So "1,5" tokenizes as ["1", "5"] and (under the default
-    # `permissive=False`) returns None — a silent loss. Warn so the
-    # caller can pre-localize. Parser output is intentionally
-    # unchanged (LOCKED scope, v2.8.3 plan §3 #12).
-    if re.search(r"(?<!\d)-?\d+,\d{1,2}(?!\d)", raw):
-        warnings.warn(
-            f"parse_numeric_answer: input {raw!r} contains a "
-            "comma followed by 1-2 digits, which looks like a "
-            "European decimal-comma (e.g. '1,5' meaning 1.5). "
-            "The parser treats commas as thousands separators and "
-            "may drop the value or split it into multiple tokens. "
-            "Pre-process with str.replace(',', '.') if you intend "
-            "decimal-comma input.",
-            UserWarning,
-            stacklevel=2,
-        )
+    # v2.8.4 M15: the v2.8.3 Commit B (M7) warn-only European
+    # decimal-comma shim used to fire here for inputs like "1,5" or
+    # "12,50" under the default US mode.  That warning has been
+    # removed: callers who actually have EU-style inputs should now
+    # opt into ``decimal_separator="eu"`` to get correct parsing
+    # rather than relying on a warning.  The default ``"us"`` mode
+    # remains intentionally backward-compatible with v2.8.3 (the
+    # known silent-wrong outputs on EU inputs are documented in the
+    # v2.8.4 release notes and pinned by the parser test suite).
 
     # Strip currency / approximation prefixes BEFORE percent
     # detection so hedged or currency-prefixed percent strings
@@ -296,7 +428,9 @@ def parse_numeric_answer(
                     "percent='number' (keep raw) to accept",
                 )
             return None
-        v = _try_float(pct_match.group(1))
+        v = _try_float(
+            pct_match.group(1), decimal_separator=decimal_separator,
+        )
         if v is None:
             if strict:
                 _strict_raise(
@@ -308,11 +442,11 @@ def parse_numeric_answer(
 
     # 1. Try range detection BEFORE scalar parsing so "172-175" wins
     #    over "172" (first-number-extraction).
-    rng = _try_range(pre_clean)
+    rng = _try_range(pre_clean, decimal_separator=decimal_separator)
     if rng is None:
         # Also try on the un-stripped raw input (some range forms
         # don't survive currency stripping unchanged).
-        rng = _try_range(raw)
+        rng = _try_range(raw, decimal_separator=decimal_separator)
     if rng is not None:
         return rng
 
@@ -320,7 +454,9 @@ def parse_numeric_answer(
     cleaned = _strip_approximation(_strip_currency_and_units(raw))
     cleaned = _normalize_minus(cleaned)
 
-    numbers = _extract_numbers(cleaned)
+    numbers = _extract_numbers(
+        cleaned, decimal_separator=decimal_separator,
+    )
     if len(numbers) == 0:
         if strict:
             _strict_raise(

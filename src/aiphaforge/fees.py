@@ -12,6 +12,13 @@ from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Optional
 
+# v2.8.4 M11b: parameterize ``USStockFeeModel.__repr__`` year tags so updating
+# the historically-tagged schedule label is a one-line change in this module
+# rather than a string edit inside the formatter.  The default ``__init__``
+# values still reflect the FY2026 SEC fee + 2026 FINRA TAF schedules.
+_REPR_SEC_SCHEDULE_LABEL = "FY2026"
+_REPR_FINRA_SCHEDULE_LABEL = "2026"
+
 # v2.8: public surface lock.
 __all__ = [
     "BaseFeeModel",
@@ -361,9 +368,10 @@ class USStockFeeModel(BaseFeeModel):
         return (
             f"USStockFeeModel(per_share=${self.commission_per_share:.4f}, "
             f"min=${self.min_commission:.2f}, "
-            f"sec=${self.sec_fee_rate * 1e6:.2f}/$1M [FY2026], "
+            f"sec=${self.sec_fee_rate * 1e6:.2f}/$1M "
+            f"[{_REPR_SEC_SCHEDULE_LABEL}], "
             f"finra_taf=${self.finra_taf_per_share:.6f}/share "
-            f"cap=${self.finra_taf_cap:.2f} [2026])"
+            f"cap=${self.finra_taf_cap:.2f} [{_REPR_FINRA_SCHEDULE_LABEL}])"
         )
 
 

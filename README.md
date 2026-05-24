@@ -26,6 +26,24 @@ More patterns (AI agent with MetaController, portfolio rebalancing,
 bootstrap CIs, market-impact capacity, Bayesian optimization) live
 under [Quick Start](#quick-start).
 
+### Pick Your Entry Point
+
+`BacktestEngine` accepts six input-shape setters.  Pick the one matching
+your data shape; the rest are mutually exclusive (calling a different
+setter clears the previous input state).
+
+| Setter | Input shape | Use when | Mutual exclusion |
+|---|---|---|---|
+| `set_strategy(strategy)` | `BaseStrategy` instance | You have a strategy class that computes signals each bar from price and state. | Calls `_clear_wide_input_state()`. |
+| `set_signals(signals)` | `pd.Series` (single-asset) or `Dict[str, pd.Series]` (multi-asset) | You have pre-computed continuous signals in [-1, 1] (or NaN-hold). | Calls `_clear_wide_input_state()`. |
+| `set_signals_wide(signal_wide)` | `pd.DataFrame` (rows=bars, cols=symbols) | You have a wide DataFrame of signals — single setter for the multi-asset case. | Inline clears `_strategy`, `_signals`, `_target_weights`, `_target_weights_wide`, `_target_weights_wide_config`. |
+| `set_score_wide(scores, rule)` | `pd.DataFrame` of ML scores + a `ScoreToSignalRule` | You have model scores and want an explicit thresholding rule applied each bar. | Inline clears `_strategy`, `_signals`, `_target_weights`, `_target_weights_wide`, `_target_weights_wide_config`; the resulting signal frame is then set via `set_signals_wide(...)`. |
+| `set_target_weights(target_weights)` | `pd.Series` or `Dict[str, pd.Series]` | You have target portfolio weights (institutional rebalancing). | Calls `_clear_wide_input_state()`. |
+| `set_target_weights_wide(target_weights, ...)` | `pd.DataFrame` of target weights, optional `rebalance_frequency` | Multi-asset target-weight rebalancing on a daily DataFrame with quarterly (or similar) cadence. | Inline clears `_strategy`, `_signals`, `_target_weights`, `_signals_wide`. |
+
+`set_fee_model(...)` is unrelated — it configures cost simulation
+independently of input shape.
+
 ## Features
 
 ### Core Engine
@@ -714,590 +732,230 @@ for diag in result.diagnostics:
         print(f"dropped {diag.details['collision_count']} rows")
 ```
 
-## v2.8.3 Release Notes
+### Factor Research (alpha screening)
 
-### Headline — LLM-pillar diagnostic patches + a fabricated-roadmap retraction
+Use the alpha layer to rank a custom factor before plugging it into a
+`FactorRuleStrategy`.  `AlphaScreener.compute_ic` returns the
+information-coefficient series across forward-return horizons;
+`FactorReport` summarises IC stats, decile spreads, and turnover.
 
-v2.8.3 ships five MEDIUM-severity LLM-pillar patches (M6-M10),
-corrects a fabricated v2.9 design claim in
-`MetaContext.adjust_strategy_params`, and clears the v2.8.2
-Commit I deferred-items backlog. No engine source change beyond
-documentation in `fees.py` and the `meta.py` docstring; the
-public API surface and `BacktestResult` field set are unchanged.
+```python
+from aiphaforge.alpha.evaluator import AlphaScreener
+from aiphaforge.alpha.report import FactorReport
+from aiphaforge.factor_strategy import FactorRuleStrategy
+from aiphaforge.factors import BaseFactor
+
+
+class MyMomentum(BaseFactor):
+    def compute(self, df):
+        return df["close"].pct_change(20)
+
+
+screener = AlphaScreener(prices=price_df)
+ic_series = screener.compute_ic(MyMomentum())
+report = FactorReport.from_screener(screener, factor=MyMomentum())
+# Once the factor passes screening, drop it into a strategy:
+strategy = FactorRuleStrategy(factor=MyMomentum(), top_k=10)
+```
+
+### Hook-driven Order Submission
+
+`BacktestHook.on_pre_signal` runs each bar before the engine processes
+its own signals, so a hook can inject orders into the broker for that
+bar.  The hook calls `context.broker.submit_order(order, timestamp=...)`
+directly — `BacktestHook` itself does not expose `submit_order`.
+
+```python
+from aiphaforge.hooks import BacktestHook
+from aiphaforge.orders import Order, OrderSide, OrderType
+
+
+class CustomEntryHook(BacktestHook):
+    def on_pre_signal(self, context):
+        # context.broker, context.timestamp, context.portfolio, etc.
+        # are available to inspect; submit an Order when your rule fires.
+        if my_condition(context):
+            order = Order(
+                symbol="AAPL",
+                side=OrderSide.BUY,
+                order_type=OrderType.MARKET,
+                size=100,
+            )
+            context.broker.submit_order(order, timestamp=context.timestamp)
+
+
+engine.add_hook(CustomEntryHook())
+```
+
+### LLM Memory Probes — `knowledge_check` orchestrator
+
+`knowledge_check` is the high-level entry point for the LLM memory
+probe pillar: feed it a `KnowledgeProbe`, an `AttestedAnswers` bundle,
+and a provider config, and it runs the probe + comparison and returns
+a `KnowledgeCheckReport` with leakage indices, anchor validity, and
+persistence validity.
+
+```python
+from aiphaforge.probes import (
+    AttestedAnswers,
+    KnowledgeCheckReport,
+    KnowledgeProbe,
+    knowledge_check,
+)
+
+probe = KnowledgeProbe(name="AAPL_Q1_2024_close", ...)
+answers = AttestedAnswers.attest(...)
+provider_config = {
+    "endpoint": "...",
+    "api_key": "...",
+    "model": "your-llm-model",
+    "temperature": 0.0,
+    "max_tokens": 100,
+    "max_retries": 3,
+    "request_timeout_seconds": 30,
+    "rate_limit_rps": 5,
+    "system_prompt": "...",
+}
+
+report: KnowledgeCheckReport = knowledge_check(
+    probe=probe,
+    attested=answers,
+    provider_config=provider_config,
+)
+assert report.anchor_validity == "OK"
+```
+
+## v2.8.4 Release Notes
+
+### Headline — UX + API hygiene
+
+v2.8.4 ships six docs-and-CI items grouped under "UX + API hygiene"
+plus one carve-out from v2.8.3.  The engine is untouched; the surface
+public API is unchanged.  Single user-visible behavior change:
+`parse_numeric_answer` gains a `decimal_separator` kwarg that defaults
+to `"us"` (preserving v2.8.3 behavior verbatim).
 
 ### Per-M one-liner
 
-| ID | File | Symptom |
-|----|------|---------|
-| M6 | `probes/anchors.py:_block_bootstrap_corr_ci` | Floor-division on `n // block_size` left bootstrap samples short by up to `block_size-1` elements when `n` was not a multiple. Now uses ceiling division so the concatenated sample (after the `[:n]` slice) matches the original length exactly. Leverage-corr CI / SE estimates may shift by ~1-3% on unaligned windows. |
-| M7 | `probes/scoring.py:parse_numeric_answer` | European decimal-comma inputs (`"1,5"`, `"12,50"`) previously tokenized to two numbers and returned `None` under the default `permissive=False` — a silent loss. v2.8.3 emits a `UserWarning` naming the offending substring + suggesting `str.replace(',', '.')`. Parser output is intentionally unchanged. |
-| M8 | `probes/_vol.py:estimate_sigma` | Parkinson H==L fallback to `stdev_returns` still triggers at fraction ≥ 50%. The new `[0.4, 0.5)` warning band adds an `h_eq_l_warning_band` provenance entry (with closed-form bias estimate) without changing the chosen estimator — surfaces borderline windows for audit. |
-| M9 | `probes/orchestrator.py:looks_like_refusal` | Leading-window keyword scan widened 50 → 80 characters. Captures refusals that arrive after a longer preface — e.g. when a reply opens with two filler clauses before the refusal keyword. Concrete: the prefix `"The price was approximately 100. The price was approximately 100. "` is 66 chars, so a refusal keyword (`"i don't know"`) at position 66 sits past v2.8.2's 50-char window but inside v2.8.3's 80-char window. False-positive class from in-quote refusal phrases past position 80 is regression-pinned. |
-| M10 | `probes/orchestrator.py:KnowledgeCheckReport` | New `persistence_validity: Literal["NO_PERSISTENCE", "OK", "PAIRING_FAILED", "UNKNOWN"]` field. Mirrors `anchor_validity`. When ≠ `OK`, `real_minus_persistence_bucket_delta`, `real_vs_persistence_sign_test_p`, **and `persistence_caveat`** are suppressed to `None`. Legacy pickles (v2.8.2 and earlier) backfill via `__setstate__`: `persistence_baseline_score is not None` → `"UNKNOWN"`; otherwise → `"NO_PERSISTENCE"` (the latter case covers Knowledge / RankContinuation pickles for which no baseline ever existed). |
-| meta.py docstring | `meta.py:MetaContext.adjust_strategy_params` | Removes the fabricated "designed jointly with v2.9 IncrementalFactor" claim. The performance note now reflects the actual current behavior (O(N·K) full-timeline regeneration) and an honest "on the roadmap, no committed milestone" pointer. |
+| M | Site | What changed | User impact |
+|---|---|---|---|
+| M11 | `README.md` -> `CHANGELOG.md` | Release notes for v2.8.1, v2.8.2, v2.8.3 moved into a new root-level `CHANGELOG.md` (Keep-a-Changelog 1.1.0 format).  README keeps thin anchor-preserving stubs linking to the new file.  Sub-anchors within each release block are preserved by verbatim copy. | Loud if external links pinned to `README#v281` / `#v282` / `#v283`; silent otherwise (anchors survive). |
+| M11b | `src/aiphaforge/fees.py:360-366` | `USStockFeeModel.__repr__` parameterizes the SEC FY2026 and FINRA 2026 schedule labels via module-level constants (`_REPR_SEC_SCHEDULE_LABEL`, `_REPR_FINRA_SCHEDULE_LABEL`).  Default text unchanged. | Loud only for tests pinning the verbatim repr; none in the public tree. |
+| M12 | `README.md:#pick-your-entry-point` | New "Pick Your Entry Point" h3 with a 6-row decision table for the input-shape `set_*` family on `BacktestEngine`.  A companion parity test pins every public setter to either appear in the table or sit on the explicit allowlist. | Loud for line-pinned tools (line numbers shifted); silent for anchor-pinned tools. |
+| M13 | `README.md` Quick Start | Three new quickstart h3 sections: factor research (AlphaScreener / FactorReport / FactorRuleStrategy), hook-driven order submission (`BacktestHook.on_pre_signal` + `context.broker.submit_order(order, timestamp=...)`), and `knowledge_check` orchestrator.  A companion parity test asserts every documented symbol imports. | Silent unless downstream tooling scrapes README for code blocks. |
+| M14 | `.github/workflows/ci.yml`, `pyproject.toml` | Two new mypy steps in CI: an **advisory broad** `mypy src/aiphaforge/` (`continue-on-error: true`) so the type-check signal is visible without blocking, and a **scoped blocking** `mypy src/aiphaforge/alpha/` (no `continue-on-error`) that gates the currently 0-error `alpha/` subpackage.  Phase 2 (per-file allowlist + blocking on the top modules) is deferred to v2.9. | Loud (visible in CI output).  Local: `mypy src/aiphaforge/` shows ~200 errors / ~50 files at v2.8.4 baseline; `mypy src/aiphaforge/alpha/` must be clean. |
+| M15 | `src/aiphaforge/probes/scoring.py:50-344` | `parse_numeric_answer` gains a `decimal_separator: Literal["us", "eu"] = "us"` kwarg.  Default `"us"` preserves v2.8.3 behavior exactly (including the known silent-wrong outputs on European-style inputs).  Under `"eu"` the comma/period roles swap: `,` is the decimal point and `.` is the thousands separator.  Bracketed ranges accept BOTH `;` (canonical, silent) and `,` (parses, emits a `UserWarning` per R5).  The v2.8.3 M7 broad warn-shim is REMOVED under default US mode — its role is replaced by the EU opt-in. | Loud for EU users on opt-in (parser now correct on `"1,5"`-style inputs; warning surfaces on `,`-separated bracket ranges); SILENT for US default users (unchanged — backward-compat outputs pinned by `tests/test_probes_parse_locale.py::test_us_default_preserves_v2_8_3_silent_wrong_outputs`). |
 
-### M10 pickle migration recipe
+### URL changes in v2.8.4
 
-v2.8.2 pickles do not carry `persistence_validity`. The new
-`__setstate__` backfills the field **conditionally** with no
-warning, so existing load sites continue to work:
-
-- If the original report had a persistence baseline
-  (`persistence_baseline_score is not None`, i.e. the probe was a
-  `ContinuationProbe`): backfill to `"UNKNOWN"`. The legacy pickle
-  cannot distinguish a trivial-OK pairing from a `PAIRING_FAILED`
-  one (both produced `real_vs_persistence_sign_test_p = 1.0` via
-  `sign_test_p(0, 0) = (1.0, "trivial_n_zero")`), so re-run the
-  orchestrator to recover the real `OK` / `PAIRING_FAILED` status.
-- If no persistence baseline was ever computed (`KnowledgeProbe`
-  or `RankContinuationProbe`): backfill to `"NO_PERSISTENCE"`.
-  There is nothing to be "unknown" about; no re-run is needed.
-
-```python
-import pickle
-from aiphaforge.probes.orchestrator import KnowledgeCheckReport
-
-with open("v2.8.2_report.pickle", "rb") as f:
-    report = pickle.load(f)
-    # ContinuationProbe pickle → persistence_validity="UNKNOWN"
-    # Knowledge / RankContinuation pickle → "NO_PERSISTENCE"
-
-if report.persistence_validity == "UNKNOWN":
-    # Legacy ContinuationProbe pickle: cannot distinguish OK from
-    # PAIRING_FAILED because sign_test_p(0, 0) returns (1.0,
-    # "trivial_n_zero") under both. Re-run the orchestrator on the
-    # original probe to upgrade.
-    ...
-elif report.persistence_validity == "NO_PERSISTENCE":
-    # Knowledge / RankContinuation pickle — never had a persistence
-    # baseline. No upgrade needed; downstream stats already None.
-    ...
-```
-
-Rationale: the v2.8.2 `real_vs_persistence_sign_test_p` field
-silently collapsed both `OK` (paired but no signal) and
-`PAIRING_FAILED` (no qid overlap → empty pair list → `(0, 0)`)
-into the same `1.0` p-value. Consumers reading a v2.8.2 pickle
-have no way to tell which case produced the `1.0`. The `UNKNOWN`
-tag flags exactly this ambiguity so users can choose to re-run
-rather than treat the legacy `1.0` as a clean null result.
-
-### M7 honesty paragraph
-
-If you submitted European-format numeric inputs to
-`parse_numeric_answer` in v2.8.2 (single scalar like `"1,5"`),
-the parser returned `None` and your `parse_status` showed
-`"invalid"`. There was no warning. Range/bracket paths that
-contained a comma-decimal token were similarly mis-tokenized.
-v2.8.3 emits a `UserWarning` so the silent loss surfaces in
-test logs. Full locale support (parsing European decimals
-correctly given an explicit `locale=` argument) is on the
-v2.8.4 M15 roadmap; v2.8.3 is warning-only.
-
-### Lost-data playbook for v2.8.2 ContinuationProbe users
-
-For paper authors who used v2.8.2 `ContinuationProbe` pickles in
-published work AND cannot re-run (raw data deleted, dataset
-embargo, post-publication audit, etc.):
-
-**Suggested citation wording**:
-
-> This work used AIphaForge v2.8.2 for the persistence-baseline
-> analysis. v2.8.3 added a `persistence_validity` field to
-> `KnowledgeCheckReport` that retroactively cannot distinguish
-> `OK` from `PAIRING_FAILED` for v2.8.2-saved pickles (per the
-> AIphaForge v2.8.3 release notes, M10). Where this paper reports
-> `real_minus_persistence_bucket_delta` or
-> `real_vs_persistence_sign_test_p` from a v2.8.2-loaded report,
-> the underlying `persistence_validity` is `UNKNOWN`, and results
-> should be treated as having unknown pairing-success state.
-
-**Retraction / correction guidance**:
-
-- If your published claim used `real_minus_persistence_bucket_delta`
-  as evidence of a specific pairing state, and you cannot re-run:
-  publish a correction or erratum stating the underlying validity
-  is `UNKNOWN` per v2.8.3 release notes M10.
-- If your published claim used `real_vs_persistence_sign_test_p`
-  for a hypothesis test: same — note the underlying validity is
-  `UNKNOWN`. The `1.0` p-value cannot distinguish trivial-OK from
-  pairing-failure.
-- If your published claim used only `bucket_delta` magnitudes
-  without explicit pairing-success assertions: a footnote
-  disclosing the v2.8.2 → v2.8.3 ambiguity is sufficient (no
-  retraction needed).
+- `README#v281`, `README#v282`, `README#v283` -> the release-notes
+  blocks moved into `CHANGELOG.md`.  Each README anchor still exists
+  as a thin h2 stub pointing at the new canonical URLs
+  `CHANGELOG.md#283---2026-05-24` (and `#282-...`, `#281-...`).
+- Sub-anchors inside the v2.8.3 block (e.g.,
+  `### Lost-data playbook for v2.8.2 ContinuationProbe users`) are
+  preserved verbatim inside `CHANGELOG.md`, so the resolved URL
+  inside the new file is still `CHANGELOG.md#lost-data-playbook-...`.
 
 ### CI engineer triage block
 
-Expected failure modes when CI re-baselines on v2.8.3, in order
-of likelihood:
+Upgrading from v2.8.3:
 
-1. **M6 leverage-corr CI / SE shifts** — bootstrap samples on
-   unaligned windows are now full-length. CI half-widths and SEs
-   may move by ~1-3% on the affected windows.
-2. **M7 European-pattern warnings** — fixtures containing
-   `"\d,\d"` or `"\d,\d\d"` patterns now emit `UserWarning`.
-   `pytest.warns` blocks may need to widen, or input fixtures
-   need pre-localization via `str.replace(',', '.')`.
-3. **M8 H==L `[0.4, 0.5)` warnings** — windows in the new
-   warning band gain an extra provenance entry
-   (`h_eq_l_warning_band`); test fixtures that snapshot the
-   provenance dict shape need updating.
-4. **M9 refusal_rate metric up for borderline fixtures** — if
-   your fixtures contain refusal-shaped phrases starting in the
-   character-position 50-79 band, `looks_like_refusal` now
-   returns `True` where it previously returned `False`.
-   Downstream `refusal_rate` aggregates rise; `effective_rate`
-   falls correspondingly.
-5. **M10 `persistence_validity` field on
-   `KnowledgeCheckReport`** — pickled reports gain a new
-   field; consumers using `dataclasses.fields()` to enumerate
-   surface need updating. The `to_dict()` method already covers
-   the field automatically.
-6. **M3 dict-path validation respects `data_validation="none"`**
-   — regression-pin only, no code change. The v2.8.2
-   `set_signals` dict path already honors the
-   `data_validation="none"` escape hatch (the outer guard at
-   `engine.py:453` covers both single-Series and dict branches).
-   v2.8.3 adds a test that pins this behavior so a future
-   refactor that accidentally narrows the guard would surface
-   immediately.
-
-### Reverse-pickle caveat
-
-v2.8.3 → v2.8.2 reverse pickle is NOT supported. The new
-`persistence_validity` field has no `__init__` translation back
-to the v2.8.2 dataclass; a v2.8.3 pickle loaded under v2.8.2 will
-raise `TypeError: KnowledgeCheckReport got unexpected keyword
-arguments: ['persistence_validity']`. This is per the v2.8.1 H7
-forward-only contract.
+- **ruff**: no new rules; `ruff check src/` passes CLEAN at v2.8.4.
+- **pytest**: +18 tests across 6 new test files
+  (`test_changelog_exists_and_pins_anchors.py`,
+  `test_fees_repr_year_parameterized.py`,
+  `test_readme_entry_point_table_parity.py`,
+  `test_readme_quickstart_imports_resolve.py`,
+  `test_ci_workflow_pins_mypy_step.py`,
+  `test_probes_parse_locale.py`).
+  Total collected: 1762 -> 1780.
+- **mypy**: new advisory step lands in `.github/workflows/ci.yml`.
+  NON-BLOCKING for the broad `mypy src/aiphaforge/` invocation.  NEW
+  scoped-blocking step `mypy src/aiphaforge/alpha/` IS blocking.
+  Local invocation: `mypy src/aiphaforge/` reports ~200 errors at
+  v2.8.4; `mypy src/aiphaforge/alpha/` MUST be clean (zero errors).
+- **Version pin**: if you pin AIphaForge by SHA, re-pin to the v2.8.4
+  release commit.  `AttestedAnswers` users re-attest against the new
+  release string (`__version__ == '2.8.4'`).
+- **MED-C caveat**: opting into `decimal_separator="eu"` means
+  US-style inputs may silently parse differently (e.g., `"1.5"`
+  under EU is processed under the EU regex).  Pick the locale
+  matching your data.
+- **MED-D caveat**: under EU, scientific notation requires the
+  EU-locale form (e.g., `"1,5e3"`); a US-style `"1.5e3"` under EU
+  may return None or an unexpected value.
+- **MED-E caveat (silent shape risk)**: under
+  `decimal_separator="eu"`, the input `"[1,234, 5,678]"` (a
+  US thousands-separator pair) parses as `(1.234, 5.678)` — a
+  **1000x smaller pair** than the US default `(1234.0, 5678.0)`.
+  A UserWarning IS emitted (per R5), but if your data may include
+  US-style 1,234-formatted numbers, stay on US default or
+  pre-validate magnitudes before feeding to EU mode.
 
 ### Lockfile-pin recipe
 
 ```bash
-pip install \
-  git+https://github.com/chifongwong-coder/AIphaForge@<v2.8.3-merge-sha>
+# Pin to v2.8.4 by merge SHA (the SHA is set when the v2.8.4 branch
+# lands on main; until then pin to the feature branch HEAD).
+pip install git+https://github.com/chifongwong-coder/AIphaForge@<v2.8.4-merge-sha>
+
+# requirements.txt
+aiphaforge @ git+https://github.com/chifongwong-coder/AIphaForge@<v2.8.4-merge-sha>
 ```
 
-The merge SHA is set when v2.8.3 lands on `main`; until then, pin
-to the feature branch via
-`@feature/v2.8.3-llm-medium`.
+Reproduce CI locally:
+
+```bash
+pip install -e ".[dev]"
+ruff check src/
+mypy src/aiphaforge/        # advisory broad
+mypy src/aiphaforge/alpha/  # scoped blocking gate (MUST be clean)
+pytest tests/ -v
+```
 
 ### Deprecation removal commitment
 
-`bucket_delta_tango_ci` legacy alias remains scheduled for hard
-removal in v2.9 (unchanged from v2.8.1+v2.8.2). v2.8.3 does not
-move the schedule.
+Unchanged from v2.8.1 / v2.8.2 / v2.8.3:
 
-### What v2.8.3 does NOT include
+- `tango_paired_diff_ci` alias + `bucket_delta_tango_ci` legacy
+  kwarg: hard-removal in v2.9. v2.8.4 keeps the legacy translation
+  + `DeprecationWarning` shipped in v2.8.1 H7.
+- `persistence_validity = "UNKNOWN"` setstate backfill (v2.8.3
+  Commit F + L) is permanent. Consumers loading v2.8.2 pickles
+  still see the backfill semantics described in
+  [CHANGELOG.md#283](./CHANGELOG.md#283---2026-05-24) M10.
+- v2.8.3 M7 European-decimal warning shim: removed under
+  `decimal_separator="eu"` (M15 supersedes); RETAINED under the
+  `"us"` default so existing callers still see the warning on
+  ambiguous comma input.
 
-- Full locale support for European decimal-comma parsing (M7 is
-  warning-only; locale support is on the v2.8.4 M15 roadmap).
+No new deprecations were introduced in v2.8.4.
+
+### What v2.8.4 does NOT include
+
+- LLM probe MEDIUMs beyond the M15 locale work (shipped in v2.8.3).
 - Reverse-lock skip-rule tightening (v2.8.5).
-- `IncrementalSMA` / `IncrementalEMA` / partial-timeline
-  regeneration (no committed milestone — see the corrected
-  `MetaContext.adjust_strategy_params` docstring).
-- `__pickle_version__` constant on `KnowledgeCheckReport` (does
-  not exist; out of scope for v2.8.3).
-- `dataclasses.asdict` for `KnowledgeCheckReport` serialization
-  (use `report.to_dict()` instead — `asdict` rejects the
-  `MappingProxyType`-wrapped fields).
+- Test fixture consolidation `tests/_helpers/ohlcv.py` (v2.8.5 L1).
+- `aiphaforge.stats` neutral-primitives module (v2.9).
+- `significance.py` subpackage split (v2.9).
+- `IncrementalSMA` / `IncrementalEMA` / partial-timeline regeneration
+  (no committed milestone).
+- mypy Phase 2 (per-file allowlist + blocking on the top modules) —
+  deferred to v2.9.
+- v3.0 LLM / AI factor mining (separate major track).
+
+## v2.8.3 Release Notes
+
+See [CHANGELOG.md](./CHANGELOG.md#283---2026-05-24).
 
 ## v2.8.2 Release Notes
 
-### Headline — parallel-backtest users: your strategy instance is mutated in place
-
-If you used `MetaContext.adjust_strategy_params` with a shared
-strategy instance across parallel backtest workers
-(`multiprocessing.Pool`, threading, or a simple loop), the
-adjustment from one worker leaked to ALL other workers holding
-the same reference. v2.8.2 documents this in the
-`adjust_strategy_params` docstring + ships the
-factory-per-worker recipe.
-
-```python
-# WRONG — shared instance leaks adjustments across workers:
-strategy = MACrossover(short=5, long=20)
-with Pool() as pool:
-    pool.map(lambda d: run(d, strategy), datasets)
-
-# RIGHT — factory per worker isolates state:
-def make_strategy():
-    return MACrossover(short=5, long=20)
-with Pool() as pool:
-    pool.map(lambda d: run(d, make_strategy()), datasets)
-```
-
-If your historical v2.8.1-or-earlier results came from the
-"shared instance" pattern with mid-run `adjust_strategy_params`
-calls, those results are cross-contaminated and should be
-re-run with the factory pattern. **There is NO runtime
-detection in v2.8.2** — if you upgrade via dependabot / auto-pin
-without reading these release notes, silent contamination from
-prior runs persists. You must audit your parallel-backtest
-pipelines and switch to the factory pattern manually.
-
-**Performance note — `adjust_strategy_params` regen cost**: every
-call re-runs the strategy from bar 0 (O(N·K) for N bars × K
-adjustments). Callers performing many small adjustments on a long
-timeline should batch them where possible. A partial-timeline
-(incremental) regeneration path is on the roadmap; no committed
-milestone yet. *(The v2.8.2 release notes initially announced a
-v2.8.3 ship "designed jointly with a v2.9 IncrementalFactor
-engine integration" — there is no IncrementalFactor module or
-v2.9 plan, and v2.8.3 corrects this fabrication in both the
-`MetaContext.adjust_strategy_params` docstring and these release
-notes. See v2.8.3 Commit H.)*
-
-### CI engineer triage block
-
-Five expected failure modes when CI re-baselines on v2.8.2, in
-order of impact:
-
-1. **US-stock sell-side cost shift (M2)** — `USStockFeeModel`
-   sell commission rises by ~$2.3 per $100k due to FY2026 SEC §31
-   + 2026 FINRA TAF defaults now applying. Buy-side unchanged.
-   Golden fixtures with US-stock sell-heavy strategies will
-   rebaseline. Opt out (e.g., pre-2003 backtests):
-   `USStockFeeModel(sec_fee_rate=0, finra_taf_per_share=0)`.
-2. **`set_signals` validation (M3)** — duplicate-index Series,
-   non-`DatetimeIndex` Series, and non-numeric dtype now raise at
-   `set_signals` time. Tests that worked silently in v2.8.1 with
-   these shapes now fail at the boundary instead of crashing
-   later. See "M3 rejection set" below for the enumerated cases.
-   Escape hatch: `BacktestEngine(data_validation="none")`.
-3. **Parallel-backtest contamination (M4)** — covered in the
-   headline above. No automatic detection ships in v2.8.2; the
-   migration is to switch to the factory-per-worker pattern.
-4. **`cost_normalization` opt-in (M5)** — `DefaultTradeCost` now
-   accepts `cost_normalization="current_equity"` (default
-   `"initial_capital"` preserves v2.8.1). Decision rubric below.
-5. **`PercentageStopLoss` divergence pin (M1)** — no behavior
-   change; new regression test pins existing event-driven /
-   vectorized divergence magnitude on a gap-bar fixture. CI
-   suites mirroring that fixture pattern may need to update
-   their expected divergence range. **Note for live-vs-backtest
-   users**: vectorized PnL is OPTIMISTIC vs event-driven on
-   gap-down triggers; if you tune thresholds against vectorized
-   and run live event-driven, expect realized worse fills.
-6. **New tests + test regressions fixed (Commit F + v2.8.1
-   deferred items)** — 9 new test files / additions land in
-   v2.8.2 (M1-M5 + 4 v2.8.1 follow-up pins). 2 pre-existing tests
-   were updated to honor M3's stricter `set_signals` validation
-   (`test_e2e.py::test_empty_data_raises`,
-   `test_v2_8_1_h2_dup_index.py::test_engine_event_driven_rejects_dup_data_at_validation_not_loop`).
-   A CI workflow running `pytest --collect-only` diff will see
-   these new entries; no behavior change in the production code.
-
-### Per-M one-liner
-
-| ID | File | Symptom |
-|----|------|---------|
-| M1 | `exit_rules.py:PercentageStopLoss` | Event-driven submits market order (next-bar open fill); vectorized exits at theoretical threshold on trigger bar. Documents-only fix; alignment requires next-bar OHLC plumbing into vectorized (v2.9). |
-| M2 | `fees.py:USStockFeeModel` | Sell side now includes SEC §31 (FY2026 `20.60e-6`) + FINRA TAF (2026 `0.000195/share, cap $9.79`). Buy-side unchanged. Opt out with zeros. |
-| M3 | `engine.py:set_signals` | Single-Series + per-symbol-dict path now calls `validate_signal_series`. Respects `data_validation="none"`. |
-| M4 | `meta.py:MetaContext.adjust_strategy_params` | In-place mutation documented; factory-per-worker recipe ships. Performance note: each call re-runs the strategy from bar 0 (O(N·K)). A partial-timeline regeneration path is on the roadmap, no committed milestone. *(v2.8.2 originally promised a v2.8.3 ship "designed jointly with v2.9 IncrementalFactor"; this claim was fabricated — there is no IncrementalFactor engine integration plan. v2.8.3 Commit H retracted the claim in the meta.py docstring; this row supersedes the v2.8.2 row text.)* |
-| M5 | `costs.py:DefaultTradeCost` | Opt-in `cost_normalization="current_equity"`. Default unchanged. First-order approximation (uses pre-cost gross returns). |
-
-### M3 rejection set
-
-`set_signals` now rejects these Series shapes at the boundary
-(authoritative source: `tests/_helpers/expected_rejections.md`):
-
-- Non-`DatetimeIndex` (e.g. `RangeIndex`, `Int64Index`, `MultiIndex`) → `TypeError`
-- Duplicate `DatetimeIndex` timestamps → `ValueError`
-- Non-numeric dtype (e.g. `object`, `string`) → `TypeError`
-
-These shapes PASS default validation (NOT rejected):
-- All-NaN Series
-- Out-of-order timestamps
-- Empty Series
-- Fractional values (when `allow_fractional=True`, the default)
-
-Escape hatch: `BacktestEngine(data_validation="none")` skips boundary
-validation for parity with the `validate_ohlcv` convention.
-
-### M2 era-specific overrides
-
-Recipes for backtests outside the FY2026 default era:
-
-```python
-# Pre-2003-04-01 (no NASD/FINRA TAF; fee introduced 2003-04):
-# FINRA TAF was originally the NASD TAF, renamed in 2007 when
-# FINRA was formed from NASD + NYSE Regulation. Same fee math.
-fee = USStockFeeModel(finra_taf_per_share=0)
-
-# Pre-1971 (no SEC §31; fee introduced 1971):
-fee = USStockFeeModel(sec_fee_rate=0)
-
-# Cross-boundary backtest spanning the FY2026-2 effective date
-# (2026-04-04): SEC §31 jumped from 8.00e-6 to 20.60e-6.
-# Run two segments with separate USStockFeeModel instances and
-# concatenate equity curves; a single scalar can't express both.
-# NOTE: this is a CALLER-side recipe — the engine has no in-engine
-# path for switching fee model mid-run. Split your data, run two
-# BacktestEngine instances, then concatenate the equity curves
-# manually.
-fee_pre  = USStockFeeModel(sec_fee_rate=8.00e-6)   # 2025-10-01..2026-04-03
-fee_post = USStockFeeModel(sec_fee_rate=20.60e-6)  # 2026-04-04..present
-```
-
-For historic rates outside v2.8.2's defaults, consult the SEC Fee
-Rate Advisory archive and the FINRA Trading Activity Fee schedule.
-
-### M5 decision rubric
-
-When to use which `cost_normalization`:
-
-- **`"initial_capital"` (default)** — path-independent cost
-  reporting (most use cases); your strategy stays within ±50%
-  of starting capital; you compare across strategies and want
-  apples-to-apples cost figures.
-- **`"current_equity"`** — backtest has > 50% expected drawdown;
-  you compute Sharpe / max-drawdown over deep-loss regimes; you
-  need cost ratio to reflect realized equity at each bar.
-
-The `"current_equity"` mode is a first-order approximation
-(`running_equity` uses gross pre-cost returns). The bias under-
-states cost; magnitude grows with turnover × horizon. The
-iteratively-correct version is a v2.9 follow-up.
-
-### Lockfile-pin
-
-```bash
-# v2.8.1 (previous release):
-pip install git+https://github.com/chifongwong-coder/AIphaForge@5862eb7
-
-# v2.8.2 (current release): pin the immutable commit SHA below.
-# Until the v2.8.2 branch is merged to main, this is the HEAD SHA
-# of feature/v2.8.2-strategy-medium; after merge, swap to the
-# merge-commit SHA from `git log main` for the immutable reference.
-# Avoid pinning to a branch name — branch names are mutable.
-pip install git+https://github.com/chifongwong-coder/AIphaForge@2240d2b
-```
-
-### Deprecation removal commitment
-
-`tango_paired_diff_ci` alias + `bucket_delta_tango_ci` kwarg
-hard-removal stays on v2.9 schedule (unchanged from v2.8.1).
-
-### What v2.8.2 does NOT include
-
-- **M4 perf optimization** — full-timeline regen on every
-  `adjust_strategy_params` call. A partial-timeline regeneration
-  path is on the roadmap; no committed milestone.
-  *(v2.8.2 originally cited a v2.8.3 ship "designed jointly with
-  v2.9 IncrementalFactor engine integration so both consumers
-  share a single API"; this paragraph was fabricated. v2.8.3
-  Commit H + the v2.8.3 release notes retract the claim. This
-  bullet supersedes the v2.8.2 original.)*
-- **LLM probe MEDIUMs** (anchors, orchestrator, scoring) —
-  v2.8.3.
-- **UX + API hygiene** (CHANGELOG, mypy CI) — v2.8.4.
-- **Test fixture consolidation + factor LOWs** — v2.8.5.
-- **Architectural items** (`significance.py` split, neutral
-  primitives module) — v2.9 (the final v2.x release).
-  *(v2.8.2 originally included "IncrementalFactor engine
-  integration" in this list; that integration is not on a v2.9
-  plan and was retracted in v2.8.3.)*
-- **v3.0 LLM/AI factor mining** — separate major track.
-
----
+See [CHANGELOG.md](./CHANGELOG.md#282---2026-05-21).
 
 ## v2.8.1 Release Notes
 
-### Two silent-correctness bugs are fixed. Your historical results may have been wrong.
-
-**Headline 1 — vectorized US-stock equity curves WILL improve after
-upgrade (H1).** v2.8.0's `DefaultTradeCost.apply_vectorized` called
-`fee_model.estimate_commission_rate()` with no arguments, getting the
-default `(price=100, size=100)` pair. For `USStockFeeModel` with the
-`min_commission=$1` floor, that produced a ~1% trade cost — about
-100× the real per-trade rate. v2.8.1 derives a representative
-`(price, size)` from your `position_sizer + initial_capital`. Cost
-drag drops from inflated ≈1% to correct ≈0.01-0.1%. **This is a bug
-fix, not a behavior change in your strategy.** Caveat for live
-traders: if you tuned thresholds against the inflated backtest cost,
-your live edge may now appear *worse* than your new backtest — your
-strategy was implicitly over-paying for the wrong reason.
-
-**Headline 2 — vectorized multi-asset PnL with a `capital_allocator`
-was silently wrong (H4).** The vectorized core ignored
-`capital_allocator` and ran static equal-weight; the event-driven
-core honored it. Users running vectorized multi-asset backtests with
-a custom allocator got PnL that did NOT match the equivalent
-event-driven run. v2.8.1 does NOT implement dynamic allocation in
-vectorized (that's v2.8.2+); instead, it emits a loud `UserWarning`
-naming your allocator class and pointing at `mode='event_driven'`.
-**If you ran vectorized multi-asset with a non-trivial
-`capital_allocator` in v2.8.0, your historical backtest PnL is wrong
-and you should re-run on event-driven to get the right numbers.**
-
-### Lockfile-pin for academic reproducibility of v2.8.0-pinned runs
-
-AIphaForge is not currently published to PyPI. For exact
-reproducibility of a v2.8.0-pinned analysis, pin the git commit SHA
-directly:
-
-```bash
-pip install git+https://github.com/chifongwong-coder/AIphaForge@fd4b34f
-```
-
-```text
-# requirements.txt
-aiphaforge @ git+https://github.com/chifongwong-coder/AIphaForge@fd4b34f
-```
-
-Commit `fd4b34f` is the v2.8.0 release commit (`__version__ ==
-'2.8.0'`). If you cited a v2.8.0 result in a paper, this is the SHA
-to reference.
-
-### CI engineer triage block
-
-Seven expected failure modes when CI re-baselines on v2.8.1, listed
-in order of impact (silent-correctness bugs first, then noisy breaks,
-then opt-in `-W error` breaks):
-
-1. **Equity curve drift (H1)** — most common. Cost rate fixed;
-   rebaseline golden fixtures for any single-asset vectorized run.
-2. **Multi-asset PnL drift (H4)** — silent bug; previously wrong
-   numbers. If your golden fixtures cover vectorized multi-asset
-   with a `capital_allocator`, decide whether to (a) accept the new
-   `UserWarning` and re-baseline against event-driven, or (b) switch
-   the fixture to `mode='event_driven'` outright.
-3. **Duplicate-timestamp fixture `ValueError` (H2)** —
-   `validate_ohlcv` now hard-fails on duplicate index regardless of
-   `validation_level`. Fix the data, not the test:
-   `df = df[~df.index.duplicated(keep='first')]`.
-4. **New vectorized warnings break `-W error` runs (H3 + H4)** —
-   v2.8.1 expanded `_VECTORIZED_UNSUPPORTED_FIELDS` from 7 to 21.
-   Setting any of `fill_model`, `session_end_time`,
-   `immediate_fill_price`, `fee_allocation`, `capital_allocator`,
-   `lot_size`, `max_position_pct`, the multi-asset `asset_*` dicts,
-   etc. on a `vectorized` engine now warns. Under `pytest -W error`
-   these become exceptions. Either move to `event_driven` or relax
-   the warning filter for the affected modules.
-5. **`DeprecationWarning` as error (H6)** — code that still imports
-   `tango_paired_diff_ci` (renamed to `wald_paired_diff_ci`) emits a
-   `DeprecationWarning`. Under `-W error` this is a hard fail.
-   Migrate the import or relax the filter.
-6. **Pickle bytes-hash pinning (H7)** —
-   `KnowledgeCheckReport.__getstate__` changes dict shape. Any
-   caller pinning the pickle bytes-hash needs re-pinning.
-7. **ABC additive break** — external subclasses of `BaseTradeCost`
-   that override `apply_vectorized` with the v2.8.0 (kwargs-less)
-   signature will `TypeError` on the first vectorized run:
-   `TypeError: apply_vectorized() got an unexpected keyword argument 'representative_notional'`.
-   Fix in your override: add
-   `*, representative_notional=None, representative_size=None`
-   (or `**_kwargs`) to the signature. Forward both kwargs if you
-   call `super().apply_vectorized(...)` from your subclass — silently
-   dropping them re-introduces the H1 bug at the call site. No
-   fallback shim ships in v2.8.1 per the v2.8.x "no compat flag"
-   precedent.
-
-### Per-H one-liner
-
-| ID | File | Symptom |
-|----|------|---------|
-| H1 | `costs.py:DefaultTradeCost.apply_vectorized` | Vectorized US-stock cost over-billed ≈100× via no-args `estimate_commission_rate()`. |
-| H2 | `utils.py:validate_ohlcv` | Duplicate-timestamp OHLCV slipped past `warn` mode and crashed event-driven mid-loop. |
-| H3 | `engine.py:_VECTORIZED_UNSUPPORTED_FIELDS` | 14 fields silently dropped by vectorized; no warning surfaced them. |
-| H4 | `engine.py:_warn_vectorized_capital_allocator_divergence` | Vectorized multi-asset ignored `capital_allocator`; PnL silently diverged from event-driven. |
-| H5 | `probes/anchors.py:_build_ohlcv_from_returns` | Anchor H/L hardcoded ±1.5% → Parkinson/GK vol estimates were deterministic noise. Synthetic spread ratio now bar-for-bar matches real; Parkinson is approximately (not exactly) equal — see docstring. |
-| H6 | `probes/orchestrator.py:tango_paired_diff_ci` | Function named after Tango (1998) but body is Wald — caused mis-citation. |
-| H7 | `probes/orchestrator.py:KnowledgeCheckReport` | `MappingProxyType` fields broke pickle round-trip; multiprocessing pipelines crashed. |
-| H8 | `tests/test_v2_8_public_api_lock.py` | v2.8 lock was one-way; symbols without `_` prefix slipped public. |
-
-### Anchor-probe users (H5): your reported Parkinson values will change
-
-Anchor-side Parkinson `(ln(H/L))^2` and Garman-Klass intra-bar vol
-estimates in v2.8.0 were deterministic functions of the constant
-±1.5% spread the helper hardcoded — not anything tied to your real
-symbol. v2.8.1 derives synthetic H/L from the real bar's
-`(H - L) / close` ratio per timestamp, so the anchor's vol stats now
-reflect the real bar. **Numerical impact**: any leakage-test
-sensitivity calibrated on v2.8.0 Parkinson values needs
-re-calibration. The synthetic spread RATIO is bar-for-bar identical
-to the real spread; Parkinson is approximately equal (the synthetic
-centers H/L symmetrically around close, which a real bar generally
-does not — typical relative error < 1% at spread ≤ 5%, see the
-`_build_ohlcv_from_returns` docstring).
-
-### Breaking changes + migration recipes
-
-- **H2** dedupe: `df = df[~df.index.duplicated(keep='first')]`
-- **H6** rename — GNU sed:
-  `sed -i 's/tango_paired_diff_ci/wald_paired_diff_ci/g' your_file.py`
-  BSD/macOS:
-  `sed -i '' 's/tango_paired_diff_ci/wald_paired_diff_ci/g' your_file.py`
-- **H7** pickle: old v2.7.x pickles carrying `bucket_delta_tango_ci`
-  load with a `DeprecationWarning` (the translation now fires on
-  both `__init__` and pickle restore via `__setstate__` — v2.8.1
-  Commit J fix). Re-save with `pickle.dump(report, ...)` after a
-  clean load to silence.
-- **H7** kwargs-only: `KnowledgeCheckReport` accepts ONLY keyword
-  arguments since v2.8.1. Positional construction raises `TypeError`.
-  The dataclass has 24 required fields plus several optional defaults;
-  the skeleton below is illustrative — copy-paste will raise
-  `TypeError: missing required argument 'paired_sign_test_n_positive'`
-  (or similar) until every required field is supplied. Inspect
-  `dataclasses.fields(KnowledgeCheckReport)` for the authoritative
-  list:
-  ```python
-  # v2.8.0 (worked, no longer):
-  # KnowledgeCheckReport("knowledge", real_score, anchor_score, ...)
-
-  # v2.8.1+ (skeleton — supply ALL 24 required fields):
-  KnowledgeCheckReport(
-      probe_kind="knowledge",
-      real_score=real_score,
-      anchor_score=anchor_score,
-      bucket_delta=bucket_delta,
-      paired_sign_test_p=sign_test_p_val,
-      # ... other ~14 required fields by keyword ...
-      anchor_validity="OK",
-      parsing_schema_hash=schema_hash,
-      parsing_schema_description=schema_desc,
-      prompt_template_hash=template_hash,
-      prompt_template_description=template_desc,
-  )
-  ```
-- **H8** promoted symbols (your existing imports are now blessed):
-  `serialize_answer_records`, `resolve_determinism_config`.
-
-### Advanced knobs you might not have noticed
-
-- `BacktestEngine(representative_notional=...)` and / or
-  `BacktestEngine(representative_size=...)` — override the engine-
-  derived cost-estimation values. Engine default is
-  `initial_capital * min(sizer.fraction, max_position_size)` for
-  `FractionSizer` / `AllInSizer`, or `sizer.size` for `FixedSizer`.
-  Either or both kwargs can be passed independently — whatever you
-  pass wins; the engine fills only the unset side from the sizer.
-- `build_synthetic_anchor(..., hl_spread_source="real_distribution_shuffled")`
-  — opt out of bar-by-bar real-spread propagation. Permutes the real
-  spread ratios via a seed-derived RNG; destroys bar-level
-  autocorrelation while preserving the marginal distribution. Useful
-  for verifying "no per-bar leak" via `autocorr(spread) ≈ 0`. True
-  symbol anonymization still goes through `SymbolMasker`.
-
-### Deprecation removal commitment
-
-`tango_paired_diff_ci` and the `bucket_delta_tango_ci` legacy kwarg
-to `KnowledgeCheckReport` ship with `DeprecationWarning` in v2.8.1.
-Both **hard-remove in v2.9** — the next minor version after the
-v2.8.x patch series. If you maintain a downstream that pins
-`tango_paired_diff_ci` import, migrate before bumping past v2.8.x.
-
-### What v2.8.1 does NOT include
-
-v2.8.1 is the **HIGH-severity batch only**. MEDIUM-severity follow-
-ups (strategy / LLM / UX-API / test-factor housekeeping) ship across
-v2.8.2 – v2.8.5; architectural work (`IncrementalFactor` engine
-integration, `significance.py` split, neutral primitives module)
-lands in v2.9 (the final v2.x release). A separate v3.0 track is
-reserved for LLM/AI factor mining.
+See [CHANGELOG.md](./CHANGELOG.md#281---2026-05-20).
 
 ## Installation
 
