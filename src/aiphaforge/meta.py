@@ -100,10 +100,12 @@ class MetaContext:
                 pool.map(lambda d: run(d, make_strategy()), datasets)
 
         Performance note: regeneration runs over the FULL timeline
-        each call (O(N·K) for N bars × K adjustments).
-        Partial-timeline regeneration is planned for v2.8.3, designed
-        jointly with the v2.9 ``IncrementalFactor`` engine integration
-        so both consumers share a single opt-in incremental interface.
+        each call (O(N·K) for N bars × K adjustments) — every
+        ``adjust_strategy_params`` invocation re-runs the strategy
+        from bar 0. Callers that perform many small adjustments on
+        a long timeline should batch them where possible. A
+        partial-timeline (incremental) regeneration path is on the
+        roadmap; no committed milestone yet.
         """
         if self._strategy is not None:
             self._strategy.update_params(**kwargs)
