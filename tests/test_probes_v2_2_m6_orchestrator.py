@@ -60,13 +60,42 @@ def _make_real_data(n: int = 60, seed: int = 0) -> pd.DataFrame:
 
 
 class TestLooksLikeRefusal:
-    def test_keyword_in_leading_50_chars_returns_true(self):
+    # v2.8.3 Commit D (M9): leading window widened 50 → 80 characters.
+    def test_keyword_in_leading_80_chars_returns_true(self):
         assert looks_like_refusal("I don't have access to that data.")
 
-    def test_keyword_at_position_60_returns_false(self):
-        # "i don't know" placed beyond first 50 chars
-        text = ("The price was approximately 100. " * 2
-                + "I don't know more.")
+    def test_keyword_at_position_66_now_caught_under_widen_80(self):
+        # "i don't know" starts at position 66 in the prefix below.
+        # Under the prior 50-char window this missed the refusal;
+        # under the M9-widened 80-char window it is correctly caught.
+        prefix = "The price was approximately 100. " * 2  # 66 chars
+        text = prefix + "I don't know more."
+        assert len(prefix) == 66
+        assert looks_like_refusal(text)
+
+    def test_keyword_past_position_80_returns_false(self):
+        # Push the keyword far enough that it lies past the widened
+        # 80-char window. The digit ratio is intentionally high so
+        # the length-based fallback also does not trigger.
+        prefix = "Price 100.55 close 100.60 open 100.40 vol 1000. " * 2
+        text = prefix + "I don't know more."
+        assert len(prefix) > 80
+        assert not looks_like_refusal(text)
+
+    def test_in_quote_refusal_phrase_past_window_still_excluded(self):
+        # Regression: the leading-window restriction's whole purpose
+        # is to avoid flagging numeric answers that quote a
+        # refusal-shaped phrase mid-reply. Widening to 80 must not
+        # break that property — a quoted refusal that begins after
+        # position 80 inside a digit-rich answer must still return
+        # False.
+        prefix = "Open 100.55, high 100.80, low 100.20, close 100.65. " * 2
+        text = (
+            prefix
+            + "The article says 'I don't have access' but the "
+            + "close was 100.65."
+        )
+        assert len(prefix) > 80
         assert not looks_like_refusal(text)
 
     def test_short_numeric_answer_returns_false(self):
@@ -522,3 +551,183 @@ class TestPersistenceBaseline:
         )
         assert report.persistence_baseline_score is None
         assert report.persistence_caveat is None
+
+    # v2.8.3 Commit E (M10a): persistence_validity gate.
+    def test_persistence_validity_no_persistence_for_pointintime(self):
+        # Non-continuation probes have no persistence baseline.
+        data = _make_real_data()
+        probe = KnowledgeProbe(symbol="AAPL",
+                                templates=DEFAULT_TEMPLATES)
+        anchors = list(data.index[10:15])
+        question_set = probe.build(data, anchors)
+        attested = _build_perfect_attested(question_set)
+        report = knowledge_check(
+            probe, data, anchors, attested,
+            provider_config=_provider_config(),
+        )
+        assert report.persistence_validity == "NO_PERSISTENCE"
+        # Gated downstream stats stay None.
+        assert report.real_minus_persistence_bucket_delta is None
+        assert report.real_vs_persistence_sign_test_p is None
+
+    def test_persistence_validity_ok_for_clean_continuation(self):
+        data = _make_real_data(n=80)
+        probe = ContinuationProbe(
+            symbol="AAPL", context_bars=10, forward_horizon=1,
+            templates=[NextCloseContinuation],
+        )
+        anchors = list(data.index[20:25])
+        question_set = probe.build(data, anchors)
+        attested = _build_perfect_attested(question_set)
+        report = knowledge_check(
+            probe, data, anchors, attested,
+            provider_config=_provider_config(),
+        )
+        assert report.persistence_validity == "OK"
+        # Downstream stats populated under OK.
+        assert report.real_minus_persistence_bucket_delta is not None
+        assert report.real_vs_persistence_sign_test_p is not None
+
+    # v2.8.3 Commit F (M10b): __setstate__ backfill for legacy pickles.
+    def test_legacy_pickle_without_persistence_validity_backfills_unknown(
+        self,
+    ):
+        # v2.8.3 Commit F + Commit L: a v2.8.2 pickle from a
+        # ContinuationProbe (persistence_baseline_score is not None)
+        # backfills to "UNKNOWN" so consumers re-run the orchestrator.
+        import pickle
+        data = _make_real_data(n=80)
+        probe = ContinuationProbe(
+            symbol="AAPL", context_bars=10, forward_horizon=1,
+            templates=[NextCloseContinuation],
+        )
+        anchors = list(data.index[20:25])
+        question_set = probe.build(data, anchors)
+        attested = _build_perfect_attested(question_set)
+        report = knowledge_check(
+            probe, data, anchors, attested,
+            provider_config=_provider_config(),
+        )
+        state = report.__getstate__()
+        state.pop("persistence_validity", None)
+        assert state["persistence_baseline_score"] is not None
+        revived = KnowledgeCheckReport.__new__(KnowledgeCheckReport)
+        revived.__setstate__(state)
+        assert revived.persistence_validity == "UNKNOWN"
+        roundtripped = pickle.loads(pickle.dumps(report))
+        assert roundtripped.persistence_validity == "OK"
+
+    def test_pairing_failed_nulls_persistence_caveat(
+        self, monkeypatch,
+    ):
+        # v2.8.3 Commit L (architect MED fix): under PAIRING_FAILED
+        # the persistence_caveat must also be None (symmetric to
+        # real_minus_persistence_bucket_delta and
+        # real_vs_persistence_sign_test_p suppression). Force the
+        # empty-pair branch by monkeypatching the helper.
+        from aiphaforge.probes import orchestrator as orch_mod
+        monkeypatch.setattr(
+            orch_mod, "_pair_scores_by_question_id",
+            lambda real, persistence: ([], []),
+        )
+        data = _make_real_data(n=80)
+        probe = ContinuationProbe(
+            symbol="AAPL", context_bars=10, forward_horizon=1,
+            templates=[NextCloseContinuation],
+        )
+        anchors = list(data.index[20:25])
+        question_set = probe.build(data, anchors)
+        attested = _build_perfect_attested(question_set)
+        report = knowledge_check(
+            probe, data, anchors, attested,
+            provider_config=_provider_config(),
+        )
+        assert report.persistence_validity == "PAIRING_FAILED"
+        assert report.real_minus_persistence_bucket_delta is None
+        assert report.real_vs_persistence_sign_test_p is None
+        assert report.persistence_caveat is None
+
+    def test_legacy_pickle_non_continuation_backfills_no_persistence(
+        self,
+    ):
+        # v2.8.3 Commit L (architect MAJOR fix): a v2.8.2 pickle
+        # from a KnowledgeProbe / RankContinuationProbe has
+        # persistence_baseline_score=None — there is no persistence
+        # baseline to be "unknown" about. Backfill NO_PERSISTENCE
+        # so the M10 migration recipe ("re-run to upgrade") does
+        # not mislead users of non-Continuation pickles.
+        data = _make_real_data()
+        probe = KnowledgeProbe(
+            symbol="AAPL", templates=DEFAULT_TEMPLATES,
+        )
+        anchors = list(data.index[10:15])
+        question_set = probe.build(data, anchors)
+        attested = _build_perfect_attested(question_set)
+        report = knowledge_check(
+            probe, data, anchors, attested,
+            provider_config=_provider_config(),
+        )
+        state = report.__getstate__()
+        state.pop("persistence_validity", None)
+        assert state["persistence_baseline_score"] is None
+        revived = KnowledgeCheckReport.__new__(KnowledgeCheckReport)
+        revived.__setstate__(state)
+        assert revived.persistence_validity == "NO_PERSISTENCE"
+
+    # v2.8.3 Commit G (M10c): field-contract coverage.
+    def test_persistence_validity_is_a_declared_dataclass_field(self):
+        from dataclasses import fields
+        field_names = {f.name for f in fields(KnowledgeCheckReport)}
+        assert "persistence_validity" in field_names
+
+    def test_to_dict_includes_persistence_validity(self):
+        data = _make_real_data(n=80)
+        probe = ContinuationProbe(
+            symbol="AAPL", context_bars=10, forward_horizon=1,
+            templates=[NextCloseContinuation],
+        )
+        anchors = list(data.index[20:25])
+        question_set = probe.build(data, anchors)
+        attested = _build_perfect_attested(question_set)
+        report = knowledge_check(
+            probe, data, anchors, attested,
+            provider_config=_provider_config(),
+        )
+        d = report.to_dict()
+        assert "persistence_validity" in d
+        assert d["persistence_validity"] == "OK"
+
+    def test_construct_with_explicit_pairing_failed_validity(self):
+        # Direct construction with PAIRING_FAILED is accepted by the
+        # manual __init__. Reuse the H7-pickle helper for the
+        # remaining required fields so this test stays focused on
+        # the M10 field acceptance.
+        from tests.test_v2_8_1_h7_report_pickle import _baseline_kwargs
+        kwargs = _baseline_kwargs()
+        kwargs["persistence_validity"] = "PAIRING_FAILED"
+        report = KnowledgeCheckReport(**kwargs)
+        assert report.persistence_validity == "PAIRING_FAILED"
+
+    def test_unknown_kwarg_for_persistence_validity_typo_rejected(self):
+        # __init__ rejects unknown kwargs (M4 contract). A typo on
+        # the new field must not silently drop through.
+        from tests.test_v2_8_1_h7_report_pickle import _baseline_kwargs
+        kwargs = _baseline_kwargs()
+        kwargs["persistencevalidity"] = "OK"  # typo (no underscore)
+        with pytest.raises(
+            TypeError, match="persistencevalidity",
+        ):
+            KnowledgeCheckReport(**kwargs)
+
+    def test_pickle_roundtrip_preserves_explicit_pairing_failed(self):
+        # __setstate__ backfills ONLY when the key is missing. An
+        # explicit "PAIRING_FAILED" must survive the round-trip
+        # unchanged (no override to UNKNOWN, no coercion).
+        import pickle
+
+        from tests.test_v2_8_1_h7_report_pickle import _baseline_kwargs
+        kwargs = _baseline_kwargs()
+        kwargs["persistence_validity"] = "PAIRING_FAILED"
+        report = KnowledgeCheckReport(**kwargs)
+        revived = pickle.loads(pickle.dumps(report))
+        assert revived.persistence_validity == "PAIRING_FAILED"

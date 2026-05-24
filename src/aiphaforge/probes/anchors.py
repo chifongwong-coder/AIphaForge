@@ -74,7 +74,14 @@ def _block_bootstrap_corr_ci(
     """
     rng = np.random.Generator(np.random.PCG64(seed))
     n = len(returns)
-    n_blocks = max(1, n // block_size)
+    # Ceiling division so the concatenated bootstrap sample (after the
+    # trailing [:n] truncation) always has length exactly n, matching
+    # the original returns length. Floor division could leave the
+    # bootstrap sample short by up to block_size-1 elements when n is
+    # not a multiple of block_size (e.g. n=199, block_size=10 → floor
+    # gives 19 blocks = 190 elements; ceiling gives 20 blocks → 200,
+    # truncated to 199).
+    n_blocks = -(-n // block_size)
     samples = []
     for _ in range(n_resamples):
         starts = rng.integers(0, n - block_size + 1, size=n_blocks)

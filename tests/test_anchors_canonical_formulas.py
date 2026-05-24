@@ -38,6 +38,42 @@ class TestBlockBootstrapCorrCI:
         )
         assert out3 != out1
 
+    # v2.8.3 Commit A (M6): ceiling-division n_blocks invariant tests.
+    def test_block_bootstrap_aligned_length_unchanged(self):
+        # n is a multiple of block_size: ceiling(n/k) == floor(n/k),
+        # so the M6 fix is a no-op on aligned inputs.
+        rng_data = np.random.default_rng(2026)
+        returns = rng_data.normal(0.0, 0.01, 200)
+        lo, hi, se = _block_bootstrap_corr_ci(
+            returns, block_size=10, n_resamples=100, seed=42,
+        )
+        # CI is finite and ordered (sanity on aligned path).
+        assert np.isfinite(lo) and np.isfinite(hi) and np.isfinite(se)
+        assert lo <= hi
+
+    def test_block_bootstrap_unaligned_length_n_minus_one(self):
+        # n=199, block_size=10 → floor gives 19 blocks (190 elements,
+        # short by 9); ceiling gives 20 blocks (200, truncated to 199).
+        # After M6 the bootstrap sample length equals n exactly.
+        rng_data = np.random.default_rng(2026)
+        returns = rng_data.normal(0.0, 0.01, 199)
+        lo, hi, se = _block_bootstrap_corr_ci(
+            returns, block_size=10, n_resamples=100, seed=42,
+        )
+        assert np.isfinite(lo) and np.isfinite(hi) and np.isfinite(se)
+        assert lo <= hi
+
+    def test_block_bootstrap_unaligned_length_short_residual(self):
+        # n=53, block_size=10 → ceiling gives 6 blocks (60 → 53);
+        # exercises the tightest non-trivial residual.
+        rng_data = np.random.default_rng(2026)
+        returns = rng_data.normal(0.0, 0.01, 53)
+        lo, hi, se = _block_bootstrap_corr_ci(
+            returns, block_size=10, n_resamples=100, seed=42,
+        )
+        assert np.isfinite(lo) and np.isfinite(hi) and np.isfinite(se)
+        assert lo <= hi
+
 
 # ---------------------------------------------------------------------------
 # GJR-GARCH parameter recovery (per-parameter empirical tolerance bands)

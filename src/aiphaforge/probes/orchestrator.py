@@ -123,15 +123,26 @@ def looks_like_refusal(raw_text: str) -> bool:
     """Heuristic: True if raw answer text looks like a refusal
     paragraph rather than a numeric/structured answer.
 
-    Locked v2.2 (per § 7.4):
+    v2.8.3 Commit D (M9): leading-window widened 50 → 80 characters.
+    The 50-char window missed refusals that begin with a longer
+    preface — e.g. when a reply opens with two filler clauses
+    before reaching the refusal keyword. Concrete: the prefix
+    ``"The price was approximately 100. The price was approximately
+    100. "`` is 66 characters; a refusal keyword (``"i don't know"``)
+    starting at position 66 sits past the 50-char window but
+    inside the 80-char window. The widen catches this preface
+    shape without materially increasing false positives from
+    in-quote refusal phrases (which typically appear deeper in
+    the reply, well past position 80).
+
       1. Apply _normalize_for_hash + lowercase.
       2. SHORT-CIRCUIT: if any keyword in _REFUSAL_KEYWORDS_LEADING
-         appears in the LEADING 50 CHARACTERS, return True.
+         appears in the LEADING 80 CHARACTERS, return True.
          Restricting to leading text removes the false-positive class
          where the LLM quotes a refusal-shaped phrase inside a valid
          answer (e.g., 'the article says "I don't have access..."
          but the close was $147.20').
-      3. FALLBACK (no keyword in leading 50): if length > 120 AND
+      3. FALLBACK (no keyword in leading 80): if length > 120 AND
          digit ratio < 5%, return True.
       4. Otherwise return False.
 
@@ -141,7 +152,7 @@ def looks_like_refusal(raw_text: str) -> bool:
     if not raw_text:
         return False
     s = _normalize_for_hash(raw_text).lower()
-    leading = s[:50]
+    leading = s[:80]
     for kw in _REFUSAL_KEYWORDS_LEADING:
         if kw in leading:
             return True
@@ -876,6 +887,25 @@ class KnowledgeCheckReport:
 
     is_pillar_summary: bool = False  # ENFORCED False
 
+    # v2.8.3 Commit E (M10a): persistence-baseline pairing validity,
+    # mirrors anchor_validity so downstream consumers can dispatch on
+    # whether real_minus_persistence_bucket_delta and
+    # real_vs_persistence_sign_test_p carry meaningful values.
+    #   "NO_PERSISTENCE" — probe is not a ContinuationProbe; the
+    #                      persistence baseline does not apply.
+    #   "OK"             — pairing succeeded; downstream stats are
+    #                      populated.
+    #   "PAIRING_FAILED" — real/persistence question_id sets do not
+    #                      overlap; derived stats suppressed.
+    #   "UNKNOWN"        — legacy pickle restored without this field;
+    #                      backfilled by __setstate__ (Commit F).
+    # Conceptually grouped with the persistence_* fields above; placed
+    # at the end of the field list because dataclass field ordering
+    # interacts with default values across the file's history.
+    persistence_validity: Literal[
+        "NO_PERSISTENCE", "OK", "PAIRING_FAILED", "UNKNOWN",
+    ] = "NO_PERSISTENCE"
+
     def to_dict(self) -> dict[str, Any]:
         """Convert this report to a plain-dict representation
         suitable for JSON serialization.
@@ -1033,6 +1063,34 @@ class KnowledgeCheckReport:
             state = dict(state)
             state.setdefault("bucket_delta_ci",
                              state.pop("bucket_delta_tango_ci"))
+
+        # v2.8.3 Commit F (M10b) + Commit L (post-impl architect
+        # MAJOR fix): persistence_validity field was added in
+        # v2.8.3 Commit E. Pickles produced by v2.8.2 and earlier
+        # carry no such key. The backfill is CONDITIONAL on whether
+        # the original report had a persistence baseline at all:
+        #   - If persistence_baseline_score is None, the probe was
+        #     not a ContinuationProbe (KnowledgeProbe /
+        #     RankContinuationProbe never produce a persistence
+        #     baseline). Backfill NO_PERSISTENCE — there is nothing
+        #     to be "unknown" about, and surfacing UNKNOWN here
+        #     would mislead users of the M10 migration recipe
+        #     ("re-run the orchestrator to upgrade") since there
+        #     is no upgrade possible for non-Continuation pickles.
+        #   - If persistence_baseline_score is not None, the
+        #     v2.8.2 report had a baseline but no validity tag.
+        #     sign_test_p(0, 0) returns (1.0, "trivial_n_zero")
+        #     for both the "OK trivial" and "PAIRING_FAILED" cases,
+        #     so the legacy pickle cannot distinguish them.
+        #     Backfill UNKNOWN — consumers must dispatch on this
+        #     tag and re-run the orchestrator to recover the real
+        #     OK / PAIRING_FAILED status.
+        if "persistence_validity" not in state:
+            state = dict(state)
+            if state.get("persistence_baseline_score") is not None:
+                state["persistence_validity"] = "UNKNOWN"
+            else:
+                state["persistence_validity"] = "NO_PERSISTENCE"
 
         # Re-wrap MappingProxyType after load + replay __post_init__
         # so any validation / wrapping side effects fire on the
@@ -1353,6 +1411,13 @@ def knowledge_check(
     persistence_caveat_field: Optional[str] = None
     real_minus_persistence_delta: Optional[dict[str, float]] = None
     real_vs_persistence_p: Optional[float] = None
+    # v2.8.3 Commit E (M10a): pairing-validity tag. Non-continuation
+    # probes have no persistence baseline → NO_PERSISTENCE. For
+    # ContinuationProbe we compute the baseline below and set OK
+    # or PAIRING_FAILED based on the actual qid overlap.
+    persistence_validity_field: Literal[
+        "NO_PERSISTENCE", "OK", "PAIRING_FAILED", "UNKNOWN",
+    ] = "NO_PERSISTENCE"
 
     if isinstance(probe, ContinuationProbe):
         persistence_report = _compute_persistence_baseline_report(
@@ -1384,15 +1449,32 @@ def knowledge_check(
             )
         )
         notes.extend(persistence_pairing_notes)
-        rp_pos = sum(
-            1 for (rb, pb) in paired_rp
-            if ordinal_map.get(rb, 0) > ordinal_map.get(pb, 0)
-        )
-        rp_neg = sum(
-            1 for (rb, pb) in paired_rp
-            if ordinal_map.get(rb, 0) < ordinal_map.get(pb, 0)
-        )
-        real_vs_persistence_p, _ = sign_test_p(rp_pos, rp_neg)
+        # v2.8.3 Commit E (M10a) + Commit L (architect MED fix):
+        # if the qid-paired list is empty the real and persistence
+        # reports share no question_ids; the sign-test would
+        # degenerate to sign_test_p(0, 0) = (1.0, "trivial_n_zero"),
+        # a meaningless p-value that callers cannot distinguish
+        # from a genuine null result. Suppress ALL derived stats
+        # AND null persistence_caveat (symmetric to anchor side —
+        # without a paired pairing the caveat does not apply
+        # either; surfacing it would suggest a meaningful baseline
+        # exists when one does not). Tag PAIRING_FAILED.
+        if not paired_rp:
+            persistence_validity_field = "PAIRING_FAILED"
+            real_minus_persistence_delta = None
+            real_vs_persistence_p = None
+            persistence_caveat_field = None
+        else:
+            persistence_validity_field = "OK"
+            rp_pos = sum(
+                1 for (rb, pb) in paired_rp
+                if ordinal_map.get(rb, 0) > ordinal_map.get(pb, 0)
+            )
+            rp_neg = sum(
+                1 for (rb, pb) in paired_rp
+                if ordinal_map.get(rb, 0) < ordinal_map.get(pb, 0)
+            )
+            real_vs_persistence_p, _ = sign_test_p(rp_pos, rp_neg)
 
     notes.insert(0, _NON_TRANSITIVITY_NOTE)
 
@@ -1455,6 +1537,7 @@ def knowledge_check(
             real_minus_persistence_delta
         ),
         real_vs_persistence_sign_test_p=real_vs_persistence_p,
+        persistence_validity=persistence_validity_field,
         parsing_schema_hash=answers.parsing_schema_hash,
         parsing_schema_description=answers.parsing_schema_description,
         prompt_template_hash=answers.prompt_template_hash,

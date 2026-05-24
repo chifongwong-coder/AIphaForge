@@ -298,3 +298,31 @@ class TestParseNumericPercent:
     def test_strict_hedged_percent_raises(self):
         with pytest.raises(ValueError, match="percent-policy"):
             parse_numeric_answer("about 2.5%", strict=True)
+
+
+# ---------- v2.8.3 Commit B (M7): European decimal-comma warn-only ----------
+
+class TestParseNumericEuropeDecimalCommaWarning:
+    def test_one_digit_after_comma_warns(self):
+        with pytest.warns(UserWarning, match="European decimal-comma"):
+            parse_numeric_answer("1,5")
+
+    def test_two_digits_after_comma_warns(self):
+        with pytest.warns(UserWarning, match="European decimal-comma"):
+            parse_numeric_answer("12,50")
+
+    def test_thousands_separator_does_not_warn(self):
+        # "1,500" has exactly 3 digits after the comma → real
+        # thousands separator, no warning.
+        import warnings as _w
+        with _w.catch_warnings():
+            _w.simplefilter("error")  # any UserWarning becomes error
+            result = parse_numeric_answer("1,500")
+        assert result == 1500.0
+
+    def test_warning_does_not_change_parser_output(self):
+        # LOCKED: parser output is unchanged. "1,5" still returns
+        # None under the default permissive=False (two-number reply),
+        # despite the warning.
+        with pytest.warns(UserWarning):
+            assert parse_numeric_answer("1,5") is None

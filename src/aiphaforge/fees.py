@@ -322,6 +322,29 @@ class USStockFeeModel(BaseFeeModel):
         Regulatory fees apply only when ``side == "sell"`` and are
         added on top of the broker fee — independent of the
         broker's minimum.
+
+        FINRA TAF cap × ``side="average"`` asymmetry (v2.8.3 Commit I
+        item 1): ``BaseFeeModel.estimate_commission_rate(side="average")``
+        computes ``(buy_commission + sell_commission) / 2``. On
+        trades small enough that the cap does not bind
+        (``size * finra_taf_per_share <= finra_taf_cap``) the
+        averaged rate equals exactly the midpoint of the per-share
+        schedule and the cap is invisible. On larger trades the
+        sell-side TAF is clamped at ``finra_taf_cap`` while the
+        per-share term would have grown linearly, so the averaged
+        rate is BELOW the would-be midpoint of the uncapped
+        schedule — the average is no longer a simple sum of the
+        per-share rates. Worked example at the default 2026
+        schedule (``finra_taf_per_share=0.000195``, cap ``$9.79``):
+        the cap binds at ``size ≈ 9.79 / 0.000195 ≈ 50,205`` shares.
+        For ``size=100_000`` at ``price=100`` the sell-side TAF is
+        ``9.79`` (capped) rather than the uncapped ``19.50``; the
+        ``side="average"`` rate is therefore ``4.895/notional``
+        smaller per share of TAF contribution than the
+        cap-unaware estimate. Callers running representative-cost
+        analytics on large blocks should query ``side="sell"``
+        explicitly rather than treat ``side="average"`` as a simple
+        scaling of the per-share schedule.
         """
         broker_commission = max(
             size * self.commission_per_share, self.min_commission

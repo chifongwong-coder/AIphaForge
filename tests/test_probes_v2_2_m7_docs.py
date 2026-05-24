@@ -114,6 +114,7 @@ class TestReportCarriesWarning:
 
 class TestVersion:
     def test_version_is_current_release(self):
-        # Updated by v2.8.2 patch bump (5 strategy MED + v2.8.1 deferred test hardening).
+        # Updated by v2.8.3 patch bump (5 LLM-MED + meta.py docstring +
+        # v2.8.2 carry-forward).
         import aiphaforge
-        assert aiphaforge.__version__ == "2.8.2"
+        assert aiphaforge.__version__ == "2.8.3"

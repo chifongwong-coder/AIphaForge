@@ -224,6 +224,70 @@ class TestEstimateSigma:
                 f"must exceed legacy linear {legacy_linear:.4f}"
             )
 
+    # v2.8.3 Commit C (M8): H==L warning band in [0.4, 0.5).
+    def test_h_eq_l_warning_band_emits_provenance_no_fallback(self):
+        # Build a window with H==L for 9/20 = 45% of bars (in [0.4, 0.5)).
+        n, n_eq = 20, 9
+        df = pd.DataFrame(
+            {
+                "open": [100.0] * n,
+                "high": [100.0] * n_eq + [101.0] * (n - n_eq),
+                "low": [100.0] * n_eq + [99.0] * (n - n_eq),
+                "close": [100.0] * n,
+                "volume": [1e6] * n,
+            },
+            index=_bdates(n),
+        )
+        _, prov = estimate_sigma(df, "parkinson")
+        assert prov["h_eq_l_fraction"] == pytest.approx(0.45, abs=1e-12)
+        # In the warning band: provenance entry present, method
+        # NOT switched (still parkinson, not stdev_returns).
+        assert "h_eq_l_warning_band" in prov
+        assert prov["method_used"] == "parkinson"
+        assert "fallback_reason" not in prov
+        # Under-estimate matches closed form 1 - sqrt(1 - 0.45).
+        assert prov["h_eq_l_warning_band"]["estimated_underestimate_pct"] == (
+            pytest.approx(1.0 - math.sqrt(0.55), abs=1e-12)
+        )
+
+    def test_h_eq_l_warning_band_silent_below_band(self):
+        # 3/20 = 15%, well below the 40% warning threshold.
+        n, n_eq = 20, 3
+        df = pd.DataFrame(
+            {
+                "open": [100.0] * n,
+                "high": [100.0] * n_eq + [101.0] * (n - n_eq),
+                "low": [100.0] * n_eq + [99.0] * (n - n_eq),
+                "close": [100.0] * n,
+                "volume": [1e6] * n,
+            },
+            index=_bdates(n),
+        )
+        _, prov = estimate_sigma(df, "parkinson")
+        assert prov["h_eq_l_fraction"] == pytest.approx(0.15, abs=1e-12)
+        assert "h_eq_l_warning_band" not in prov
+        assert "fallback_reason" not in prov
+
+    def test_h_eq_l_warning_band_yields_to_fallback_at_threshold(self):
+        # f=0.50 must hit the fallback branch (>= 0.5), NOT the
+        # warning band (which is strictly < 0.5).
+        n, n_eq = 20, 10
+        df = pd.DataFrame(
+            {
+                "open": [100.0] * n,
+                "high": [100.0] * n_eq + [101.0] * (n - n_eq),
+                "low": [100.0] * n_eq + [99.0] * (n - n_eq),
+                "close": [100.0] * n,
+                "volume": [1e6] * n,
+            },
+            index=_bdates(n),
+        )
+        _, prov = estimate_sigma(df, "parkinson")
+        assert prov["h_eq_l_fraction"] == pytest.approx(0.50, abs=1e-12)
+        assert "h_eq_l_warning_band" not in prov
+        assert "fallback_reason" in prov
+        assert prov["method_used"] == "stdev_returns"
+
     def test_parkinson_event_day_warning_fires(self):
         # 19 normal bars + 1 event-day bar with |return| > 5σ
         rng = np.random.default_rng(0)

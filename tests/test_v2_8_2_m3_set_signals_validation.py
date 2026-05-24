@@ -84,6 +84,29 @@ def test_set_signals_respects_data_validation_none():
 
 
 # --------------------------------------------------------------------
+# v2.8.3 Commit I item 6 — dict-path also honors data_validation='none'
+# --------------------------------------------------------------------
+
+def test_set_signals_dict_respects_data_validation_none():
+    """Parity with the single-Series escape hatch: the dict path
+    must also skip per-Series validation when the engine was
+    constructed with data_validation='none'. Without this guarantee
+    a user opting out of validation on the long path would still
+    be silently rejected on the dict path.
+    """
+    eng = BacktestEngine(
+        initial_capital=100_000, data_validation="none",
+    )
+    idx = pd.DatetimeIndex(["2024-01-02", "2024-01-03", "2024-01-03"])
+    good = _good_signals()
+    bad = pd.Series([1.0, np.nan, np.nan], index=idx, dtype=float)
+    # The dict path: one good Series + one bad (duplicate-index)
+    # Series. data_validation='none' must bypass the per-Series
+    # validate_signal_series call for BAD as well as GOOD.
+    eng.set_signals({"GOOD": good, "BAD": bad})
+
+
+# --------------------------------------------------------------------
 # Test 5 — non-Series / non-dict input rejected with clean TypeError
 # --------------------------------------------------------------------
 
