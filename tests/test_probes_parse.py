@@ -300,29 +300,49 @@ class TestParseNumericPercent:
             parse_numeric_answer("about 2.5%", strict=True)
 
 
-# ---------- v2.8.3 Commit B (M7): European decimal-comma warn-only ----------
+# ---------- v2.8.4 M15: v2.8.3 M7 warn-shim removal (US default is silent) ----
+
+# v2.8.3 Commit B (M7) shipped a "broad" UserWarning under the default
+# US mode whenever the input looked like a European decimal-comma
+# (e.g. ``"1,5"`` or ``"12,50"``).  v2.8.4 M15 removes that shim and
+# replaces its role with the new ``decimal_separator="eu"`` opt-in
+# (which actually parses such inputs correctly).  Under US default the
+# parser is now silent for the same inputs — the silent-wrong outputs
+# are pinned as backward-compat guards in
+# ``TestParseNumericEuropeDecimalCommaWarning.test_*_no_longer_warns``
+# (formerly ``..._warns``).
 
 class TestParseNumericEuropeDecimalCommaWarning:
-    def test_one_digit_after_comma_warns(self):
-        with pytest.warns(UserWarning, match="European decimal-comma"):
-            parse_numeric_answer("1,5")
-
-    def test_two_digits_after_comma_warns(self):
-        with pytest.warns(UserWarning, match="European decimal-comma"):
-            parse_numeric_answer("12,50")
-
-    def test_thousands_separator_does_not_warn(self):
-        # "1,500" has exactly 3 digits after the comma → real
-        # thousands separator, no warning.
+    def test_one_digit_after_comma_no_longer_warns(self):
+        # v2.8.4 M15: the v2.8.3 M7 broad warning is removed. The
+        # parser is silent under US default; opt into ``"eu"`` to
+        # parse the value correctly.
         import warnings as _w
         with _w.catch_warnings():
             _w.simplefilter("error")  # any UserWarning becomes error
+            parse_numeric_answer("1,5")  # silent
+
+    def test_two_digits_after_comma_no_longer_warns(self):
+        import warnings as _w
+        with _w.catch_warnings():
+            _w.simplefilter("error")
+            parse_numeric_answer("12,50")  # silent under US default
+
+    def test_thousands_separator_does_not_warn(self):
+        # "1,500" has exactly 3 digits after the comma → real
+        # thousands separator, no warning.  Unchanged from v2.8.3.
+        import warnings as _w
+        with _w.catch_warnings():
+            _w.simplefilter("error")
             result = parse_numeric_answer("1,500")
         assert result == 1500.0
 
-    def test_warning_does_not_change_parser_output(self):
-        # LOCKED: parser output is unchanged. "1,5" still returns
-        # None under the default permissive=False (two-number reply),
-        # despite the warning.
-        with pytest.warns(UserWarning):
+    def test_us_default_output_unchanged_after_shim_removal(self):
+        # LOCKED (v2.8.3 + v2.8.4): under default US mode "1,5"
+        # returns None.  v2.8.4 removes the warning but preserves the
+        # parser output verbatim so existing v2.8.3 consumers see
+        # zero observable change in the default code path.
+        import warnings as _w
+        with _w.catch_warnings():
+            _w.simplefilter("error")
             assert parse_numeric_answer("1,5") is None
