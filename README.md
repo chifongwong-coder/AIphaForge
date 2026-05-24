@@ -26,6 +26,24 @@ More patterns (AI agent with MetaController, portfolio rebalancing,
 bootstrap CIs, market-impact capacity, Bayesian optimization) live
 under [Quick Start](#quick-start).
 
+### Pick Your Entry Point
+
+`BacktestEngine` accepts six input-shape setters.  Pick the one matching
+your data shape; the rest are mutually exclusive (calling a different
+setter clears the previous input state).
+
+| Setter | Input shape | Use when | Mutual exclusion |
+|---|---|---|---|
+| `set_strategy(strategy)` | `BaseStrategy` instance | You have a strategy class that computes signals each bar from price and state. | Calls `_clear_wide_input_state()`. |
+| `set_signals(signals)` | `pd.Series` (single-asset) or `Dict[str, pd.Series]` (multi-asset) | You have pre-computed continuous signals in [-1, 1] (or NaN-hold). | Calls `_clear_wide_input_state()`. |
+| `set_signals_wide(signal_wide)` | `pd.DataFrame` (rows=bars, cols=symbols) | You have a wide DataFrame of signals — single setter for the multi-asset case. | Inline clears `_strategy`, `_signals`, `_target_weights`, `_target_weights_wide`, `_target_weights_wide_config`. |
+| `set_score_wide(scores, rule)` | `pd.DataFrame` of ML scores + a `ScoreToSignalRule` | You have model scores and want an explicit thresholding rule applied each bar. | Inline clears `_strategy`, `_signals`, `_target_weights`, `_target_weights_wide`, `_target_weights_wide_config`; the resulting signal frame is then set via `set_signals_wide(...)`. |
+| `set_target_weights(target_weights)` | `pd.Series` or `Dict[str, pd.Series]` | You have target portfolio weights (institutional rebalancing). | Calls `_clear_wide_input_state()`. |
+| `set_target_weights_wide(target_weights, ...)` | `pd.DataFrame` of target weights, optional `rebalance_frequency` | Multi-asset target-weight rebalancing on a daily DataFrame with quarterly (or similar) cadence. | Inline clears `_strategy`, `_signals`, `_target_weights`, `_signals_wide`. |
+
+`set_fee_model(...)` is unrelated — it configures cost simulation
+independently of input shape.
+
 ## Features
 
 ### Core Engine
