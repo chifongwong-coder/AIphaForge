@@ -739,22 +739,38 @@ public API surface and `BacktestResult` field set are unchanged.
 ### M10 pickle migration recipe
 
 v2.8.2 pickles do not carry `persistence_validity`. The new
-`__setstate__` backfill emits no warning (the field is silently
-populated as `"UNKNOWN"`) so existing load sites continue to
-work. To detect the legacy provenance and re-run:
+`__setstate__` backfills the field **conditionally** with no
+warning, so existing load sites continue to work:
+
+- If the original report had a persistence baseline
+  (`persistence_baseline_score is not None`, i.e. the probe was a
+  `ContinuationProbe`): backfill to `"UNKNOWN"`. The legacy pickle
+  cannot distinguish a trivial-OK pairing from a `PAIRING_FAILED`
+  one (both produced `real_vs_persistence_sign_test_p = 1.0` via
+  `sign_test_p(0, 0) = (1.0, "trivial_n_zero")`), so re-run the
+  orchestrator to recover the real `OK` / `PAIRING_FAILED` status.
+- If no persistence baseline was ever computed (`KnowledgeProbe`
+  or `RankContinuationProbe`): backfill to `"NO_PERSISTENCE"`.
+  There is nothing to be "unknown" about; no re-run is needed.
 
 ```python
 import pickle
 from aiphaforge.probes.orchestrator import KnowledgeCheckReport
 
 with open("v2.8.2_report.pickle", "rb") as f:
-    report = pickle.load(f)  # backfills persistence_validity="UNKNOWN"
+    report = pickle.load(f)
+    # ContinuationProbe pickle → persistence_validity="UNKNOWN"
+    # Knowledge / RankContinuation pickle → "NO_PERSISTENCE"
 
 if report.persistence_validity == "UNKNOWN":
-    # Legacy pickle: cannot distinguish OK from PAIRING_FAILED
-    # because sign_test_p(0, 0) returns (1.0, "trivial_n_zero")
-    # under both. Re-run the orchestrator on the original probe to
-    # upgrade.
+    # Legacy ContinuationProbe pickle: cannot distinguish OK from
+    # PAIRING_FAILED because sign_test_p(0, 0) returns (1.0,
+    # "trivial_n_zero") under both. Re-run the orchestrator on the
+    # original probe to upgrade.
+    ...
+elif report.persistence_validity == "NO_PERSISTENCE":
+    # Knowledge / RankContinuation pickle — never had a persistence
+    # baseline. No upgrade needed; downstream stats already None.
     ...
 ```
 
