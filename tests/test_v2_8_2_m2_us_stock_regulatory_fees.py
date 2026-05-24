@@ -147,3 +147,68 @@ def test_us_stock_reg_fees_independent_of_broker_min_commission():
     # And explicitly: sell > broker_min alone — reg fees are NOT
     # absorbed by the broker minimum.
     assert sell > broker
+
+
+# --------------------------------------------------------------------
+# v2.8.3 Commit I item 1: FINRA TAF cap × side='average' asymmetry
+# --------------------------------------------------------------------
+
+def test_us_stock_finra_taf_cap_average_asymmetry():
+    """Pin the cap × side='average' interaction.
+
+    Default 2026 schedule (per_share=0.000195, cap=$9.79): the cap
+    binds at ``size >= 9.79 / 0.000195 ≈ 50,205`` shares. Below the
+    cap the sell-side TAF grows linearly and side='average' equals
+    the per-share midpoint exactly. Above the cap the sell-side TAF
+    is clamped at $9.79, so the averaged commission rate is BELOW
+    the would-be midpoint of the uncapped per-share schedule.
+
+    This test pins:
+      1. below-cap: TAF on a 1,000-share sell is ``1000 * 0.000195``
+         (linear, no clamp).
+      2. above-cap: TAF on a 100,000-share sell is exactly $9.79
+         (clamped — would otherwise be $19.50).
+      3. ``estimate_commission_rate(side='average')`` on a
+         100,000-share trade is strictly less than the rate that
+         would obtain if the cap did NOT bind (computed via a
+         no-cap counterfactual model). Regression guard against an
+         accidental future refactor that removes the cap from the
+         side='average' code path.
+    """
+    fee = USStockFeeModel()  # cap=$9.79
+    # (1) below-cap linear regime.
+    sell_1k = fee.calculate_commission(price=100.0, size=1000.0,
+                                       side="sell")
+    expected_taf_1k = 1000.0 * 0.000195  # 0.195, well under 9.79
+    expected_sec_1k = 100.0 * 1000.0 * 20.60e-6  # 2.060
+    expected_broker_1k = max(1000.0 * 0.005, 1.0)  # 5.0
+    assert sell_1k == pytest.approx(
+        expected_broker_1k + expected_sec_1k + expected_taf_1k,
+    )
+
+    # (2) above-cap clamping regime.
+    sell_100k = fee.calculate_commission(price=100.0, size=100_000.0,
+                                          side="sell")
+    expected_taf_100k = 9.79  # would have been 100_000 * 0.000195 = 19.50
+    expected_sec_100k = 100.0 * 100_000.0 * 20.60e-6  # 206.0
+    expected_broker_100k = max(100_000.0 * 0.005, 1.0)  # 500.0
+    assert sell_100k == pytest.approx(
+        expected_broker_100k + expected_sec_100k + expected_taf_100k,
+    )
+
+    # (3) side='average' under the cap is below the uncapped
+    # counterfactual.
+    rate_avg_capped = fee.estimate_commission_rate(
+        price=100.0, size=100_000.0, side="average",
+    )
+    no_cap_fee = USStockFeeModel(finra_taf_cap=float("inf"))
+    rate_avg_uncapped = no_cap_fee.estimate_commission_rate(
+        price=100.0, size=100_000.0, side="average",
+    )
+    assert rate_avg_capped < rate_avg_uncapped
+    # Difference equals half of the TAF underbilling
+    # (cap saves 19.50 - 9.79 = 9.71 on the sell side; the average
+    # over (buy, sell) halves it).
+    notional = 100.0 * 100_000.0
+    delta = rate_avg_uncapped - rate_avg_capped
+    assert delta == pytest.approx((19.50 - 9.79) / 2 / notional)

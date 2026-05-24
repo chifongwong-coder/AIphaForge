@@ -117,20 +117,25 @@ def test_h6_tango_paired_diff_ci_deprecation_warning_originates_outside_aiphafor
 # --------------------------------------------------------------------
 
 def test_reverse_lock_currently_passes_foreign_class_instances():
-    """Documents a known limitation in the v2.8.1 reverse-lock test:
-    an instance of a class defined in another package passes the
-    lock because the skip rule reads ``val.__module__`` for the
-    instance (which resolves to the class's module, foreign), and
-    skips on that ground.
+    """Pin the v2.8.1 reverse-lock skip rule's blind spot.
 
-    v2.8.5 will tighten the skip rule to require
-    ``inspect.isclass(val) or inspect.isfunction(val)`` (with an
-    allowlist for typing generics — see
-    ``tests/_helpers/reverse_lock_allowlist.md`` for the audit
-    findings).
+    The reverse-lock contract is: every public module attribute
+    (not in ``__all__``) must be either a class, function, or
+    submodule defined inside aiphaforge. The v2.8.1 implementation
+    enforces this with a coarse ``val.__module__`` check, which has
+    one false-negative shape: an INSTANCE of a foreign class
+    (``__module__`` reports the foreign class's module, not
+    ``None``), so it is silently skipped instead of flagged. The
+    risk is a public-named attribute like ``LEAKED_INSTANCE =
+    datetime(2024, 1, 1)`` slipping through the lock as a
+    side-channel public API the project never intended.
 
-    When v2.8.5 ships the tightener, flip this test's assertion to
-    catch the instance and remove this pin.
+    This pin documents the blind spot rather than the cure. v2.8.5
+    will tighten the skip rule to ``inspect.isclass(val) or
+    inspect.isfunction(val)`` with a typing-generics allowlist
+    (see ``tests/_helpers/reverse_lock_allowlist.md`` for the
+    audit findings). When that tightening ships, flip the
+    assertion below and remove this pin.
     """
     from datetime import datetime
 
