@@ -914,6 +914,24 @@ mypy src/aiphaforge/alpha/  # scoped blocking gate (MUST be clean)
 pytest tests/ -v
 ```
 
+### Deprecation removal commitment
+
+Unchanged from v2.8.1 / v2.8.2 / v2.8.3:
+
+- `tango_paired_diff_ci` alias + `bucket_delta_tango_ci` legacy
+  kwarg: hard-removal in v2.9. v2.8.4 keeps the legacy translation
+  + `DeprecationWarning` shipped in v2.8.1 H7.
+- `persistence_validity = "UNKNOWN"` setstate backfill (v2.8.3
+  Commit F + L) is permanent. Consumers loading v2.8.2 pickles
+  still see the backfill semantics described in
+  [CHANGELOG.md#283](./CHANGELOG.md#283---2026-05-24) M10.
+- v2.8.3 M7 European-decimal warning shim: removed under
+  `decimal_separator="eu"` (M15 supersedes); RETAINED under the
+  `"us"` default so existing callers still see the warning on
+  ambiguous comma input.
+
+No new deprecations were introduced in v2.8.4.
+
 ### What v2.8.4 does NOT include
 
 - LLM probe MEDIUMs beyond the M15 locale work (shipped in v2.8.3).

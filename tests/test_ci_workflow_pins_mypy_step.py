@@ -50,16 +50,24 @@ def test_ci_workflow_runs_mypy_with_continue_on_error() -> None:
     """
     steps = _test_job_steps()
 
-    advisory = _find_step_running(steps, "mypy src/aiphaforge/\n") or \
-        _find_step_running(steps, "mypy src/aiphaforge/ ") or \
-        next(
-            (s for s in steps
-             if isinstance(s.get("run"), str)
-             and s["run"].strip() == "mypy src/aiphaforge/"),
-            None,
+    # Advisory step: any mypy run targeting the full src/aiphaforge/
+    # tree (post-Commit J adds --config-file / --follow-imports flags
+    # for robustness). Identify by the trailing `src/aiphaforge/`
+    # without the `alpha/` suffix.
+    def _is_advisory(s: dict) -> bool:
+        run = s.get("run", "")
+        if not isinstance(run, str):
+            return False
+        run = run.strip()
+        return (
+            run.startswith("mypy ")
+            and "src/aiphaforge/" in run
+            and "src/aiphaforge/alpha/" not in run
         )
+
+    advisory = next((s for s in steps if _is_advisory(s)), None)
     assert advisory is not None, (
-        "ci.yml missing advisory 'mypy src/aiphaforge/' step"
+        "ci.yml missing advisory mypy step targeting src/aiphaforge/"
     )
     assert advisory.get("continue-on-error") is True, (
         "Advisory mypy step must set continue-on-error: true so it "
@@ -67,17 +75,28 @@ def test_ci_workflow_runs_mypy_with_continue_on_error() -> None:
         f"{advisory.get('continue-on-error')!r}"
     )
 
-    scoped = next(
-        (s for s in steps
-         if isinstance(s.get("run"), str)
-         and s["run"].strip() == "mypy src/aiphaforge/alpha/"),
-        None,
-    )
+    # Scoped-blocking step: any mypy run targeting src/aiphaforge/alpha/.
+    def _is_scoped(s: dict) -> bool:
+        run = s.get("run", "")
+        if not isinstance(run, str):
+            return False
+        return run.strip().startswith("mypy ") and "src/aiphaforge/alpha/" in run
+
+    scoped = next((s for s in steps if _is_scoped(s)), None)
     assert scoped is not None, (
-        "ci.yml missing scoped-blocking 'mypy src/aiphaforge/alpha/' step"
+        "ci.yml missing scoped-blocking mypy step on src/aiphaforge/alpha/"
     )
     assert scoped.get("continue-on-error") is not True, (
         "Scoped-blocking mypy step must NOT set continue-on-error: true "
         "(it is the v2.8.4 M14 blocking gate); saw: "
         f"{scoped.get('continue-on-error')!r}"
+    )
+    # Commit J defensive hardening: the scoped step must include
+    # --follow-imports=silent so the gate is isolated to alpha/ source
+    # even when mypy's import discovery would otherwise reach errors
+    # in transitive modules.
+    scoped_cmd = scoped["run"].strip()
+    assert "--follow-imports=silent" in scoped_cmd, (
+        "Scoped mypy step must use --follow-imports=silent to isolate "
+        f"the gate to alpha/ source; saw: {scoped_cmd!r}"
     )
