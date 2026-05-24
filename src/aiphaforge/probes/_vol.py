@@ -145,10 +145,11 @@ def estimate_sigma(
             # fallback threshold. The estimator does not switch to
             # stdev_returns (insufficient evidence of degeneracy
             # given the 50% gate), but the empirical bias is already
-            # material (10-13% under-estimate at f=0.4-0.5 by the
-            # closed-form 1 - sqrt(1-f)). Surface a provenance entry
-            # so users can audit borderline windows. Does NOT change
-            # the chosen estimator.
+            # material — by the closed-form 1 - sqrt(1-f) the
+            # under-estimate at f=0.4 is ~22.5% and at f=0.5 is
+            # ~29.3%. Surface a provenance entry so users can
+            # audit borderline windows. Does NOT change the chosen
+            # estimator.
             provenance["h_eq_l_warning_band"] = {
                 "h_eq_l_fraction": h_eq_l_fraction,
                 "estimated_underestimate_pct": (

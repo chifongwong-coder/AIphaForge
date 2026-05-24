@@ -124,12 +124,16 @@ def looks_like_refusal(raw_text: str) -> bool:
     paragraph rather than a numeric/structured answer.
 
     v2.8.3 Commit D (M9): leading-window widened 50 → 80 characters.
-    The 50-char window missed refusals that begin with a polite
-    preface (``"As an AI language model, I don't have access to..."``
-    — the keyword ``"don't have access"`` starts past character 50).
-    80 captures the common preface-then-refusal shape without
-    materially increasing false positives from in-quote refusal
-    phrases (those typically appear deeper in the reply).
+    The 50-char window missed refusals that begin with a longer
+    preface — e.g. when a reply opens with two filler clauses
+    before reaching the refusal keyword. Concrete: the prefix
+    ``"The price was approximately 100. The price was approximately
+    100. "`` is 66 characters; a refusal keyword (``"i don't know"``)
+    starting at position 66 sits past the 50-char window but
+    inside the 80-char window. The widen catches this preface
+    shape without materially increasing false positives from
+    in-quote refusal phrases (which typically appear deeper in
+    the reply, well past position 80).
 
       1. Apply _normalize_for_hash + lowercase.
       2. SHORT-CIRCUIT: if any keyword in _REFUSAL_KEYWORDS_LEADING
@@ -1060,17 +1064,33 @@ class KnowledgeCheckReport:
             state.setdefault("bucket_delta_ci",
                              state.pop("bucket_delta_tango_ci"))
 
-        # v2.8.3 Commit F (M10b): persistence_validity field was
-        # added in v2.8.3 Commit E. Pickles produced by v2.8.2 and
-        # earlier carry no such key. Backfill to "UNKNOWN" so the
-        # revived instance still satisfies the Literal contract
-        # (rather than producing AttributeError on downstream
-        # reads). UNKNOWN is a distinct tag — not silently coerced
-        # to NO_PERSISTENCE — so consumers can detect the legacy
-        # provenance and re-run the orchestrator to upgrade.
+        # v2.8.3 Commit F (M10b) + Commit L (post-impl architect
+        # MAJOR fix): persistence_validity field was added in
+        # v2.8.3 Commit E. Pickles produced by v2.8.2 and earlier
+        # carry no such key. The backfill is CONDITIONAL on whether
+        # the original report had a persistence baseline at all:
+        #   - If persistence_baseline_score is None, the probe was
+        #     not a ContinuationProbe (KnowledgeProbe /
+        #     RankContinuationProbe never produce a persistence
+        #     baseline). Backfill NO_PERSISTENCE — there is nothing
+        #     to be "unknown" about, and surfacing UNKNOWN here
+        #     would mislead users of the M10 migration recipe
+        #     ("re-run the orchestrator to upgrade") since there
+        #     is no upgrade possible for non-Continuation pickles.
+        #   - If persistence_baseline_score is not None, the
+        #     v2.8.2 report had a baseline but no validity tag.
+        #     sign_test_p(0, 0) returns (1.0, "trivial_n_zero")
+        #     for both the "OK trivial" and "PAIRING_FAILED" cases,
+        #     so the legacy pickle cannot distinguish them.
+        #     Backfill UNKNOWN — consumers must dispatch on this
+        #     tag and re-run the orchestrator to recover the real
+        #     OK / PAIRING_FAILED status.
         if "persistence_validity" not in state:
             state = dict(state)
-            state["persistence_validity"] = "UNKNOWN"
+            if state.get("persistence_baseline_score") is not None:
+                state["persistence_validity"] = "UNKNOWN"
+            else:
+                state["persistence_validity"] = "NO_PERSISTENCE"
 
         # Re-wrap MappingProxyType after load + replay __post_init__
         # so any validation / wrapping side effects fire on the
@@ -1429,16 +1449,21 @@ def knowledge_check(
             )
         )
         notes.extend(persistence_pairing_notes)
-        # v2.8.3 Commit E (M10a): if the qid-paired list is empty the
-        # real and persistence reports share no question_ids; the
-        # sign-test would degenerate to sign_test_p(0, 0) = (1.0,
-        # "trivial_n_zero"), a meaningless p-value that callers
-        # cannot distinguish from a genuine null result. Suppress
-        # derived stats and tag PAIRING_FAILED instead.
+        # v2.8.3 Commit E (M10a) + Commit L (architect MED fix):
+        # if the qid-paired list is empty the real and persistence
+        # reports share no question_ids; the sign-test would
+        # degenerate to sign_test_p(0, 0) = (1.0, "trivial_n_zero"),
+        # a meaningless p-value that callers cannot distinguish
+        # from a genuine null result. Suppress ALL derived stats
+        # AND null persistence_caveat (symmetric to anchor side —
+        # without a paired pairing the caveat does not apply
+        # either; surfacing it would suggest a meaningful baseline
+        # exists when one does not). Tag PAIRING_FAILED.
         if not paired_rp:
             persistence_validity_field = "PAIRING_FAILED"
             real_minus_persistence_delta = None
             real_vs_persistence_p = None
+            persistence_caveat_field = None
         else:
             persistence_validity_field = "OK"
             rp_pos = sum(

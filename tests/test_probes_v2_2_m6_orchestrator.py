@@ -592,6 +592,9 @@ class TestPersistenceBaseline:
     def test_legacy_pickle_without_persistence_validity_backfills_unknown(
         self,
     ):
+        # v2.8.3 Commit F + Commit L: a v2.8.2 pickle from a
+        # ContinuationProbe (persistence_baseline_score is not None)
+        # backfills to "UNKNOWN" so consumers re-run the orchestrator.
         import pickle
         data = _make_real_data(n=80)
         probe = ContinuationProbe(
@@ -605,18 +608,71 @@ class TestPersistenceBaseline:
             probe, data, anchors, attested,
             provider_config=_provider_config(),
         )
-        # Simulate a pickle produced by v2.8.2 by stripping the new
-        # field before pickling. __setstate__ on load must backfill
-        # to "UNKNOWN" so the Literal contract holds.
         state = report.__getstate__()
         state.pop("persistence_validity", None)
+        assert state["persistence_baseline_score"] is not None
         revived = KnowledgeCheckReport.__new__(KnowledgeCheckReport)
         revived.__setstate__(state)
         assert revived.persistence_validity == "UNKNOWN"
-        # A round-trip through pickle.dumps / pickle.loads on a state
-        # *with* the field should preserve the original value.
         roundtripped = pickle.loads(pickle.dumps(report))
         assert roundtripped.persistence_validity == "OK"
+
+    def test_pairing_failed_nulls_persistence_caveat(
+        self, monkeypatch,
+    ):
+        # v2.8.3 Commit L (architect MED fix): under PAIRING_FAILED
+        # the persistence_caveat must also be None (symmetric to
+        # real_minus_persistence_bucket_delta and
+        # real_vs_persistence_sign_test_p suppression). Force the
+        # empty-pair branch by monkeypatching the helper.
+        from aiphaforge.probes import orchestrator as orch_mod
+        monkeypatch.setattr(
+            orch_mod, "_pair_scores_by_question_id",
+            lambda real, persistence: ([], []),
+        )
+        data = _make_real_data(n=80)
+        probe = ContinuationProbe(
+            symbol="AAPL", context_bars=10, forward_horizon=1,
+            templates=[NextCloseContinuation],
+        )
+        anchors = list(data.index[20:25])
+        question_set = probe.build(data, anchors)
+        attested = _build_perfect_attested(question_set)
+        report = knowledge_check(
+            probe, data, anchors, attested,
+            provider_config=_provider_config(),
+        )
+        assert report.persistence_validity == "PAIRING_FAILED"
+        assert report.real_minus_persistence_bucket_delta is None
+        assert report.real_vs_persistence_sign_test_p is None
+        assert report.persistence_caveat is None
+
+    def test_legacy_pickle_non_continuation_backfills_no_persistence(
+        self,
+    ):
+        # v2.8.3 Commit L (architect MAJOR fix): a v2.8.2 pickle
+        # from a KnowledgeProbe / RankContinuationProbe has
+        # persistence_baseline_score=None — there is no persistence
+        # baseline to be "unknown" about. Backfill NO_PERSISTENCE
+        # so the M10 migration recipe ("re-run to upgrade") does
+        # not mislead users of non-Continuation pickles.
+        data = _make_real_data()
+        probe = KnowledgeProbe(
+            symbol="AAPL", templates=DEFAULT_TEMPLATES,
+        )
+        anchors = list(data.index[10:15])
+        question_set = probe.build(data, anchors)
+        attested = _build_perfect_attested(question_set)
+        report = knowledge_check(
+            probe, data, anchors, attested,
+            provider_config=_provider_config(),
+        )
+        state = report.__getstate__()
+        state.pop("persistence_validity", None)
+        assert state["persistence_baseline_score"] is None
+        revived = KnowledgeCheckReport.__new__(KnowledgeCheckReport)
+        revived.__setstate__(state)
+        assert revived.persistence_validity == "NO_PERSISTENCE"
 
     # v2.8.3 Commit G (M10c): field-contract coverage.
     def test_persistence_validity_is_a_declared_dataclass_field(self):
@@ -668,6 +724,7 @@ class TestPersistenceBaseline:
         # explicit "PAIRING_FAILED" must survive the round-trip
         # unchanged (no override to UNKNOWN, no coercion).
         import pickle
+
         from tests.test_v2_8_1_h7_report_pickle import _baseline_kwargs
         kwargs = _baseline_kwargs()
         kwargs["persistence_validity"] = "PAIRING_FAILED"

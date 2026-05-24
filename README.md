@@ -732,8 +732,8 @@ public API surface and `BacktestResult` field set are unchanged.
 | M6 | `probes/anchors.py:_block_bootstrap_corr_ci` | Floor-division on `n // block_size` left bootstrap samples short by up to `block_size-1` elements when `n` was not a multiple. Now uses ceiling division so the concatenated sample (after the `[:n]` slice) matches the original length exactly. Leverage-corr CI / SE estimates may shift by ~1-3% on unaligned windows. |
 | M7 | `probes/scoring.py:parse_numeric_answer` | European decimal-comma inputs (`"1,5"`, `"12,50"`) previously tokenized to two numbers and returned `None` under the default `permissive=False` — a silent loss. v2.8.3 emits a `UserWarning` naming the offending substring + suggesting `str.replace(',', '.')`. Parser output is intentionally unchanged. |
 | M8 | `probes/_vol.py:estimate_sigma` | Parkinson H==L fallback to `stdev_returns` still triggers at fraction ≥ 50%. The new `[0.4, 0.5)` warning band adds an `h_eq_l_warning_band` provenance entry (with closed-form bias estimate) without changing the chosen estimator — surfaces borderline windows for audit. |
-| M9 | `probes/orchestrator.py:looks_like_refusal` | Leading-window keyword scan widened 50 → 80 characters. Captures refusals that begin with a polite preface (`"As an AI language model, I don't have access to..."` — keyword starts at character 60). False-positive class from in-quote refusal phrases past position 80 is regression-pinned. |
-| M10 | `probes/orchestrator.py:KnowledgeCheckReport` | New `persistence_validity: Literal["NO_PERSISTENCE", "OK", "PAIRING_FAILED", "UNKNOWN"]` field. Mirrors `anchor_validity`. When ≠ `OK`, `real_minus_persistence_bucket_delta` and `real_vs_persistence_sign_test_p` are suppressed to `None`. Legacy pickles (v2.8.2 and earlier) backfill to `"UNKNOWN"` via `__setstate__`. |
+| M9 | `probes/orchestrator.py:looks_like_refusal` | Leading-window keyword scan widened 50 → 80 characters. Captures refusals that arrive after a longer preface — e.g. when a reply opens with two filler clauses before the refusal keyword. Concrete: the prefix `"The price was approximately 100. The price was approximately 100. "` is 66 chars, so a refusal keyword (`"i don't know"`) at position 66 sits past v2.8.2's 50-char window but inside v2.8.3's 80-char window. False-positive class from in-quote refusal phrases past position 80 is regression-pinned. |
+| M10 | `probes/orchestrator.py:KnowledgeCheckReport` | New `persistence_validity: Literal["NO_PERSISTENCE", "OK", "PAIRING_FAILED", "UNKNOWN"]` field. Mirrors `anchor_validity`. When ≠ `OK`, `real_minus_persistence_bucket_delta`, `real_vs_persistence_sign_test_p`, **and `persistence_caveat`** are suppressed to `None`. Legacy pickles (v2.8.2 and earlier) backfill via `__setstate__`: `persistence_baseline_score is not None` → `"UNKNOWN"`; otherwise → `"NO_PERSISTENCE"` (the latter case covers Knowledge / RankContinuation pickles for which no baseline ever existed). |
 | meta.py docstring | `meta.py:MetaContext.adjust_strategy_params` | Removes the fabricated "designed jointly with v2.9 IncrementalFactor" claim. The performance note now reflects the actual current behavior (O(N·K) full-timeline regeneration) and an honest "on the roadmap, no committed milestone" pointer. |
 
 ### M10 pickle migration recipe
@@ -839,10 +839,13 @@ of likelihood:
    surface need updating. The `to_dict()` method already covers
    the field automatically.
 6. **M3 dict-path validation respects `data_validation="none"`**
-   — closes a v2.8.2 gap. Tests relying on dict-path validation
-   firing when the engine was constructed with
-   `data_validation="none"` would have been buggy; in v2.8.3
-   they will (correctly) no longer fire.
+   — regression-pin only, no code change. The v2.8.2
+   `set_signals` dict path already honors the
+   `data_validation="none"` escape hatch (the outer guard at
+   `engine.py:453` covers both single-Series and dict branches).
+   v2.8.3 adds a test that pins this behavior so a future
+   refactor that accidentally narrows the guard would surface
+   immediately.
 
 ### Reverse-pickle caveat
 
@@ -977,7 +980,7 @@ order of impact:
 | M1 | `exit_rules.py:PercentageStopLoss` | Event-driven submits market order (next-bar open fill); vectorized exits at theoretical threshold on trigger bar. Documents-only fix; alignment requires next-bar OHLC plumbing into vectorized (v2.9). |
 | M2 | `fees.py:USStockFeeModel` | Sell side now includes SEC §31 (FY2026 `20.60e-6`) + FINRA TAF (2026 `0.000195/share, cap $9.79`). Buy-side unchanged. Opt out with zeros. |
 | M3 | `engine.py:set_signals` | Single-Series + per-symbol-dict path now calls `validate_signal_series`. Respects `data_validation="none"`. |
-| M4 | `meta.py:MetaContext.adjust_strategy_params` | In-place mutation documented. Perf optimization moved to v2.8.3 (partial-regen requires opt-in interface, designed jointly with IncrementalFactor). |
+| M4 | `meta.py:MetaContext.adjust_strategy_params` | In-place mutation documented; factory-per-worker recipe ships. Performance note: each call re-runs the strategy from bar 0 (O(N·K)). A partial-timeline regeneration path is on the roadmap, no committed milestone. *(v2.8.2 originally promised a v2.8.3 ship "designed jointly with v2.9 IncrementalFactor"; this claim was fabricated — there is no IncrementalFactor engine integration plan. v2.8.3 Commit H retracted the claim in the meta.py docstring; this row supersedes the v2.8.2 row text.)* |
 | M5 | `costs.py:DefaultTradeCost` | Opt-in `cost_normalization="current_equity"`. Default unchanged. First-order approximation (uses pre-cost gross returns). |
 
 ### M3 rejection set
@@ -1064,17 +1067,23 @@ hard-removal stays on v2.9 schedule (unchanged from v2.8.1).
 
 ### What v2.8.2 does NOT include
 
-- **M4 perf optimization** — partial-timeline regen requires an
-  opt-in `BaseStrategy.regen_from_bar` interface that must be
-  designed jointly with v2.9 IncrementalFactor engine integration
-  so both consumers share a single API. Deferred to v2.8.3.
+- **M4 perf optimization** — full-timeline regen on every
+  `adjust_strategy_params` call. A partial-timeline regeneration
+  path is on the roadmap; no committed milestone.
+  *(v2.8.2 originally cited a v2.8.3 ship "designed jointly with
+  v2.9 IncrementalFactor engine integration so both consumers
+  share a single API"; this paragraph was fabricated. v2.8.3
+  Commit H + the v2.8.3 release notes retract the claim. This
+  bullet supersedes the v2.8.2 original.)*
 - **LLM probe MEDIUMs** (anchors, orchestrator, scoring) —
   v2.8.3.
 - **UX + API hygiene** (CHANGELOG, mypy CI) — v2.8.4.
 - **Test fixture consolidation + factor LOWs** — v2.8.5.
-- **Architectural items** (`IncrementalFactor` engine integration,
-  `significance.py` split, neutral primitives module) — v2.9
-  (the final v2.x release).
+- **Architectural items** (`significance.py` split, neutral
+  primitives module) — v2.9 (the final v2.x release).
+  *(v2.8.2 originally included "IncrementalFactor engine
+  integration" in this list; that integration is not on a v2.9
+  plan and was retracted in v2.8.3.)*
 - **v3.0 LLM/AI factor mining** — separate major track.
 
 ---
