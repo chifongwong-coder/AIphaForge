@@ -617,3 +617,60 @@ class TestPersistenceBaseline:
         # *with* the field should preserve the original value.
         roundtripped = pickle.loads(pickle.dumps(report))
         assert roundtripped.persistence_validity == "OK"
+
+    # v2.8.3 Commit G (M10c): field-contract coverage.
+    def test_persistence_validity_is_a_declared_dataclass_field(self):
+        from dataclasses import fields
+        field_names = {f.name for f in fields(KnowledgeCheckReport)}
+        assert "persistence_validity" in field_names
+
+    def test_to_dict_includes_persistence_validity(self):
+        data = _make_real_data(n=80)
+        probe = ContinuationProbe(
+            symbol="AAPL", context_bars=10, forward_horizon=1,
+            templates=[NextCloseContinuation],
+        )
+        anchors = list(data.index[20:25])
+        question_set = probe.build(data, anchors)
+        attested = _build_perfect_attested(question_set)
+        report = knowledge_check(
+            probe, data, anchors, attested,
+            provider_config=_provider_config(),
+        )
+        d = report.to_dict()
+        assert "persistence_validity" in d
+        assert d["persistence_validity"] == "OK"
+
+    def test_construct_with_explicit_pairing_failed_validity(self):
+        # Direct construction with PAIRING_FAILED is accepted by the
+        # manual __init__. Reuse the H7-pickle helper for the
+        # remaining required fields so this test stays focused on
+        # the M10 field acceptance.
+        from tests.test_v2_8_1_h7_report_pickle import _baseline_kwargs
+        kwargs = _baseline_kwargs()
+        kwargs["persistence_validity"] = "PAIRING_FAILED"
+        report = KnowledgeCheckReport(**kwargs)
+        assert report.persistence_validity == "PAIRING_FAILED"
+
+    def test_unknown_kwarg_for_persistence_validity_typo_rejected(self):
+        # __init__ rejects unknown kwargs (M4 contract). A typo on
+        # the new field must not silently drop through.
+        from tests.test_v2_8_1_h7_report_pickle import _baseline_kwargs
+        kwargs = _baseline_kwargs()
+        kwargs["persistencevalidity"] = "OK"  # typo (no underscore)
+        with pytest.raises(
+            TypeError, match="persistencevalidity",
+        ):
+            KnowledgeCheckReport(**kwargs)
+
+    def test_pickle_roundtrip_preserves_explicit_pairing_failed(self):
+        # __setstate__ backfills ONLY when the key is missing. An
+        # explicit "PAIRING_FAILED" must survive the round-trip
+        # unchanged (no override to UNKNOWN, no coercion).
+        import pickle
+        from tests.test_v2_8_1_h7_report_pickle import _baseline_kwargs
+        kwargs = _baseline_kwargs()
+        kwargs["persistence_validity"] = "PAIRING_FAILED"
+        report = KnowledgeCheckReport(**kwargs)
+        revived = pickle.loads(pickle.dumps(report))
+        assert revived.persistence_validity == "PAIRING_FAILED"
