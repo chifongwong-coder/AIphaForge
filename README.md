@@ -714,6 +714,176 @@ for diag in result.diagnostics:
         print(f"dropped {diag.details['collision_count']} rows")
 ```
 
+## v2.8.3 Release Notes
+
+### Headline — LLM-pillar diagnostic patches + a fabricated-roadmap retraction
+
+v2.8.3 ships five MEDIUM-severity LLM-pillar patches (M6-M10),
+corrects a fabricated v2.9 design claim in
+`MetaContext.adjust_strategy_params`, and clears the v2.8.2
+Commit I deferred-items backlog. No engine source change beyond
+documentation in `fees.py` and the `meta.py` docstring; the
+public API surface and `BacktestResult` field set are unchanged.
+
+### Per-M one-liner
+
+| ID | File | Symptom |
+|----|------|---------|
+| M6 | `probes/anchors.py:_block_bootstrap_corr_ci` | Floor-division on `n // block_size` left bootstrap samples short by up to `block_size-1` elements when `n` was not a multiple. Now uses ceiling division so the concatenated sample (after the `[:n]` slice) matches the original length exactly. Leverage-corr CI / SE estimates may shift by ~1-3% on unaligned windows. |
+| M7 | `probes/scoring.py:parse_numeric_answer` | European decimal-comma inputs (`"1,5"`, `"12,50"`) previously tokenized to two numbers and returned `None` under the default `permissive=False` — a silent loss. v2.8.3 emits a `UserWarning` naming the offending substring + suggesting `str.replace(',', '.')`. Parser output is intentionally unchanged. |
+| M8 | `probes/_vol.py:estimate_sigma` | Parkinson H==L fallback to `stdev_returns` still triggers at fraction ≥ 50%. The new `[0.4, 0.5)` warning band adds an `h_eq_l_warning_band` provenance entry (with closed-form bias estimate) without changing the chosen estimator — surfaces borderline windows for audit. |
+| M9 | `probes/orchestrator.py:looks_like_refusal` | Leading-window keyword scan widened 50 → 80 characters. Captures refusals that begin with a polite preface (`"As an AI language model, I don't have access to..."` — keyword starts at character 60). False-positive class from in-quote refusal phrases past position 80 is regression-pinned. |
+| M10 | `probes/orchestrator.py:KnowledgeCheckReport` | New `persistence_validity: Literal["NO_PERSISTENCE", "OK", "PAIRING_FAILED", "UNKNOWN"]` field. Mirrors `anchor_validity`. When ≠ `OK`, `real_minus_persistence_bucket_delta` and `real_vs_persistence_sign_test_p` are suppressed to `None`. Legacy pickles (v2.8.2 and earlier) backfill to `"UNKNOWN"` via `__setstate__`. |
+| meta.py docstring | `meta.py:MetaContext.adjust_strategy_params` | Removes the fabricated "designed jointly with v2.9 IncrementalFactor" claim. The performance note now reflects the actual current behavior (O(N·K) full-timeline regeneration) and an honest "on the roadmap, no committed milestone" pointer. |
+
+### M10 pickle migration recipe
+
+v2.8.2 pickles do not carry `persistence_validity`. The new
+`__setstate__` backfill emits no warning (the field is silently
+populated as `"UNKNOWN"`) so existing load sites continue to
+work. To detect the legacy provenance and re-run:
+
+```python
+import pickle
+from aiphaforge.probes.orchestrator import KnowledgeCheckReport
+
+with open("v2.8.2_report.pickle", "rb") as f:
+    report = pickle.load(f)  # backfills persistence_validity="UNKNOWN"
+
+if report.persistence_validity == "UNKNOWN":
+    # Legacy pickle: cannot distinguish OK from PAIRING_FAILED
+    # because sign_test_p(0, 0) returns (1.0, "trivial_n_zero")
+    # under both. Re-run the orchestrator on the original probe to
+    # upgrade.
+    ...
+```
+
+Rationale: the v2.8.2 `real_vs_persistence_sign_test_p` field
+silently collapsed both `OK` (paired but no signal) and
+`PAIRING_FAILED` (no qid overlap → empty pair list → `(0, 0)`)
+into the same `1.0` p-value. Consumers reading a v2.8.2 pickle
+have no way to tell which case produced the `1.0`. The `UNKNOWN`
+tag flags exactly this ambiguity so users can choose to re-run
+rather than treat the legacy `1.0` as a clean null result.
+
+### M7 honesty paragraph
+
+If you submitted European-format numeric inputs to
+`parse_numeric_answer` in v2.8.2 (single scalar like `"1,5"`),
+the parser returned `None` and your `parse_status` showed
+`"invalid"`. There was no warning. Range/bracket paths that
+contained a comma-decimal token were similarly mis-tokenized.
+v2.8.3 emits a `UserWarning` so the silent loss surfaces in
+test logs. Full locale support (parsing European decimals
+correctly given an explicit `locale=` argument) is on the
+v2.8.4 M15 roadmap; v2.8.3 is warning-only.
+
+### Lost-data playbook for v2.8.2 ContinuationProbe users
+
+For paper authors who used v2.8.2 `ContinuationProbe` pickles in
+published work AND cannot re-run (raw data deleted, dataset
+embargo, post-publication audit, etc.):
+
+**Suggested citation wording**:
+
+> This work used AIphaForge v2.8.2 for the persistence-baseline
+> analysis. v2.8.3 added a `persistence_validity` field to
+> `KnowledgeCheckReport` that retroactively cannot distinguish
+> `OK` from `PAIRING_FAILED` for v2.8.2-saved pickles (per the
+> AIphaForge v2.8.3 release notes, M10). Where this paper reports
+> `real_minus_persistence_bucket_delta` or
+> `real_vs_persistence_sign_test_p` from a v2.8.2-loaded report,
+> the underlying `persistence_validity` is `UNKNOWN`, and results
+> should be treated as having unknown pairing-success state.
+
+**Retraction / correction guidance**:
+
+- If your published claim used `real_minus_persistence_bucket_delta`
+  as evidence of a specific pairing state, and you cannot re-run:
+  publish a correction or erratum stating the underlying validity
+  is `UNKNOWN` per v2.8.3 release notes M10.
+- If your published claim used `real_vs_persistence_sign_test_p`
+  for a hypothesis test: same — note the underlying validity is
+  `UNKNOWN`. The `1.0` p-value cannot distinguish trivial-OK from
+  pairing-failure.
+- If your published claim used only `bucket_delta` magnitudes
+  without explicit pairing-success assertions: a footnote
+  disclosing the v2.8.2 → v2.8.3 ambiguity is sufficient (no
+  retraction needed).
+
+### CI engineer triage block
+
+Expected failure modes when CI re-baselines on v2.8.3, in order
+of likelihood:
+
+1. **M6 leverage-corr CI / SE shifts** — bootstrap samples on
+   unaligned windows are now full-length. CI half-widths and SEs
+   may move by ~1-3% on the affected windows.
+2. **M7 European-pattern warnings** — fixtures containing
+   `"\d,\d"` or `"\d,\d\d"` patterns now emit `UserWarning`.
+   `pytest.warns` blocks may need to widen, or input fixtures
+   need pre-localization via `str.replace(',', '.')`.
+3. **M8 H==L `[0.4, 0.5)` warnings** — windows in the new
+   warning band gain an extra provenance entry
+   (`h_eq_l_warning_band`); test fixtures that snapshot the
+   provenance dict shape need updating.
+4. **M9 refusal_rate metric up for borderline fixtures** — if
+   your fixtures contain refusal-shaped phrases starting in the
+   character-position 50-79 band, `looks_like_refusal` now
+   returns `True` where it previously returned `False`.
+   Downstream `refusal_rate` aggregates rise; `effective_rate`
+   falls correspondingly.
+5. **M10 `persistence_validity` field on
+   `KnowledgeCheckReport`** — pickled reports gain a new
+   field; consumers using `dataclasses.fields()` to enumerate
+   surface need updating. The `to_dict()` method already covers
+   the field automatically.
+6. **M3 dict-path validation respects `data_validation="none"`**
+   — closes a v2.8.2 gap. Tests relying on dict-path validation
+   firing when the engine was constructed with
+   `data_validation="none"` would have been buggy; in v2.8.3
+   they will (correctly) no longer fire.
+
+### Reverse-pickle caveat
+
+v2.8.3 → v2.8.2 reverse pickle is NOT supported. The new
+`persistence_validity` field has no `__init__` translation back
+to the v2.8.2 dataclass; a v2.8.3 pickle loaded under v2.8.2 will
+raise `TypeError: KnowledgeCheckReport got unexpected keyword
+arguments: ['persistence_validity']`. This is per the v2.8.1 H7
+forward-only contract.
+
+### Lockfile-pin recipe
+
+```bash
+pip install \
+  git+https://github.com/chifongwong-coder/AIphaForge@<v2.8.3-merge-sha>
+```
+
+The merge SHA is set when v2.8.3 lands on `main`; until then, pin
+to the feature branch via
+`@feature/v2.8.3-llm-medium`.
+
+### Deprecation removal commitment
+
+`bucket_delta_tango_ci` legacy alias remains scheduled for hard
+removal in v2.9 (unchanged from v2.8.1+v2.8.2). v2.8.3 does not
+move the schedule.
+
+### What v2.8.3 does NOT include
+
+- Full locale support for European decimal-comma parsing (M7 is
+  warning-only; locale support is on the v2.8.4 M15 roadmap).
+- Reverse-lock skip-rule tightening (v2.8.5).
+- `IncrementalSMA` / `IncrementalEMA` / partial-timeline
+  regeneration (no committed milestone — see the corrected
+  `MetaContext.adjust_strategy_params` docstring).
+- `__pickle_version__` constant on `KnowledgeCheckReport` (does
+  not exist; out of scope for v2.8.3).
+- `dataclasses.asdict` for `KnowledgeCheckReport` serialization
+  (use `report.to_dict()` instead — `asdict` rejects the
+  `MappingProxyType`-wrapped fields).
+
 ## v2.8.2 Release Notes
 
 ### Headline — parallel-backtest users: your strategy instance is mutated in place
@@ -748,11 +918,17 @@ without reading these release notes, silent contamination from
 prior runs persists. You must audit your parallel-backtest
 pipelines and switch to the factory pattern manually.
 
-**Performance optimization for this regen path (partial-timeline
-regen instead of full regen on every adjustment) ships in v2.8.3,
-designed jointly with the v2.9 `IncrementalFactor` engine
-integration so both consumers share a single opt-in incremental
-interface.**
+**Performance note — `adjust_strategy_params` regen cost**: every
+call re-runs the strategy from bar 0 (O(N·K) for N bars × K
+adjustments). Callers performing many small adjustments on a long
+timeline should batch them where possible. A partial-timeline
+(incremental) regeneration path is on the roadmap; no committed
+milestone yet. *(The v2.8.2 release notes initially announced a
+v2.8.3 ship "designed jointly with a v2.9 IncrementalFactor
+engine integration" — there is no IncrementalFactor module or
+v2.9 plan, and v2.8.3 corrects this fabrication in both the
+`MetaContext.adjust_strategy_params` docstring and these release
+notes. See v2.8.3 Commit H.)*
 
 ### CI engineer triage block
 
