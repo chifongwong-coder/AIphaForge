@@ -98,7 +98,7 @@ class TestReportCarriesWarning:
 
 class TestVersion:
     def test_version_is_current_release(self):
-        # Updated by v2.8.4 patch bump (M11+M11b+M12+M13+M14+M15 —
-        # UX + API hygiene).
+        # Updated by v2.8.5 patch bump (L1-L7 + reverse-lock — test
+        # hygiene + factor LOW patches).
         import aiphaforge
-        assert aiphaforge.__version__ == "2.8.4"
+        assert aiphaforge.__version__ == "2.8.5"

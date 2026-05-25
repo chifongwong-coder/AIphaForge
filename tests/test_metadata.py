@@ -16,7 +16,7 @@ else:
 import aiphaforge
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-EXPECTED_VERSION = "2.8.4"
+EXPECTED_VERSION = "2.8.5"
 
 
 def _read_pyproject_version() -> str:
