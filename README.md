@@ -825,6 +825,54 @@ report: KnowledgeCheckReport = knowledge_check(
 assert report.anchor_validity == "OK"
 ```
 
+## v2.8.5 Release Notes
+
+### Headline — test hygiene + factor LOW patches
+
+v2.8.5 is a patch release focused on test-suite consolidation and
+small factor-pillar fixes. The engine zero-diff invariant holds:
+`engine.py`, `broker.py`, `portfolio.py`, `orders.py`, `fees.py`,
+`hooks.py`, `results.py`, and `performance.py` are untouched.
+
+### Per-item summary (8 deliverables)
+
+| L | Site | What changed | User impact |
+|---|---|---|---|
+| L1 | `tests/_helpers/ohlcv.py` (new) + 10 test files migrated | Test fixtures consolidated onto 3 shared constructors (`make_ohlcv`, `make_close_only`, `make_ohlcv_from_closes`). Method-bound fixtures and shape-divergent bespoke fixtures stay in place. | Silent — test-internal only; no user-facing API change. |
+| L2 | `tests/test_engine_edge_cases.py` (new) | 3 new edge-case tests: N=1 bar engine behavior pin; all-NaN signal produces zero trades; constant-drift total return matches closed-form. | Loud (test count grows by 3); no behavior change. |
+| L3 | `tests/test_alpha_screener.py` | R11 alpha-firewall path list extended with `src/aiphaforge/alpha/signal_analysis.py`. Pre-implementation AST check confirmed no current violation. | Loud only if a future commit accidentally introduces a forbidden import in `signal_analysis.py`. |
+| L4 | `tests/test_incremental_rsi.py` | Seed-transition cliff comment fixed: "period-1, period, period+1" -> "period-2, period-1, period" (matches what the 3 existing tests at `:66/:74/:82` assert). Comment-only fix. | Silent. |
+| L5 | `tests/test_incremental_rolling_mean.py` | New `test_running_sum_no_drift_at_100k_bars` exercises 100k bars * window=20 rolling-mean accumulator vs `pd.Series.rolling(20).mean()` reference; asserts `rtol=1e-9, atol=1e-6`. | Loud only if a future refactor introduces drift exceeding `1e-6` at 100k bars. |
+| L6 | `src/aiphaforge/alpha/evaluator.py` | `AlphaScreener._check_columns` now raises `TypeError` (was `AttributeError`) when `factor` or `prices` is not a `pd.DataFrame`. The `AttributeError` was an implementation artifact, not a documented contract — the signature has always typed both args as `pd.DataFrame`. | **Loud — different exception class.** Callers writing `except AttributeError` for type-mismatched input must switch to `except TypeError`. Escape hatch: wrap inputs in `.to_frame()` before calling. |
+| L7 | `src/aiphaforge/probes/__init__.py` + `tests/test_probes_private_symbols_test_only.py` (new) | 3 probes private symbols (`_canonical_json`, `_normalize_choice`, `_serialize_collision_examples`) explicitly documented as "test-internal helpers, subject to change without notice". Meta-test asserts no non-test, non-probes module imports them. | Silent (docstring tag + 1 meta-test); no API change. |
+| Reverse-lock | `tests/test_v2_8_public_api_lock.py` + `tests/_helpers/reverse_lock_allowlist.md` | Reverse-lock rule 2 tightened: skip-on-foreign-`__module__` now requires `inspect.isclass(val) or inspect.isfunction(val)` first. Typing-generics + `__future__` imports allowlist (205 noise-floor symbols at ship-time, 0 "other" bucket) keeps these out of the lock surface. The v2.8.2 documentation pin is removed. | Silent for current code (no existing violation); loud for future regressions. |
+
+### CI engineer triage
+
+- **ruff**: no new rules. `ruff check src/` passes CLEAN at v2.8.5.
+- **pytest**: **+8 tests** across:
+  - `tests/test_engine_edge_cases.py` (+3, L2)
+  - `tests/test_incremental_rolling_mean.py` (+1, L5)
+  - `tests/test_alpha_screener.py` (+2, L6)
+  - `tests/test_probes_private_symbols_test_only.py` (+1, L7)
+  - `tests/test_v2_8_public_api_lock.py` (+2, reverse-lock allowlist + 0-other guard)
+  - `tests/test_v2_8_2_deferred_test_hardening.py` (-1, removed v2.8.2 pin)
+  - L1 / L3 / L4 ship as test-internal renames / firewall-list / docstring — 0 test additions.
+- **mypy**: unchanged. Broad `mypy src/aiphaforge/` advisory; scoped-blocking `mypy src/aiphaforge/alpha/` still at 0 errors.
+- **L6 behavior change**: `AlphaScreener._check_columns` now raises `TypeError` on non-`pd.DataFrame` input (was `AttributeError`). If your code catches `AttributeError` from this method, switch to `TypeError`.
+- **Pinning**: if you pin AIphaForge by SHA, re-pin to the v2.8.5 release commit.
+
+### What v2.8.5 does NOT include
+
+- V2.9-S1 `aiphaforge.stats` neutral-primitives hoist (v2.9).
+- V2.9-S2 `significance.py` 7-file subpackage split (v2.9).
+- V2.9-S3 `set_factor_provider` + `IncrementalSMA` (alias) + `IncrementalEMA` (new) (v2.9 — the only engine-touching item).
+- V2.9-S5 curated probes promote to top-level `__all__` (v2.9).
+- mypy Phase 2 (per-file allowlist + blocking on the top modules) (v2.9).
+- LLM-probe MEDIUMs (closed in v2.8.3).
+- M11-M15 UX + API hygiene (closed in v2.8.4).
+- New features.
+
 ## v2.8.4 Release Notes
 
 ### Headline — UX + API hygiene

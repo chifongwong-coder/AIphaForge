@@ -10,6 +10,81 @@ Releases prior to v2.8.1 are not documented here; consult the git history
 
 ## [Unreleased]
 
+## [2.8.5] - 2026-05-25
+
+### Headline — test hygiene + factor LOW patches
+
+Eight deliverables grouped under "test hygiene + factor LOW" plus a
+carry-forward reverse-lock tightening from v2.8.2. The engine
+zero-diff invariant holds: `engine.py`, `broker.py`, `portfolio.py`,
+`orders.py`, `fees.py`, `hooks.py`, `results.py`, and `performance.py`
+are untouched.
+
+### Added
+
+- L1: `tests/_helpers/ohlcv.py` with 3 shared OHLCV constructors
+  (`make_ohlcv`, `make_close_only`, `make_ohlcv_from_closes`); 10
+  module-level fixtures migrated.
+- L2: `tests/test_engine_edge_cases.py` pinning N=1 bar behavior,
+  all-NaN signal no-trades, and constant-drift closed-form total
+  return.
+- L5: `test_running_sum_no_drift_at_100k_bars` in
+  `tests/test_incremental_rolling_mean.py` (rtol=1e-9, atol=1e-6).
+- L7: meta-test
+  `tests/test_probes_private_symbols_test_only.py` asserting the 3
+  probes private helpers stay test-internal; module docstring tag in
+  `src/aiphaforge/probes/__init__.py`.
+- Reverse-lock: `_ALLOWED_FOREIGN_ORIGINS` constant in
+  `tests/test_v2_8_public_api_lock.py`; two regression guards
+  (`test_reverse_lock_allowlist_matches_audit_script`,
+  `test_reverse_lock_other_category_remains_zero`).
+
+### Changed
+
+- L3: `src/aiphaforge/alpha/signal_analysis.py` appended to the R11
+  alpha-firewall path list in `tests/test_alpha_screener.py`.
+- L4: seed-transition cliff comment in
+  `tests/test_incremental_rsi.py` rewritten to read "period-2,
+  period-1, period" (matches the 3 existing boundary tests).
+- L6 (**behavior change**): `AlphaScreener._check_columns` raises
+  `TypeError` (was `AttributeError`) when `factor` or `prices` is not
+  a `pd.DataFrame`. The error message names the offending argument
+  and the actual type.
+- Reverse-lock: rule 2 of
+  `test_module_no_accidentally_public_symbols` requires
+  `inspect.isclass(val) or inspect.isfunction(val)` (or a
+  typing/__future__ allowlist hit) before short-circuiting on
+  foreign `__module__`. Foreign-class-instance leaks now fall
+  through to the lock assertion.
+
+### Removed
+
+- `tests/test_v2_8_2_deferred_test_hardening.py::test_reverse_lock_currently_passes_foreign_class_instances`
+  — the v2.8.2-era pin no longer applies; v2.8.5 actively catches
+  the case the pin documented.
+
+### Notes
+
+- ruff: no new rules; `ruff check src/` passes CLEAN at v2.8.5.
+- pytest: net +8 across the suite (full breakdown in the README v2.8.5
+  release notes section).
+- mypy: scoped-blocking `mypy src/aiphaforge/alpha/` still at 0
+  errors. Broad `mypy src/aiphaforge/` remains advisory.
+- L6 escape hatch: wrap inputs in `.to_frame()` before calling, or
+  catch `TypeError` instead of `AttributeError`.
+
+### Lockfile recipe
+
+```bash
+pip install git+https://github.com/chifongwong-coder/AIphaForge@<v2.8.5-merge-sha>
+```
+
+### What v2.8.5 does NOT include
+
+- V2.9-S1 `aiphaforge.stats` hoist; V2.9-S2 `significance.py` split;
+  V2.9-S3 `set_factor_provider` + `IncrementalSMA`/`IncrementalEMA`;
+  V2.9-S5 curated probes promote; mypy Phase 2; new features.
+
 ## [2.8.4] - 2026-05-24
 
 ### Headline — UX + API hygiene
