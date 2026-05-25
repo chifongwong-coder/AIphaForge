@@ -31,6 +31,26 @@ import pkgutil
 
 import pytest
 
+# v2.8.5 reverse-lock tightening: when rule 2 of
+# ``test_module_no_accidentally_public_symbols`` short-circuits on
+# foreign ``__module__``, it now requires the value to be either a
+# class / function (the canonical re-export shape) or carry one of the
+# allowlisted typing/future origins. Foreign-class-instance leaks fall
+# through to the lock assertion.
+#
+# Allowlist source: kept in lockstep with
+# ``tests/_helpers/reverse_lock_audit.py::_TYPING_ORIGIN_MODULES`` plus
+# the ``__future__`` module. The lockstep is asserted by
+# ``test_reverse_lock_allowlist_matches_audit_script`` below.
+_ALLOWED_FOREIGN_ORIGINS = frozenset({
+    "typing",
+    "typing_extensions",
+    "collections.abc",
+    "_collections_abc",
+    "__future__",
+})
+
+
 # 30 newly-locked + 2 already-locked cross-checks = 32 cases.
 _LOCKED_MODULES = [
     # Commit F — core engine (8)
@@ -102,9 +122,18 @@ def test_module_no_accidentally_public_symbols(module_name: str) -> None:
         # exceptions defined elsewhere carry __module__ pointing
         # back to their origin module; only originals get locked
         # by this module's __all__.
+        #
+        # v2.8.5 tightening: only short-circuit on foreign origin if
+        # the symbol is a class or function (the canonical re-export
+        # shape) or if its origin module is on the typing / __future__
+        # allowlist (the 205-symbol noise floor at v2.8.5 release).
+        # Foreign-class-instance leaks fall through to the lock check.
         origin = getattr(val, "__module__", None)
         if origin is not None and origin != module_name:
-            continue
+            if inspect.isclass(val) or inspect.isfunction(val):
+                continue
+            if origin in _ALLOWED_FOREIGN_ORIGINS:
+                continue
         # Primitive constants (bool, int, float, str, None) without
         # __module__ are almost always cross-module imports
         # (TRADING_DAYS_STOCK pulled from utils into engine, the
@@ -143,3 +172,53 @@ def test_module_declares_valid_public_all(module_name: str) -> None:
             f"aiphaforge.{module_name}.__all__ declares {name!r} but "
             f"the module has no such attribute"
         )
+
+
+def test_reverse_lock_allowlist_matches_audit_script() -> None:
+    """v2.8.5 reverse-lock tightening: the lock test's
+    ``_ALLOWED_FOREIGN_ORIGINS`` must equal the audit script's
+    ``_TYPING_ORIGIN_MODULES`` union ``{_FUTURE_MODULE}``.
+
+    The two surfaces hold the same allowlist for the same reason and
+    must move together. If a future audit run grows the typing-generic
+    family or the project adopts a new ``__future__``-style module,
+    update both sites in the same commit.
+    """
+    from tests._helpers.reverse_lock_audit import (
+        _FUTURE_MODULE,
+        _TYPING_ORIGIN_MODULES,
+    )
+
+    expected = frozenset(_TYPING_ORIGIN_MODULES) | {_FUTURE_MODULE}
+    assert _ALLOWED_FOREIGN_ORIGINS == expected, (
+        f"_ALLOWED_FOREIGN_ORIGINS ({sorted(_ALLOWED_FOREIGN_ORIGINS)}) "
+        f"diverges from the audit script's "
+        f"_TYPING_ORIGIN_MODULES ∪ {{_FUTURE_MODULE}} "
+        f"({sorted(expected)}). Update either site to match the other."
+    )
+
+
+def test_reverse_lock_other_category_remains_zero() -> None:
+    """v2.8.5 reverse-lock tightening: the audit script's "other"
+    category (foreign-origin symbols that are NOT classes / functions
+    / typing-generics / __future__ imports) must remain empty.
+
+    A non-zero "other" count means a real accidentally-public surface
+    has slipped through the lock and needs investigation — typically
+    by renaming the symbol with a ``_`` prefix or adding it to the
+    relevant ``__all__``.
+    """
+    from tests._helpers.reverse_lock_audit import audit_reverse_lock
+
+    result = audit_reverse_lock()
+    other_count = result["by_category"]["other"]
+    other_symbols = [
+        f"{s['module']}.{s['name']} (origin={s['origin']!r})"
+        for s in result["flagged_symbols"]
+        if s["category"] == "other"
+    ]
+    assert other_count == 0, (
+        f"reverse-lock audit found {other_count} 'other'-category "
+        f"flagged symbols; investigate:\n  "
+        + "\n  ".join(other_symbols)
+    )
