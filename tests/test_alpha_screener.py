@@ -195,6 +195,7 @@ class TestAlphaScreenerR11Firewall:
             "src/aiphaforge/alpha/labels.py",
             "src/aiphaforge/alpha/metrics.py",
             "src/aiphaforge/alpha/rank_stats.py",
+            "src/aiphaforge/alpha/signal_analysis.py",
             "src/aiphaforge/alpha/__init__.py",
         ]:
             path = Path(__file__).resolve().parent.parent / module_path
