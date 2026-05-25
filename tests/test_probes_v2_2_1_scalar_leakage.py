@@ -3,8 +3,6 @@ from __future__ import annotations
 
 import math
 
-import numpy as np
-import pandas as pd
 import pytest
 
 from aiphaforge.probes.anchors import build_synthetic_anchor
@@ -17,6 +15,7 @@ from aiphaforge.probes.questions import (
     DEFAULT_TEMPLATES,
     KnowledgeProbe,
 )
+from tests._helpers.ohlcv import make_ohlcv
 
 
 def _provider_config():
@@ -26,20 +25,6 @@ def _provider_config():
         "max_output_tokens": 256, "tokenizer_id": "test",
         "seed": 42, "reasoning_effort": None, "stop_sequences": None,
     }
-
-
-def _make_data(n: int = 30) -> pd.DataFrame:
-    rng = np.random.default_rng(0)
-    rets = rng.normal(0.0, 0.01, n)
-    closes = 100.0 * np.exp(np.cumsum(rets))
-    return pd.DataFrame(
-        {
-            "open": closes, "high": closes * 1.01,
-            "low": closes * 0.99, "close": closes,
-            "volume": [1e6] * n,
-        },
-        index=pd.bdate_range("2024-01-01", periods=n),
-    )
 
 
 def _build_perfect_attested(question_set):
@@ -131,7 +116,7 @@ class TestComputeScalarLeakageIndex:
 
 class TestScalarLeakageInReport:
     def _run(self, anchor: bool = True):
-        data = _make_data()
+        data = make_ohlcv(periods=30)
         probe = KnowledgeProbe(
             symbol="AAPL", templates=DEFAULT_TEMPLATES,
         )
@@ -174,7 +159,7 @@ class TestScalarLeakageInReport:
 
 class TestRemovedBootstrapParams:
     def _setup(self):
-        data = _make_data()
+        data = make_ohlcv(periods=30)
         probe = KnowledgeProbe(
             symbol="AAPL", templates=DEFAULT_TEMPLATES,
         )

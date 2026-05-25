@@ -9,28 +9,10 @@ Warn / none modes preserve the legacy lenient behavior.
 """
 from __future__ import annotations
 
-import numpy as np
-import pandas as pd
 import pytest
 
 from aiphaforge.utils import validate_ohlcv
-
-
-def _ohlcv(close: list[float], volume: list[float] | None = None) -> pd.DataFrame:
-    n = len(close)
-    if volume is None:
-        volume = [1_000_000.0] * n
-    arr = np.asarray(close, dtype=float)
-    return pd.DataFrame(
-        {
-            "open": arr,
-            "high": arr,
-            "low": arr,
-            "close": arr,
-            "volume": volume,
-        },
-        index=pd.bdate_range("2024-01-01", periods=n),
-    )
+from tests._helpers.ohlcv import make_ohlcv_from_closes as _ohlcv
 
 
 class TestStrictRejection:
@@ -55,7 +37,7 @@ class TestStrictRejection:
             validate_ohlcv(df, validation_level="strict")
 
     def test_strict_accepts_zero_volume(self):
-        df = _ohlcv([100.0, 101.0, 102.0], volume=[1.0, 0.0, 1.0])
+        df = _ohlcv([100.0, 101.0, 102.0], volumes=[1.0, 0.0, 1.0])
         # Should not raise — volume of 0 is allowed.
         validate_ohlcv(df, validation_level="strict")
 

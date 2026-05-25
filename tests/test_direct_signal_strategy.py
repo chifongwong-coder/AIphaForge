@@ -11,19 +11,7 @@ from aiphaforge.signal_rules import (
     ThresholdScoreRule,
 )
 from aiphaforge.signal_strategy import DirectSignalStrategy
-
-
-def _ohlcv(periods: int = 30) -> pd.DataFrame:
-    rng = np.random.default_rng(0)
-    closes = 100.0 * np.exp(np.cumsum(rng.normal(0.0, 0.01, periods)))
-    idx = pd.bdate_range("2024-01-01", periods=periods)
-    return pd.DataFrame(
-        {"open": closes, "high": closes * 1.01,
-         "low": closes * 0.99, "close": closes,
-         "volume": [1e6] * periods},
-        index=idx,
-    )
-
+from tests._helpers.ohlcv import make_ohlcv
 
 # ---------------------------------------------------------------------------
 # Routing
@@ -32,7 +20,7 @@ def _ohlcv(periods: int = 30) -> pd.DataFrame:
 
 class TestDirectSignalStrategyShapes:
     def test_single_series(self):
-        data = _ohlcv()
+        data = make_ohlcv(periods=30)
         sig = pd.Series(
             [1.0, np.nan, 0.0, -1.0, np.nan] * 6, index=data.index,
         )
@@ -43,7 +31,7 @@ class TestDirectSignalStrategyShapes:
         assert out.iloc[3] == -1.0
 
     def test_multi_dict(self):
-        data = {"A": _ohlcv(), "B": _ohlcv()}
+        data = {"A": make_ohlcv(periods=30), "B": make_ohlcv(periods=30)}
         sigs = {
             "A": pd.Series([1.0] + [np.nan] * 29, index=data["A"].index),
             "B": pd.Series([0.0, -1.0] + [np.nan] * 28, index=data["B"].index),
@@ -54,7 +42,7 @@ class TestDirectSignalStrategyShapes:
         assert set(out.keys()) == {"A", "B"}
 
     def test_wide_dataframe(self):
-        data = {"A": _ohlcv(), "B": _ohlcv()}
+        data = {"A": make_ohlcv(periods=30), "B": make_ohlcv(periods=30)}
         wide = pd.DataFrame(
             {"A": [1.0] + [np.nan] * 29,
              "B": [0.0, -1.0] + [np.nan] * 28},
@@ -67,7 +55,7 @@ class TestDirectSignalStrategyShapes:
         assert out["B"].iloc[1] == -1.0
 
     def test_scores_with_rule(self):
-        data = _ohlcv()
+        data = make_ohlcv(periods=30)
         scores = pd.Series(
             [0.85] + [0.5] * 14 + [0.10] + [0.5] * 14, index=data.index,
         )
@@ -80,7 +68,7 @@ class TestDirectSignalStrategyShapes:
 
     def test_missing_symbol_returns_nan(self):
         # Multi-asset data has B but signals dict only has A.
-        data = {"A": _ohlcv(), "B": _ohlcv()}
+        data = {"A": make_ohlcv(periods=30), "B": make_ohlcv(periods=30)}
         sigs = {"A": pd.Series([1.0] * 30, index=data["A"].index)}
         strategy = DirectSignalStrategy(signals=sigs)
         out = strategy.generate_signals(data)
@@ -95,7 +83,7 @@ class TestDirectSignalStrategyShapes:
 
 class TestUpdateSignalsAndScores:
     def test_update_signals_replaces_underlying(self):
-        data = _ohlcv()
+        data = make_ohlcv(periods=30)
         sig1 = pd.Series([1.0] * 30, index=data.index)
         strategy = DirectSignalStrategy(signals=sig1)
         out1 = strategy.generate_signals(data)
@@ -109,7 +97,7 @@ class TestUpdateSignalsAndScores:
     def test_update_scores_requires_rule_to_be_set(self):
         # Strategy constructed via signals path → no rule → cannot
         # accept scores.
-        data = _ohlcv()
+        data = make_ohlcv(periods=30)
         sig = pd.Series([1.0] * 30, index=data.index)
         strategy = DirectSignalStrategy(signals=sig)
         scores = pd.Series([0.85] * 30, index=data.index)
@@ -120,7 +108,7 @@ class TestUpdateSignalsAndScores:
         # Per docstring: update_params(rule=...) then update_scores
         # is the supported workflow for retrofitting a signals-path
         # strategy with score conversion.
-        data = _ohlcv()
+        data = make_ohlcv(periods=30)
         sig = pd.Series([1.0] * 30, index=data.index)
         strategy = DirectSignalStrategy(signals=sig)
         rule = ThresholdScoreRule(long_threshold=0.7, short_threshold=0.3)
@@ -164,7 +152,7 @@ class TestConstructionValidation:
 
 class TestEngineIntegration:
     def test_engine_can_run_direct_signal_strategy_single_asset(self):
-        data = _ohlcv()
+        data = make_ohlcv(periods=30)
         # Long on day 5, flatten on day 20.
         sig = pd.Series(np.nan, index=data.index)
         sig.iloc[5] = 1.0
@@ -178,7 +166,7 @@ class TestEngineIntegration:
         assert len(result.equity_curve) == len(data)
 
     def test_engine_can_run_direct_signal_strategy_multi_asset(self):
-        data = {"A": _ohlcv(), "B": _ohlcv()}
+        data = {"A": make_ohlcv(periods=30), "B": make_ohlcv(periods=30)}
         wide = pd.DataFrame(
             np.nan, index=data["A"].index, columns=["A", "B"], dtype=float,
         )

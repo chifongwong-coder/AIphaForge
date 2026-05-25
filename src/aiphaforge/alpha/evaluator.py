@@ -203,6 +203,16 @@ class AlphaScreener:
     def _check_columns(
         factor: pd.DataFrame, prices: pd.DataFrame,
     ) -> None:
+        if not isinstance(factor, pd.DataFrame):
+            raise TypeError(
+                f"factor must be pd.DataFrame for column alignment "
+                f"checking; got {type(factor).__name__}"
+            )
+        if not isinstance(prices, pd.DataFrame):
+            raise TypeError(
+                f"prices must be pd.DataFrame for column alignment "
+                f"checking; got {type(prices).__name__}"
+            )
         if factor.columns.equals(prices.columns):
             return
         f_set = set(factor.columns)

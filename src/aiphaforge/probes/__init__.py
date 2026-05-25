@@ -15,6 +15,18 @@ responsibility.
 
 The engine never calls LLMs. Users run their LLM externally and submit
 typed answers / hook-driven decisions back into the probe runners.
+
+Test-internal helpers (subject to change without notice)
+---------------------------------------------------------
+
+The following ``_``-prefixed helpers under ``aiphaforge.probes`` are
+test-internal and may be renamed, restructured, or removed without a
+deprecation cycle. Downstream code outside the ``probes`` subpackage
+and the test suite MUST NOT import them.
+
+* ``aiphaforge.probes._hash_utils._canonical_json``
+* ``aiphaforge.probes.scoring._normalize_choice``
+* ``aiphaforge.probes.abtest._serialize_collision_examples``
 """
 
 from aiphaforge.probes._continuation import (

@@ -14,22 +14,7 @@ import pytest
 
 from aiphaforge import BacktestEngine, MaxDrawdownHalt
 from aiphaforge.risk import BaseRiskManager, CompositeRiskManager
-
-
-def _make_data(n: int = 30) -> pd.DataFrame:
-    rng = np.random.default_rng(0)
-    rets = rng.normal(0, 0.01, size=n)
-    close = 100.0 * np.exp(np.cumsum(rets))
-    return pd.DataFrame(
-        {
-            "open": close,
-            "high": close * 1.01,
-            "low": close * 0.99,
-            "close": close,
-            "volume": np.full(n, 1_000_000.0),
-        },
-        index=pd.bdate_range("2024-01-01", periods=n),
-    )
+from tests._helpers.ohlcv import make_ohlcv
 
 
 class TestCompositeIsBaseRiskManager:
@@ -65,7 +50,7 @@ class TestEngineAcceptsBothRoutes:
             risk_manager=crm,
         )
         # If we got here, __init__ didn't blow up.
-        data = _make_data()
+        data = make_ohlcv(periods=30)
         signals = pd.Series(np.nan, index=data.index, dtype=float)
         signals.iloc[5] = 1.0
         eng.set_signals(signals)
@@ -80,7 +65,7 @@ class TestEngineAcceptsBothRoutes:
             risk_rules=CompositeRiskManager(
                 rules=[MaxDrawdownHalt(max_drawdown=0.5)]),
         )
-        data = _make_data()
+        data = make_ohlcv(periods=30)
         signals = pd.Series(np.nan, index=data.index, dtype=float)
         signals.iloc[5] = 1.0
         eng.set_signals(signals)

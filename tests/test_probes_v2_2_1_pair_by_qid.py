@@ -1,9 +1,6 @@
 """v2.2.1 #5 — Pair real/anchor scores by question_id with soft warning."""
 from __future__ import annotations
 
-import numpy as np
-import pandas as pd
-
 from aiphaforge.probes.anchors import build_synthetic_anchor
 from aiphaforge.probes.models import (
     AnswerRecord,
@@ -19,6 +16,7 @@ from aiphaforge.probes.questions import (
     DEFAULT_TEMPLATES,
     KnowledgeProbe,
 )
+from tests._helpers.ohlcv import make_ohlcv
 
 
 def _empty_template_aggregate():
@@ -121,20 +119,6 @@ def _provider_config():
     }
 
 
-def _make_data(n: int = 30) -> pd.DataFrame:
-    rng = np.random.default_rng(0)
-    rets = rng.normal(0.0, 0.01, n)
-    closes = 100.0 * np.exp(np.cumsum(rets))
-    return pd.DataFrame(
-        {
-            "open": closes, "high": closes * 1.01,
-            "low": closes * 0.99, "close": closes,
-            "volume": [1e6] * n,
-        },
-        index=pd.bdate_range("2024-01-01", periods=n),
-    )
-
-
 def _build_perfect_attested(question_set):
     return AttestedAnswers(
         answers=tuple(
@@ -182,7 +166,7 @@ class TestPairingFailedTag:
             orch_mod, "_pair_scores_by_question_id", _empty_pairs,
         )
 
-        data = _make_data()
+        data = make_ohlcv(periods=30)
         probe = KnowledgeProbe(
             symbol="AAPL", templates=DEFAULT_TEMPLATES,
         )
@@ -219,7 +203,7 @@ class TestKnowledgeCheckPairByQid:
         # construction (same probe config + same anchors). The
         # qid-based pairing should produce identical results to
         # position-based here, but the contract is now qid-based.
-        data = _make_data()
+        data = make_ohlcv(periods=30)
         probe = KnowledgeProbe(
             symbol="AAPL", templates=DEFAULT_TEMPLATES,
         )

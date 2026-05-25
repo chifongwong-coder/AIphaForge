@@ -50,7 +50,7 @@ def test_invalid_period_raises():
         RSIIncremental(period=0)
 
 
-# Seed-transition cliff: bars period-1, period, period+1 vs v2.4
+# Seed-transition cliff: bars period-2, period-1, period vs v2.4
 # RSIFactor. This is the cliff where SMA seed completes and the
 # recursive Wilder formula starts. Most likely drift point.
 

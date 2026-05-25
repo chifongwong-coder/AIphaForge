@@ -66,3 +66,50 @@ v2.8.2 Commit F ships:
 When v2.8.5 ships the tightener, this file is updated with:
 - Final allowlist constants (sourced from typing + __future__).
 - Removal date for the documentation-test pin.
+
+## v2.8.5 ship (post-merge fill at release)
+
+Tightener landed in commit J of v2.8.5. The audit-script results at
+release time and the in-test allowlist now match exactly.
+
+### Allowlist constants (source-of-truth)
+
+`tests/_helpers/reverse_lock_audit.py::_TYPING_ORIGIN_MODULES`
+unioned with `{_FUTURE_MODULE}`:
+
+| Module | Origin of |
+|---|---|
+| `typing` | `Dict`, `List`, `Optional`, `Tuple`, ... |
+| `typing_extensions` | back-ported PEP 612/646 surfaces |
+| `collections.abc` | `Iterable`, `Mapping`, `Sequence`, ... |
+| `_collections_abc` | CPython internal mirror of the above |
+| `__future__` | `annotations` |
+
+The same set is duplicated as `_ALLOWED_FOREIGN_ORIGINS` in
+`tests/test_v2_8_public_api_lock.py`. The lockstep is asserted by
+`test_reverse_lock_allowlist_matches_audit_script`.
+
+### Audit snapshot at release time
+
+```
+total_flagged: 205
+by_category:
+  typing_generics: 176
+  future_imports:  29
+  other:           0
+```
+
+A regression guard test
+(`test_reverse_lock_other_category_remains_zero`) keeps the "other"
+bucket at zero — any non-typing / non-future foreign-origin symbol
+surfacing means a real accidentally-public surface that needs a `_`
+prefix or an `__all__` entry.
+
+### v2.8.2 documentation-test pin removed
+
+`test_reverse_lock_currently_passes_foreign_class_instances` (in
+`tests/test_v2_8_2_deferred_test_hardening.py`) was the documentation
+pin that recorded the v2.8.1 rule-2 blind spot. v2.8.5 Commit J
+removes the pin since the tightener now actively catches the
+foreign-class-instance shape via the
+`inspect.isclass / inspect.isfunction` predicate.

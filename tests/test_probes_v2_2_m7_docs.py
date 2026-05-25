@@ -3,15 +3,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import numpy as np
-import pandas as pd
-
 from aiphaforge.probes.models import AnswerRecord, AttestedAnswers
 from aiphaforge.probes.orchestrator import knowledge_check
 from aiphaforge.probes.questions import (
     DEFAULT_TEMPLATES,
     KnowledgeProbe,
 )
+from tests._helpers.ohlcv import make_ohlcv
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 README = REPO_ROOT / "README.md"
@@ -65,23 +63,9 @@ def _provider_config(**overrides):
     return base
 
 
-def _make_data(n: int = 30) -> pd.DataFrame:
-    rng = np.random.default_rng(0)
-    rets = rng.normal(0.0, 0.01, n)
-    closes = 100.0 * np.exp(np.cumsum(rets))
-    return pd.DataFrame(
-        {
-            "open": closes, "high": closes * 1.01,
-            "low": closes * 0.99, "close": closes,
-            "volume": [1e6] * n,
-        },
-        index=pd.bdate_range("2024-01-01", periods=n),
-    )
-
-
 class TestReportCarriesWarning:
     def test_notes_carry_non_transitivity_warning(self):
-        data = _make_data()
+        data = make_ohlcv(periods=30)
         probe = KnowledgeProbe(
             symbol="AAPL", templates=DEFAULT_TEMPLATES,
         )
@@ -114,7 +98,7 @@ class TestReportCarriesWarning:
 
 class TestVersion:
     def test_version_is_current_release(self):
-        # Updated by v2.8.4 patch bump (M11+M11b+M12+M13+M14+M15 —
-        # UX + API hygiene).
+        # Updated by v2.8.5 patch bump (L1-L7 + reverse-lock — test
+        # hygiene + factor LOW patches).
         import aiphaforge
-        assert aiphaforge.__version__ == "2.8.4"
+        assert aiphaforge.__version__ == "2.8.5"

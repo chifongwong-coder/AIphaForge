@@ -113,63 +113,16 @@ def test_h6_tango_paired_diff_ci_deprecation_warning_originates_outside_aiphafor
 
 
 # --------------------------------------------------------------------
-# TestRev-3-doc — reverse-lock escape hatch (documented limitation)
+# TestRev-3-doc — REMOVED in v2.8.5 Commit J.
+#
+# The v2.8.2-era pin ``test_reverse_lock_currently_passes_foreign_class_instances``
+# documented the rule-2 blind spot (instances of foreign classes
+# silently skipped). v2.8.5 Commit J ships the tightener
+# (``inspect.isclass`` / ``isfunction`` predicate + typing/future
+# allowlist), so the pin no longer applies. See
+# ``tests/test_v2_8_public_api_lock.py::test_reverse_lock_other_category_remains_zero``
+# for the new regression guard.
 # --------------------------------------------------------------------
-
-def test_reverse_lock_currently_passes_foreign_class_instances():
-    """Pin the v2.8.1 reverse-lock skip rule's blind spot.
-
-    The reverse-lock contract is: every public module attribute
-    (not in ``__all__``) must be either a class, function, or
-    submodule defined inside aiphaforge. The v2.8.1 implementation
-    enforces this with a coarse ``val.__module__`` check, which has
-    one false-negative shape: an INSTANCE of a foreign class
-    (``__module__`` reports the foreign class's module, not
-    ``None``), so it is silently skipped instead of flagged. The
-    risk is a public-named attribute like ``LEAKED_INSTANCE =
-    datetime(2024, 1, 1)`` slipping through the lock as a
-    side-channel public API the project never intended.
-
-    This pin documents the blind spot rather than the cure. v2.8.5
-    will tighten the skip rule to ``inspect.isclass(val) or
-    inspect.isfunction(val)`` with a typing-generics allowlist
-    (see ``tests/_helpers/reverse_lock_allowlist.md`` for the
-    audit findings). When that tightening ships, flip the
-    assertion below and remove this pin.
-    """
-    from datetime import datetime
-
-    # Simulate the escape-hatch case: a public-named module attribute
-    # that is an instance of a foreign class. Use a stub module so we
-    # don't actually mutate a real aiphaforge module.
-    class _StubModule:
-        __all__ = ["KNOWN_EXPORT"]
-        KNOWN_EXPORT = 1  # in __all__, fine
-        LEAKED_INSTANCE = datetime(2024, 1, 1)  # foreign instance, not in __all__
-
-    # Apply the v2.8.1 skip rules manually (declared = the __all__
-    # set; the loop traces the skip-rule flow that today's lock uses):
-    for name in dir(_StubModule):
-        if name.startswith("_"):
-            continue
-        val = getattr(_StubModule, name)
-        if inspect.ismodule(val):
-            continue
-        origin = getattr(val, "__module__", None)
-        if origin is not None and origin != "_StubModule":
-            continue  # ← LEAKED_INSTANCE skipped here (datetime.__module__='datetime')
-        if origin is None and isinstance(val, (bool, int, float, str)):
-            continue
-        # Anything reaching here would be flagged by the lock.
-    # The pin: LEAKED_INSTANCE is NOT caught by today's rule.
-    # If a future tightening catches it, this assertion fails and the
-    # maintainer is reminded to remove this pin.
-    leaked_origin = type(_StubModule.LEAKED_INSTANCE).__module__
-    assert leaked_origin == "datetime", (
-        "datetime's __module__ should be 'datetime'; if Python changed "
-        "this, the v2.8.5 reverse-lock tightening assumptions need "
-        "review."
-    )
 
 
 # --------------------------------------------------------------------
