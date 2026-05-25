@@ -169,6 +169,24 @@ class TestAlphaScreenerColumnAlignment:
         with pytest.raises(ValueError, match="do not match"):
             AlphaScreener().evaluate(prices, prices_other)
 
+    def test_check_columns_rejects_series_factor_with_typeerror(self):
+        """v2.8.5 L6: a Series passed where a DataFrame is required
+        must raise TypeError that names the offending argument and
+        the actual type. Pre-v2.8.5 this was AttributeError leaked
+        from the .columns accessor — an accidental implementation
+        artifact, not a documented contract."""
+        prices = _prices(periods=5)
+        factor = pd.Series([1.0, 2.0, 3.0, 4.0, 5.0])
+        with pytest.raises(TypeError, match="factor must be pd.DataFrame"):
+            AlphaScreener._check_columns(factor, prices)
+
+    def test_check_columns_rejects_series_prices_with_typeerror(self):
+        """v2.8.5 L6: symmetric guard on the prices argument."""
+        factor = _prices(periods=5)
+        prices = pd.Series([100.0, 101.0, 102.0, 103.0, 104.0])
+        with pytest.raises(TypeError, match="prices must be pd.DataFrame"):
+            AlphaScreener._check_columns(factor, prices)
+
 
 class TestAlphaScreenerR11Firewall:
     def test_alpha_screener_no_engine_or_execution_imports(self):
