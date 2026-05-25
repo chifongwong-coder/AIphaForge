@@ -21,23 +21,7 @@ from aiphaforge import (
     BacktestHook,
     LifecycleContext,
 )
-
-
-def _make_data(n: int = 30, seed: int = 0) -> pd.DataFrame:
-    rng = np.random.default_rng(seed)
-    rets = rng.normal(0, 0.01, size=n)
-    close = 100.0 * np.exp(np.cumsum(rets))
-    df = pd.DataFrame(
-        {
-            "open": close,
-            "high": close * 1.01,
-            "low": close * 0.99,
-            "close": close,
-            "volume": np.full(n, 1_000_000.0),
-        },
-        index=pd.bdate_range("2024-01-01", periods=n),
-    )
-    return df
+from tests._helpers.ohlcv import make_ohlcv
 
 
 class _RecordingHook(BacktestHook):
@@ -68,7 +52,7 @@ class _LegacyHook(BacktestHook):
 
 def test_lifecycle_fires_once_single_asset():
     hook = _RecordingHook()
-    data = _make_data()
+    data = make_ohlcv(periods=30)
     signals = pd.Series(np.nan, index=data.index, dtype=float)
     signals.iloc[5] = 1.0
     eng = BacktestEngine(mode="event_driven", hooks=[hook])
@@ -88,8 +72,8 @@ def test_lifecycle_fires_once_single_asset():
 
 def test_lifecycle_fires_once_multi_asset():
     hook = _RecordingHook()
-    data_a = _make_data(seed=1)
-    data_b = _make_data(seed=2)
+    data_a = make_ohlcv(periods=30, seed=1)
+    data_b = make_ohlcv(periods=30, seed=2)
     signals_a = pd.Series(np.nan, index=data_a.index, dtype=float)
     signals_b = pd.Series(np.nan, index=data_b.index, dtype=float)
     signals_a.iloc[5] = 1.0
@@ -107,7 +91,7 @@ def test_lifecycle_fires_once_multi_asset():
 
 def test_legacy_signature_still_works_with_warning():
     hook = _LegacyHook()
-    data = _make_data()
+    data = make_ohlcv(periods=30)
     signals = pd.Series(np.nan, index=data.index, dtype=float)
     signals.iloc[5] = 1.0
     eng = BacktestEngine(mode="event_driven", hooks=[hook])
@@ -144,7 +128,7 @@ def test_legacy_deprecation_warning_emitted_once_per_subclass():
 
     hook1 = _Once()
     hook2 = _Once()
-    data = _make_data()
+    data = make_ohlcv(periods=30)
     signals = pd.Series(np.nan, index=data.index, dtype=float)
     signals.iloc[5] = 1.0
 
@@ -176,7 +160,7 @@ def test_legacy_deprecation_warning_emitted_once_per_subclass():
 
 def test_vectorized_lifecycle_fires_once_single_asset():
     hook = _RecordingHook()
-    data = _make_data()
+    data = make_ohlcv(periods=30)
     signals = pd.Series(np.nan, index=data.index, dtype=float)
     signals.iloc[5] = 1.0
     eng = BacktestEngine(mode="vectorized", hooks=[hook])
@@ -189,8 +173,8 @@ def test_vectorized_lifecycle_fires_once_single_asset():
 
 def test_vectorized_lifecycle_fires_once_multi_asset():
     hook = _RecordingHook()
-    data_a = _make_data(seed=1)
-    data_b = _make_data(seed=2)
+    data_a = make_ohlcv(periods=30, seed=1)
+    data_b = make_ohlcv(periods=30, seed=2)
     signals_a = pd.Series(np.nan, index=data_a.index, dtype=float)
     signals_b = pd.Series(np.nan, index=data_b.index, dtype=float)
     signals_a.iloc[5] = 1.0
@@ -228,7 +212,7 @@ def test_event_driven_end_hook_fires_on_mid_loop_exception():
             self.end_calls += 1
 
     hook = _CrashingHook()
-    data = _make_data()
+    data = make_ohlcv(periods=30)
     signals = pd.Series(np.nan, index=data.index, dtype=float)
     signals.iloc[1] = 1.0
     eng = BacktestEngine(mode="event_driven", hooks=[hook])
@@ -277,7 +261,7 @@ def test_event_driven_end_hook_fires_for_all_hooks_when_one_raises():
     passive_before = _PassiveHook()
     passive_after = _PassiveHook()
 
-    data = _make_data()
+    data = make_ohlcv(periods=30)
     signals = pd.Series(np.nan, index=data.index, dtype=float)
     signals.iloc[1] = 1.0
     eng = BacktestEngine(
@@ -318,7 +302,7 @@ def test_event_driven_end_hook_exception_does_not_mask_primary():
         def on_backtest_end(self, ctx: LifecycleContext) -> None:
             raise ValueError("END_HOOK_CRASH")
 
-    data = _make_data()
+    data = make_ohlcv(periods=30)
     signals = pd.Series(np.nan, index=data.index, dtype=float)
     signals.iloc[1] = 1.0
     eng = BacktestEngine(mode="event_driven", hooks=[_DoubleCrashHook()])
@@ -343,7 +327,7 @@ def test_event_driven_end_hook_exception_in_success_path_propagates():
         def on_backtest_end(self, ctx: LifecycleContext) -> None:
             raise RuntimeError("END_HOOK_BUG_VISIBLE")
 
-    data = _make_data()
+    data = make_ohlcv(periods=30)
     signals = pd.Series(np.nan, index=data.index, dtype=float)
     signals.iloc[1] = 1.0
     signals.iloc[8] = 0.0
@@ -361,7 +345,7 @@ def test_vectorized_end_hook_exception_in_success_path_propagates():
             raise RuntimeError("VEC_END_HOOK_BUG_VISIBLE")
 
     from aiphaforge.fees import ZeroFeeModel
-    data = _make_data()
+    data = make_ohlcv(periods=30)
     signals = pd.Series(np.nan, index=data.index, dtype=float)
     signals.iloc[1] = 1.0
     signals.iloc[8] = 0.0
@@ -390,7 +374,7 @@ def test_event_driven_end_hook_does_NOT_fire_when_start_raises():
             self.end_calls += 1
 
     hook = _CrashingStartHook()
-    data = _make_data()
+    data = make_ohlcv(periods=30)
     signals = pd.Series(np.nan, index=data.index, dtype=float)
     signals.iloc[1] = 1.0
     eng = BacktestEngine(mode="event_driven", hooks=[hook])
@@ -403,7 +387,7 @@ def test_event_driven_end_hook_does_NOT_fire_when_start_raises():
 @pytest.mark.parametrize("phase", ["start", "end"])
 def test_lifecycle_context_provides_data_dict(phase):
     hook = _RecordingHook()
-    data = _make_data()
+    data = make_ohlcv(periods=30)
     signals = pd.Series(np.nan, index=data.index, dtype=float)
     signals.iloc[5] = 1.0
     eng = BacktestEngine(mode="event_driven", hooks=[hook])

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import logging
 
-import numpy as np
 import pandas as pd
 import pytest
 
@@ -12,6 +11,7 @@ from aiphaforge.strategies import (
     BaseStrategy,
     _resolve_child_signals,
 )
+from tests._helpers.ohlcv import make_ohlcv
 
 
 @pytest.fixture(autouse=True)
@@ -22,18 +22,6 @@ def _clear_fallback_state():
     _FALLBACK_WARNED.clear()
     yield
     _FALLBACK_WARNED.clear()
-
-
-def _ohlcv(periods: int = 30, seed: int = 0) -> pd.DataFrame:
-    rng = np.random.default_rng(seed)
-    closes = 100.0 * np.exp(np.cumsum(rng.normal(0.0, 0.01, periods)))
-    return pd.DataFrame(
-        {
-            "open": closes, "high": closes * 1.01, "low": closes * 0.99,
-            "close": closes, "volume": [1e6] * periods,
-        },
-        index=pd.bdate_range("2024-01-01", periods=periods),
-    )
 
 
 class _ModernChild(BaseStrategy):
@@ -74,14 +62,14 @@ class _Composite:
 
 class TestAutoMode:
     def test_resolve_auto_uses_generate_signals_for_modern_child(self):
-        df = _ohlcv()
+        df = make_ohlcv(periods=30)
         out = _resolve_child_signals(
             _Composite, _ModernChild(), df, mode="auto",
         )
         assert (out == 1.0).all()
 
     def test_resolve_auto_falls_back_to_compute_on_exception_single_asset(self):
-        df = _ohlcv()
+        df = make_ohlcv(periods=30)
         out = _resolve_child_signals(
             _Composite, _BrokenModernChild(), df, mode="auto",
         )
@@ -89,7 +77,7 @@ class TestAutoMode:
         assert (out == 0.0).all()
 
     def test_resolve_auto_raises_on_multi_asset_fallback_attempt(self):
-        data = {"A": _ohlcv(seed=1), "B": _ohlcv(seed=2)}
+        data = {"A": make_ohlcv(periods=30, seed=1), "B": make_ohlcv(periods=30, seed=2)}
         with pytest.raises(ValueError, match="multi-asset"):
             _resolve_child_signals(
                 _Composite, _BrokenModernChild(), data, mode="auto",
@@ -98,7 +86,7 @@ class TestAutoMode:
 
 class TestGenerateSignalsMode:
     def test_resolve_generate_signals_propagates_child_exceptions(self):
-        df = _ohlcv()
+        df = make_ohlcv(periods=30)
         with pytest.raises(KeyError, match="close"):
             _resolve_child_signals(
                 _Composite, _BrokenModernChild(), df, mode="generate_signals",
@@ -107,7 +95,7 @@ class TestGenerateSignalsMode:
 
 class TestLegacyComputeMode:
     def test_resolve_legacy_compute_rejects_multi_asset_data(self):
-        data = {"A": _ohlcv(seed=1)}
+        data = {"A": make_ohlcv(periods=30, seed=1)}
         with pytest.raises(TypeError, match="legacy_compute"):
             _resolve_child_signals(
                 _Composite, _LegacyChild(), data, mode="legacy_compute",
@@ -116,7 +104,7 @@ class TestLegacyComputeMode:
 
 class TestFallbackWarningPolicy:
     def test_resolve_auto_first_fallback_logs_warning(self, caplog):
-        df = _ohlcv()
+        df = make_ohlcv(periods=30)
         with caplog.at_level(logging.WARNING, logger="aiphaforge.strategies"):
             _resolve_child_signals(
                 _Composite, _BrokenModernChild(), df, mode="auto",
@@ -132,7 +120,7 @@ class TestFallbackWarningPolicy:
         )
 
     def test_resolve_auto_repeat_fallback_drops_to_debug(self, caplog):
-        df = _ohlcv()
+        df = make_ohlcv(periods=30)
         child = _BrokenModernChild()
         # First call: WARNING.
         with caplog.at_level(logging.DEBUG, logger="aiphaforge.strategies"):

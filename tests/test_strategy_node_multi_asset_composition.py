@@ -6,7 +6,6 @@ composites under the v2.5 generate_signals dispatch.
 """
 from __future__ import annotations
 
-import numpy as np
 import pandas as pd
 import pytest
 
@@ -19,6 +18,7 @@ from aiphaforge.strategies import (
     SelectBest,
     WeightedBlend,
 )
+from tests._helpers.ohlcv import make_ohlcv
 
 
 @pytest.fixture(autouse=True)
@@ -28,20 +28,8 @@ def _clear_fallback_state():
     _FALLBACK_WARNED.clear()
 
 
-def _ohlcv(periods=60, seed=0):
-    rng = np.random.default_rng(seed)
-    closes = 100.0 * np.exp(np.cumsum(rng.normal(0.0, 0.01, periods)))
-    return pd.DataFrame(
-        {
-            "open": closes, "high": closes * 1.01, "low": closes * 0.99,
-            "close": closes, "volume": [1e6] * periods,
-        },
-        index=pd.bdate_range("2024-01-01", periods=periods),
-    )
-
-
 def _multi_data(symbols=4, periods=60):
-    return {f"S{i}": _ohlcv(periods=periods, seed=i + 1)
+    return {f"S{i}": make_ohlcv(periods=periods, seed=i + 1)
             for i in range(symbols)}
 
 
@@ -92,7 +80,7 @@ def test_select_best_with_two_cross_sectional_strategies():
 
 
 def test_priority_cascade_with_pairs_trading_in_modern_mode():
-    data = {"A": _ohlcv(seed=1), "B": _ohlcv(seed=2)}
+    data = {"A": make_ohlcv(seed=1), "B": make_ohlcv(seed=2)}
     comp = PriorityCascade(
         children=[
             PairsTrading(window=20, entry_z=2.0, exit_z=0.5),

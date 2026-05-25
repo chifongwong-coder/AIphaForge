@@ -18,25 +18,13 @@ from aiphaforge.signal_rules import (
     CrossSectionalQuantileRule,
     ThresholdScoreRule,
 )
-
-
-def _ohlcv(periods: int = 60, seed: int = 0) -> pd.DataFrame:
-    rng = np.random.default_rng(seed)
-    closes = 100.0 * np.exp(np.cumsum(rng.normal(0.0, 0.01, periods)))
-    return pd.DataFrame(
-        {
-            "open": closes, "high": closes * 1.01, "low": closes * 0.99,
-            "close": closes,
-            "volume": [1e6] * periods,
-        },
-        index=pd.bdate_range("2024-01-01", periods=periods),
-    )
+from tests._helpers.ohlcv import make_ohlcv
 
 
 def _multi(symbols: int = 4, periods: int = 60, seed: int = 0):
     rng = np.random.default_rng(seed)
     return {
-        f"S{i}": _ohlcv(
+        f"S{i}": make_ohlcv(
             periods=periods, seed=int(rng.integers(0, 10000)),
         )
         for i in range(symbols)
@@ -45,7 +33,7 @@ def _multi(symbols: int = 4, periods: int = 60, seed: int = 0):
 
 class TestFactorRuleStrategySingleAsset:
     def test_single_asset_round_trip(self):
-        data = _ohlcv()
+        data = make_ohlcv()
         rule = ThresholdScoreRule(long_threshold=70, short_threshold=30)
         strategy = FactorRuleStrategy(factor=RSIFactor(period=14), rule=rule)
         out = strategy.generate_signals(data)
@@ -66,7 +54,7 @@ class TestFactorRuleStrategyMultiAsset:
 
 class TestFactorRuleStrategyComputeFactors:
     def test_compute_factors_returns_single_factor_factor_set(self):
-        data = _ohlcv()
+        data = make_ohlcv()
         strategy = FactorRuleStrategy(
             factor=RSIFactor(period=14),
             rule=ThresholdScoreRule(long_threshold=70, short_threshold=30),
@@ -79,7 +67,7 @@ class TestFactorRuleStrategyComputeFactors:
 
 class TestFactorRuleStrategyEngineIntegration:
     def test_engine_can_run_factor_rule_strategy(self):
-        data = _ohlcv()
+        data = make_ohlcv()
         strategy = FactorRuleStrategy(
             factor=MomentumFactor(window=10),
             rule=ThresholdScoreRule(
@@ -94,7 +82,7 @@ class TestFactorRuleStrategyEngineIntegration:
 
 class TestFactorRuleStrategyNoLookahead:
     def test_no_lookahead_via_diagnostics(self):
-        data = _ohlcv()
+        data = make_ohlcv()
         strategy = FactorRuleStrategy(
             factor=MomentumFactor(window=10),
             rule=ThresholdScoreRule(

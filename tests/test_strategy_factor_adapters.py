@@ -17,24 +17,13 @@ from aiphaforge.strategies import (
     WeightedBlend,
 )
 from aiphaforge.strategy_factors import extract_strategy_factors
-
-
-def _ohlcv(periods: int = 60, seed: int = 0) -> pd.DataFrame:
-    rng = np.random.default_rng(seed)
-    closes = 100.0 * np.exp(np.cumsum(rng.normal(0.0, 0.01, periods)))
-    return pd.DataFrame(
-        {
-            "open": closes, "high": closes * 1.01, "low": closes * 0.99,
-            "close": closes, "volume": [1e6] * periods,
-        },
-        index=pd.bdate_range("2024-01-01", periods=periods),
-    )
+from tests._helpers.ohlcv import make_ohlcv
 
 
 def _multi(symbols: int = 4, periods: int = 60, seed: int = 0):
     rng = np.random.default_rng(seed)
     return {
-        f"S{i}": _ohlcv(periods=periods, seed=int(rng.integers(0, 9999)))
+        f"S{i}": make_ohlcv(periods=periods, seed=int(rng.integers(0, 9999)))
         for i in range(symbols)
     }
 
@@ -46,7 +35,7 @@ def _multi(symbols: int = 4, periods: int = 60, seed: int = 0):
 
 class TestPerStrategyAdapters:
     def test_ma_crossover_adapter(self):
-        data = _ohlcv()
+        data = make_ohlcv()
         strat = MACrossover(short=5, long=20)
         before = strat.generate_signals(data).copy()
         fs = extract_strategy_factors(strat, data)
@@ -56,13 +45,13 @@ class TestPerStrategyAdapters:
         pd.testing.assert_series_equal(before, after, check_names=False)
 
     def test_rsi_adapter(self):
-        data = _ohlcv()
+        data = make_ohlcv()
         strat = RSIMeanReversion(period=14)
         fs = extract_strategy_factors(strat, data)
         assert "rsi" in fs.values
 
     def test_vwap_adapter(self):
-        data = _ohlcv()
+        data = make_ohlcv()
         strat = VWAPReversion()
         fs = extract_strategy_factors(strat, data)
         assert {"vwap", "vwap_distance"} <= set(fs.values.keys())
@@ -76,7 +65,7 @@ class TestPerStrategyAdapters:
         assert set(fs.values["roc"].columns) == set(data.keys())
 
     def test_pairs_adapter(self):
-        data = {"A": _ohlcv(seed=1), "B": _ohlcv(seed=2)}
+        data = {"A": make_ohlcv(seed=1), "B": make_ohlcv(seed=2)}
         strat = PairsTrading(window=20, entry_z=2.0, exit_z=0.5)
         fs = extract_strategy_factors(strat, data)
         assert {"spread", "spread_zscore"} <= set(fs.values.keys())
@@ -93,7 +82,7 @@ class TestDispatchSemantics:
         class MyMA(MACrossover):
             pass
 
-        data = _ohlcv()
+        data = make_ohlcv()
         strat = MyMA(short=5, long=20)
         fs = extract_strategy_factors(strat, data)
         assert "ma_spread" in fs.values
@@ -102,7 +91,7 @@ class TestDispatchSemantics:
         # WeightedBlend is a StrategyNode composite; adapter
         # explicitly returns FactorSet.empty(), no recursion into
         # children.
-        data = _ohlcv()
+        data = make_ohlcv()
         composite = WeightedBlend(
             children=[MACrossover(short=5, long=20)],
             weights=[1.0],
@@ -115,7 +104,7 @@ class TestDispatchSemantics:
     def test_extract_uses_current_params_not_history(self):
         # Snapshot-semantic contract: changing strategy params
         # via update_params(...) changes the extracted factors.
-        data = _ohlcv()
+        data = make_ohlcv()
         strat = MACrossover(short=5, long=20)
         fs1 = extract_strategy_factors(strat, data)
         ma_short_before = fs1.values["ma_short"]["_default"]
@@ -135,7 +124,7 @@ class TestDispatchSemantics:
             def generate_signals(self, data):
                 return pd.Series(dtype=float)
 
-        fs = extract_strategy_factors(MyMLStrategy(), _ohlcv())
+        fs = extract_strategy_factors(MyMLStrategy(), make_ohlcv())
         assert fs.values == {}
 
 
