@@ -14,6 +14,7 @@ import pandas as pd
 from .fees import BaseFeeModel, SimpleFeeModel
 from .orders import Order, OrderManager, OrderSide, OrderType, should_fill_limit, should_trigger_stop
 from .portfolio import Portfolio
+from .spread import BaseSpreadModel
 
 # v2.8: public surface lock.
 __all__ = [
@@ -72,7 +73,7 @@ class Broker:
         immediate_fill_price: str = "close",
         assigned_symbol: Optional[str] = None,
         settlement: str = "t+0",
-        spread_model: Optional[object] = None,
+        spread_model: Optional[BaseSpreadModel] = None,
     ):
         self.fee_model = fee_model or SimpleFeeModel()
         self.fill_model = fill_model
@@ -724,7 +725,7 @@ class Broker:
 
         # Apply market impact (v1.9.4)
         impact_active = self._impact_model is not None and self._adv > 0
-        if impact_active:
+        if self._impact_model is not None and self._adv > 0:
             impact = self._impact_model.estimate_impact(
                 size, adjusted_price, self._adv, self._volatility)
             if order.is_buy:
