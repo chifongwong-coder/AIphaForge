@@ -43,6 +43,7 @@ from .utils import (
     calculate_trade_metrics,
     compute_buy_and_hold,
     ensure_datetime_index,
+    infer_bars_per_year,
     validate_ohlcv,
 )
 from .utils import (
@@ -104,6 +105,16 @@ class BacktestEngine:
     """
     Backtest engine supporting vectorized and event-driven execution modes.
 
+    Modeling boundary — session gaps: rolling indicators and the
+    bar-by-bar simulation treat overnight and lunch-break gaps as
+    adjacent bars. Fill prices stay realistic (gaps fill at the next
+    open); the distortion is confined to rolling windows spanning
+    sessions. For intraday realism see ``settlement="t+1"`` (fill-time
+    enforcement; clamp-and-expire approximates broker-side whole-order
+    rejection; pair with ``allow_short=False`` for cash A-share) and
+    the spread models in ``aiphaforge.spread`` (passive limit fills
+    pay up to the half-spread, never worse than their limit).
+
     Parameters:
         fee_model: Fee model instance.
         initial_capital: Starting capital.
@@ -121,6 +132,17 @@ class BacktestEngine:
         agent_enabled_strategies: Agent-controlled strategy enable states.
         hooks: List of backtest hooks (optional).
         include_benchmark: Whether to compute buy-and-hold benchmark.
+        settlement: "t+0" (default) or "t+1" — shares bought today
+            cannot be sold the same calendar day (SSE/SZSE cash-equity
+            rule; event-driven only, vectorized raises). Pair with
+            allow_short=False for cash A-share realism.
+        asset_settlements: Per-symbol settlement overrides.
+        spread_model: Bid-ask spread model (see aiphaforge.spread).
+            Event-driven honors any model; vectorized folds a global
+            FixedSpread into the cost approximation and ignores other
+            shapes with a per-run warning.
+        asset_spread_models: Per-symbol spread-model overrides
+            (event-driven only).
 
     Example:
         >>> engine = BacktestEngine(
@@ -178,6 +200,10 @@ class BacktestEngine:
         portfolio_trading_days: Optional[int] = None,
         representative_notional: Optional[float] = None,
         representative_size: Optional[float] = None,
+        settlement: str = "t+0",
+        asset_settlements: Optional[Dict[str, str]] = None,
+        spread_model=None,
+        asset_spread_models: Optional[Dict] = None,
     ):
         # Fee model
         if isinstance(fee_model, str):
@@ -325,6 +351,32 @@ class BacktestEngine:
                 raise ValueError(
                     f"max_position_pct for '{sym}' must be in (0, 1.0], "
                     f"got {pct}")
+
+        # v2.8.6: settlement constraint ("t+0" or "t+1").
+        # T+1 is an exchange-level rule (SSE/SZSE cash equities): shares
+        # bought today cannot be sold the same calendar day. It applies
+        # to all participants, so it is a market-microstructure config,
+        # not an account attribute. Note t+1 does NOT imply no-shorting;
+        # pass allow_short=False as well for cash A-share realism.
+        _valid_settlements = ("t+0", "t+1")
+        if settlement not in _valid_settlements:
+            raise ValueError(
+                f"settlement must be one of {_valid_settlements}, "
+                f"got {settlement!r}")
+        self.settlement = settlement
+        self.asset_settlements: Dict[str, str] = asset_settlements or {}
+        for sym, stl in self.asset_settlements.items():
+            if stl not in _valid_settlements:
+                raise ValueError(
+                    f"asset_settlements[{sym!r}] must be one of "
+                    f"{_valid_settlements}, got {stl!r}")
+
+        # v2.8.6: bid-ask spread models (see spread.py). Event-driven
+        # honors any BaseSpreadModel; vectorized folds a global
+        # FixedSpread into the linear cost approximation and ignores
+        # everything else with a per-run warning.
+        self.spread_model = spread_model
+        self.asset_spread_models: Dict = asset_spread_models or {}
 
         # Custom benchmark config defaults
         self._config_benchmark: Optional[pd.Series] = None
@@ -828,6 +880,14 @@ class BacktestEngine:
                     self.trading_days, sorted(data.keys()),
                     portfolio_override=self.portfolio_trading_days_override,
                 )
+            # v2.8.6: per-symbol annualization sanity check.
+            for _sym in sorted(data.keys()):
+                self._warn_annualization_mismatch(
+                    data[_sym].index,
+                    self._resolved_per_asset_td.get(
+                        _sym, self._portfolio_trading_days),
+                    symbol=_sym,
+                )
             return self._run_multi(
                 data, benchmark=benchmark,
                 benchmark_type=benchmark_type, weights=weights,
@@ -849,6 +909,11 @@ class BacktestEngine:
                 self.trading_days, [symbol],
                 portfolio_override=self.portfolio_trading_days_override,
             )
+
+        # v2.8.6: annualization sanity check (warn-only, never
+        # auto-corrects — the inference is a heuristic).
+        self._warn_annualization_mismatch(
+            data.index, self._portfolio_trading_days)
 
         # Generate signals
         signals = self._get_signals(data, symbol=symbol)
@@ -1452,6 +1517,38 @@ class BacktestEngine:
             "to mode='event_driven' for dynamic per-bar allocation."
         )
 
+    def _warn_annualization_mismatch(
+        self,
+        index,
+        trading_days: int,
+        symbol: Optional[str] = None,
+    ) -> None:
+        """v2.8.6: warn when trading_days is far off the bar density.
+
+        ``trading_days`` is bars-per-year throughout this codebase
+        (sqrt(trading_days) Sharpe scaling), so intraday data with the
+        default 252 silently mis-annualizes by an order of magnitude
+        (crypto 1h is ~8760 bars/year). Warn-only beyond a 3x band in
+        either direction; emitted unconditionally at this single call
+        site per run (plain warnings.warn, no once-flags). Never
+        auto-corrects: the density inference is a heuristic and an
+        explicit in-band user value always wins silently.
+        """
+        inferred = infer_bars_per_year(index)
+        if inferred is None or trading_days <= 0:
+            return
+        ratio = inferred / trading_days
+        if ratio >= 3.0 or ratio <= 1.0 / 3.0:
+            where = f" for {symbol!r}" if symbol is not None else ""
+            warnings.warn(
+                f"annualization mismatch{where}: trading_days="
+                f"{trading_days}, but the data's bar density implies "
+                f"~{round(inferred)} bars/year ({ratio:.1f}x off). "
+                f"Sharpe and annualized metrics scale with "
+                f"sqrt(trading_days); pass trading_days="
+                f"{round(inferred)} if the data frequency is intended."
+            )
+
     def _warn_vectorized_max_position_size_partial(self) -> None:
         """v2.8.1 FR-G2 — special message for max_position_size.
 
@@ -1519,6 +1616,27 @@ class BacktestEngine:
                         "switch to mode='event_driven' to honor it."
                     )
 
+        # v2.8.6: spread models — standalone check, NOT part of
+        # _VECTORIZED_UNSUPPORTED_FIELDS: a global FixedSpread IS
+        # honored (folded into the linear cost approximation); only
+        # dynamic models and per-asset overrides are ignored.
+        from .spread import FixedSpread
+        if (self.spread_model is not None
+                and not isinstance(self.spread_model, FixedSpread)):
+            warnings.warn(
+                "vectorized mode folds FixedSpread only; "
+                f"spread_model={type(self.spread_model).__name__} is "
+                "ignored. Switch to mode='event_driven' for dynamic "
+                "spread models."
+            )
+        if self.asset_spread_models:
+            warnings.warn(
+                "vectorized mode cannot fold per-asset spread "
+                "overrides; asset_spread_models is ignored (the global "
+                "FixedSpread, if any, still folds). Switch to "
+                "mode='event_driven' to honor per-asset spreads."
+            )
+
     def _build_config(
         self,
         benchmark: Optional[pd.Series] = None,
@@ -1538,12 +1656,30 @@ class BacktestEngine:
         # are silently dropped today. Surface these explicitly so users
         # don't get misleading "I set X but nothing changed" results.
         if self.mode == ExecutionMode.VECTORIZED:
+            # v2.8.6: T+1 cannot be honored by the vectorized core;
+            # silently ignoring it would yield optimistic results, so
+            # raise instead of warn (any "t+1", global or per-asset).
+            if (self.settlement == "t+1"
+                    or "t+1" in self.asset_settlements.values()):
+                raise ValueError(
+                    "settlement='t+1' is not supported in vectorized "
+                    "mode; use mode='event_driven'")
             self._warn_vectorized_unsupported()
 
         # v2.8.1: resolve representative notional/size for vectorized
         # cost estimation. User-passed engine kwargs win; otherwise
         # derive from the sizer.
         rep_notional, rep_size = self._resolve_representative_trade()
+
+        # v2.8.6: fold a global FixedSpread into the vectorized cost
+        # approximation (one half-spread per side). Assigned
+        # UNCONDITIONALLY on every call so a spread_model mutation
+        # between runs never leaves a stale rate on the shared
+        # DefaultTradeCost instance.
+        from .spread import FixedSpread
+        self._trade_cost.half_spread_rate = (
+            self.spread_model.spread_bps / 2.0 / 1e4
+            if isinstance(self.spread_model, FixedSpread) else 0.0)
 
         return BacktestConfig(
             initial_capital=self.initial_capital,
@@ -1590,6 +1726,10 @@ class BacktestEngine:
             impact_vol_lookback=self.impact_vol_lookback,
             representative_notional=rep_notional,
             representative_size=rep_size,
+            settlement=self.settlement,
+            asset_settlements=self.asset_settlements,
+            spread_model=self.spread_model,
+            asset_spread_models=self.asset_spread_models,
         )
 
     def _resolve_representative_trade(self):
@@ -1699,6 +1839,24 @@ class BacktestEngine:
         # Attach MetaContext audit trail (v1.2)
         if 'meta_audit' in raw and raw['meta_audit']:
             result.metadata['meta_audit'] = raw['meta_audit']
+
+        # v2.8.6: vectorized costs are subtracted from returns and
+        # never attributed to reconstructed trades — mark the result
+        # so summary() replaces the (hard-zero) per-trade cost lines
+        # with an honest embedded-in-returns note. The per-process
+        # warning fires once and drowns in parameter sweeps; this
+        # marker travels with every result.
+        if self.mode == ExecutionMode.VECTORIZED:
+            result.metadata['cost_model'] = 'vectorized_approx'
+
+        # v2.8.6: record spread-model presence for event-driven
+        # summaries (vectorized suppresses the Total Spread line — the
+        # folded spread lives in returns, not per-trade costs).
+        if (self.mode == ExecutionMode.EVENT_DRIVEN
+                and (self.spread_model is not None
+                     or self.asset_spread_models)):
+            result.metadata['spread_model'] = repr(
+                self.spread_model or self.asset_spread_models)
 
         # Annualisation (v1.9.5). Multi-asset path overrides per_asset_trading_days
         # and populates per_asset_metrics after _build_result returns.

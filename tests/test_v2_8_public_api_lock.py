@@ -69,6 +69,8 @@ _LOCKED_MODULES = [
     "strategies",
     # Already-locked cross-checks (2 — declared in v2.3/v2.4)
     "factor_strategy", "signal_strategy",
+    # v2.8.6 — new public module, locked at introduction (1)
+    "spread",
 ]
 
 

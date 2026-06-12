@@ -147,18 +147,26 @@ def load_yahoo(
 
     if single:
         df = raw.copy()
+        # yfinance >= 1.x returns MultiIndex (Price, Ticker) columns
+        # even for a single symbol; flatten before lowercasing.
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
         df.columns = [c.lower() for c in df.columns]
         validate_ohlcv(df, validation_level=validation)
         return df
 
     # Multi-symbol: yfinance returns MultiIndex columns (price, symbol)
     result = {}
+    multi_cols = isinstance(raw.columns, pd.MultiIndex)
     for sym in symbols_list:
-        try:
-            sym_df = raw.xs(sym, level="Ticker", axis=1).copy()
-        except KeyError:
-            # Fallback for different yfinance versions
-            sym_df = raw[sym].copy() if sym in raw.columns.get_level_values(0) else None
+        sym_df = None
+        if multi_cols:
+            try:
+                sym_df = raw.xs(sym, level="Ticker", axis=1).copy()
+            except KeyError:
+                # Fallback for yfinance versions with (Ticker, Price) order
+                if sym in raw.columns.get_level_values(0):
+                    sym_df = raw[sym].copy()
         if sym_df is None or sym_df.empty:
             continue
         sym_df.columns = [c.lower() for c in sym_df.columns]

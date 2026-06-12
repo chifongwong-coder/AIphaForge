@@ -107,8 +107,17 @@ independently of input shape.
 ### Costs & Fees
 - **Multi-market presets**: US stocks, China A-shares, crypto spot, crypto futures — `get_fee_model("china")`
 - **Slippage models**: Fixed, volume-based, volatility-based
+- **Bid-ask spread models** (v2.8.6): `FixedSpread(spread_bps)` and `VolatilitySpread(k, min_bps, max_bps)` — fills cross half the quoted spread per side, orthogonal to slippage and market impact. Event-driven honors any model; vectorized folds a global `FixedSpread` only
+- **T+1 settlement** (v2.8.6): `BacktestEngine(settlement="t+1")` blocks same-calendar-day sells of shares bought that day (SSE/SZSE cash-equity rule; event-driven only). Per-asset overrides via `asset_settlements`
 - **Lot sizes**: Per-asset minimum trade units (e.g., A-share 100-share lots)
 - **Corporate actions**: `CorporateActionHook` for dividends and stock splits
+
+### Modeling Boundaries
+Honest limits of the simulation — know them before trusting intraday results:
+- **Session gaps are adjacent bars**: rolling indicators and bar-by-bar simulation treat overnight and lunch-break gaps as consecutive bars. Fill prices remain realistic (gaps fill at the next open); the distortion is confined to rolling windows that span sessions. Session-aware rolling helpers are deliberately out of scope.
+- **T+1 approximations**: enforcement happens at fill time (a real broker rejects at order entry against the sellable quantity — fill-time checking is what handles resting GTC orders correctly); an oversized sell fills the settled portion and expires the remainder (approximating a trader who resizes to the sellable quantity, where a real broker would reject the whole ticket); calendar-date bucketing assumes no overnight sessions (valid for SSE/SZSE cash equities — instruments with night sessions are natively T+0). Rejected/expired orders are never auto-resubmitted; strategies and exit rules re-emit on their own schedule. `t+1` does not imply no-shorting — pass `allow_short=False` for cash A-share realism.
+- **Spread modeling choices**: passive limit fills pay (up to) the half-spread rather than earning it, clamped so a limit order never fills worse than its limit; with a spread or impact model configured, limit fills are clamped on the combined adjustment, so adding a spread model can *improve* limit fills (the with/without delta is not pure spread) and the recorded `slippage` cost stays pre-clamp. The default `slippage_pct` already crudely proxies spread-crossing — reduce it when adding an explicit spread model to avoid double-counting.
+- **Vectorized costs are embedded in returns**: they are never attributed to reconstructed trades, so vectorized summaries replace the per-trade cost lines with an "Embedded in returns (vectorized approx)" note; per-trade attribution (including `Total Spread`) needs `mode="event_driven"`.
 
 ### Performance Analysis
 - **30+ metrics**: Sharpe, Sortino, Calmar, max drawdown, VaR, CVaR, profit factor, win rate, and more
@@ -824,6 +833,41 @@ report: KnowledgeCheckReport = knowledge_check(
 )
 assert report.anchor_validity == "OK"
 ```
+
+## v2.8.6 Release Notes
+
+### Headline — framework gap fixes (T+1 settlement, spread models)
+
+v2.8.6 closes the gaps surfaced by application-layer intraday usage.
+Unlike the preceding patch line, core modules change at the source
+level — but every new capability is opt-in: with default
+configuration, all markets produce numerically identical results to
+v2.8.5 (pinned by dedicated regression and snapshot tests). The only
+default-visible changes are the `load_yahoo` bug fix, a new
+annualization warning, and the reworked cost section of vectorized
+summaries.
+
+### Per-item summary (7 deliverables)
+
+| # | Site | What changed | User impact |
+|---|---|---|---|
+| 1 | `data.py` | `load_yahoo` flattens the MultiIndex columns yfinance >= 1.x returns even for single symbols (previously crashed with `'tuple' object has no attribute 'lower'`); multi-symbol fallback hardened. | **Loud fix** — `load_yahoo` works again on current yfinance. |
+| 2 | `engine.py`, `config.py`, `broker.py`, `margin.py` | `settlement="t+1"` (+ per-asset `asset_settlements`): shares bought today cannot be sold the same calendar day (SSE/SZSE cash-equity rule). Enforced at fill time inside the broker for every fill path (GTC, IOC/FOK, immediate); oversized sells fill the settled portion and expire the remainder; FOK kills outright; margin-call liquidations retry after fill-time rejections. Event-driven only — vectorized + t+1 raises. | Opt-in. Default `"t+0"` unchanged. First T+1 event per symbol warns; order audit trail records every reason. |
+| 3 | `spread.py` (new), `broker.py`, `portfolio.py`, `results.py` | Bid-ask spread models: `FixedSpread(spread_bps)` and `VolatilitySpread(k, min_bps, max_bps)`. Fills cross half the quoted spread per side; realized spread is recorded per trade (`Trade.spread_cost`, `result.total_spread`, `Total Spread` summary line) — price-embedded, never double-deducted from cash. A limit-price clamp guarantees limit orders never fill worse than their limit when a spread/impact model is configured. | Opt-in. Default (no spread model) fill prices are byte-identical to v2.8.5 (snapshot-pinned). |
+| 4 | `engine.py`, `costs.py` | Vectorized cost path folds a global `FixedSpread` (one half-spread per side, surviving the degenerate-notional branch); dynamic spread models and per-asset overrides warn per run and are ignored. | Opt-in; warnings name the limitation. |
+| 5 | `utils.py`, `engine.py` | `infer_bars_per_year` + annualization mismatch warning: intraday data left on the default `trading_days=252` mis-scales Sharpe by an order of magnitude (crypto 1h is ~8760 bars/year); the engine now warns beyond a 3x density band and suggests the inferred value. Never auto-corrects. | **Default-visible warning** (numbers unchanged). Pass the suggested `trading_days` to silence. |
+| 6 | `margin.py` | `FundingRateModel(funding_rate_8h=..., bar_interval_seconds=...)` converts venue-quoted 8h funding rates exactly (15m bars: /32); mutually exclusive with `funding_rate_per_bar`; legacy usage unchanged. | Opt-in ergonomics. |
+| 7 | `engine.py`, `results.py` | Vectorized summaries replace the per-trade cost lines (hard zeros — costs are subtracted from returns, never attributed to reconstructed trades) with an "Embedded in returns (vectorized approx)" note, via a per-result metadata marker (the once-per-process warning drowns in parameter sweeps). | **Default-visible display change** (text only). |
+
+### What v2.8.6 does NOT include
+
+- Session-aware rolling helpers (session gaps remain adjacent bars —
+  see the new "Modeling Boundaries" section above).
+- Securities-lending (intraday variant-T+0) modeling.
+- Order-book / depth-based spread models.
+- Automatic settlement switching by fee model: `ChinaAShareFeeModel`
+  documents the `settlement="t+1"` + `allow_short=False` pairing but
+  never switches it implicitly.
 
 ## v2.8.5 Release Notes
 

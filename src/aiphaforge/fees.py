@@ -391,6 +391,13 @@ class ChinaAShareFeeModel(BaseFeeModel):
         transfer_fee_rate: Transfer fee rate, default 0.002%.
         slippage_pct: Slippage percentage, default 0.1%.
 
+    Note:
+        Fees are only half of A-share realism. For intraday backtests,
+        pair this model with ``BacktestEngine(settlement="t+1")`` (shares
+        bought today cannot be sold the same day) and
+        ``allow_short=False`` (cash A-share has no shorting). Neither is
+        switched automatically by this fee model.
+
     Example:
         >>> fee_model = ChinaAShareFeeModel()
         >>> cost = fee_model.total_cost(10.0, 10000, 'sell')

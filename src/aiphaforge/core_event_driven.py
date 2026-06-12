@@ -89,10 +89,25 @@ def run_event_driven(
             session_end_time=config.session_end_time,
             immediate_fill_price=config.immediate_fill_price,
             assigned_symbol=symbol,
+            settlement=resolve_config(
+                config.settlement, config.asset_settlements, symbol),
+            spread_model=resolve_config(
+                config.spread_model, config.asset_spread_models, symbol),
         )
         brokers[symbol].set_portfolio(portfolio)
 
     # --- Market impact: set model and pre-compute ADV/vol (v1.9.4) ---
+    # v2.8.6: requires_volatility spread models share the Parkinson
+    # vol precompute (but NOT the ADV series, which would KeyError on
+    # volume-less data) and receive it on a separate per-bar channel
+    # (_vol_for_spread) so the impact path stays byte-identical.
+    spread_needs_vol = {
+        sym: bool(getattr(
+            resolve_config(
+                config.spread_model, config.asset_spread_models, sym),
+            "requires_volatility", False))
+        for sym in symbols
+    }
     precomputed_adv: Dict[str, pd.Series] = {}
     precomputed_vol: Dict[str, pd.Series] = {}
     if config.impact_model is not None:
@@ -104,6 +119,13 @@ def run_event_driven(
                 df['volume'], config.impact_adv_lookback)
             precomputed_vol[sym] = parkinson_volatility_series(
                 df['high'], df['low'], config.impact_vol_lookback)
+    if any(spread_needs_vol.values()):
+        from .market_impact import parkinson_volatility_series
+        for sym in symbols:
+            if spread_needs_vol[sym] and sym not in precomputed_vol:
+                df = data_dict[sym]
+                precomputed_vol[sym] = parkinson_volatility_series(
+                    df['high'], df['low'], config.impact_vol_lookback)
 
     # --- Build unified timeline ---
     timeline, bar_avail = build_unified_timeline(data_dict)
@@ -240,6 +262,19 @@ def run_event_driven(
                     brokers[sym]._adv = float(
                         precomputed_adv[sym].iloc[idx_loc])
                     brokers[sym]._volatility = float(
+                        precomputed_vol[sym].iloc[idx_loc])
+            # v2.8.6: per-bar volatility channel for spread models.
+            # None during the lookback warmup (the precompute uses
+            # min_periods=1, so warmup values exist but are noisy) —
+            # spread models fall back to their min_bps floor there.
+            for sym in active:
+                if not spread_needs_vol[sym]:
+                    continue
+                idx_loc = data_dict[sym].index.get_loc(timestamp)
+                if idx_loc < config.impact_vol_lookback - 1:
+                    brokers[sym]._vol_for_spread = None
+                else:
+                    brokers[sym]._vol_for_spread = float(
                         precomputed_vol[sym].iloc[idx_loc])
 
             # Reset per-bar realized PnL tracker

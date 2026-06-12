@@ -130,13 +130,29 @@ class DefaultTradeCost(BaseTradeCost):
         cost_normalization: Literal[
             "initial_capital", "current_equity"
         ] = "initial_capital",
+        half_spread_rate: float = 0.0,
     ):
         if cost_normalization not in ("initial_capital", "current_equity"):
             raise ValueError(
                 f"cost_normalization must be 'initial_capital' or "
                 f"'current_equity'; got {cost_normalization!r}"
             )
+        if half_spread_rate < 0:
+            raise ValueError(
+                f"half_spread_rate must be >= 0, got {half_spread_rate}")
         self.cost_normalization = cost_normalization
+        # v2.8.6: per-side spread fraction folded into the linear cost
+        # approximation (set by the engine from a global FixedSpread:
+        # spread_bps / 2 / 1e4). The vectorized core's positions are
+        # WEIGHT units (signals.ffill()), so |diff(positions)| is the
+        # traded fraction of equity and the per-bar cost IN RETURN
+        # UNITS is simply trade_size * half_spread_rate — one
+        # half-spread per side of the traded equity fraction,
+        # dimensionally matching the event-driven charge. (The
+        # commission/slippage fold below predates this and uses the
+        # representative-notional convention instead; aligning it is a
+        # v2.9 item.)
+        self.half_spread_rate = half_spread_rate
 
     def apply_vectorized(
         self,
@@ -240,6 +256,12 @@ class DefaultTradeCost(BaseTradeCost):
                     UserWarning,
                     stacklevel=2,
                 )
+            # v2.8.6: the spread charge is trade_size (traded weight)
+            # times the per-side rate — already in return units, no
+            # representative notional and no close prices needed, so
+            # it survives the degenerate branch.
+            if self.half_spread_rate > 0:
+                return returns - trade_size * self.half_spread_rate
             return returns
 
         commission_rate = fee_model.estimate_commission_rate(
@@ -252,6 +274,21 @@ class DefaultTradeCost(BaseTradeCost):
         trade_notional = trade_size * data["close"]
         gross_cost = trade_notional * (commission_rate + slippage_rate)
 
+        net = self._apply_normalized_cost(
+            returns, gross_cost, initial_capital)
+        # v2.8.6: spread charge in return units (see __init__ note) —
+        # applied outside the dollar-cost normalization on purpose.
+        if self.half_spread_rate > 0:
+            net = net - trade_size * self.half_spread_rate
+        return net
+
+    def _apply_normalized_cost(
+        self,
+        returns: pd.Series,
+        gross_cost: pd.Series,
+        initial_capital: float,
+    ) -> pd.Series:
+        """Subtract dollar costs from returns per cost_normalization."""
         # v2.8.2 M5: cost_normalization dispatch.
         if self.cost_normalization == "current_equity":
             # Running equity from cumulative PRE-cost (gross) returns.

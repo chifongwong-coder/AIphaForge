@@ -14,6 +14,7 @@ import pandas as pd
 from .fees import BaseFeeModel, SimpleFeeModel
 from .orders import Order, OrderManager, OrderSide, OrderType, should_fill_limit, should_trigger_stop
 from .portfolio import Portfolio
+from .spread import BaseSpreadModel
 
 # v2.8: public surface lock.
 __all__ = [
@@ -51,6 +52,16 @@ class Broker:
         slippage_model: Slippage model.
         partial_fills: Whether partial fills are supported.
         volume_limit_pct: Max order size as fraction of bar volume.
+        settlement: "t+0" (default) or "t+1" (v2.8.6) — same-day sell
+            freeze for shares bought today, enforced at fill time via
+            a broker-side day ledger. Requires a portfolio. Sells
+            beyond the effective long are short opens, governed by
+            allow_short exactly as under t+0. Rejected/expired orders
+            are never auto-resubmitted.
+        spread_model: Optional BaseSpreadModel (v2.8.6) — buys fill at
+            price + half_spread, sells at price - half_spread;
+            realized spread accumulates in
+            order.metadata['spread_cost'].
 
     Example:
         >>> broker = Broker(fee_model=ChinaAShareFeeModel())
@@ -71,6 +82,8 @@ class Broker:
         session_end_time: Optional[time] = None,
         immediate_fill_price: str = "close",
         assigned_symbol: Optional[str] = None,
+        settlement: str = "t+0",
+        spread_model: Optional[BaseSpreadModel] = None,
     ):
         self.fee_model = fee_model or SimpleFeeModel()
         self.fill_model = fill_model
@@ -92,6 +105,49 @@ class Broker:
         self._impact_model = None  # BaseImpactModel or None
         self._adv: float = 0.0    # updated per-bar by event loop
         self._volatility: float = 0.0  # updated per-bar by event loop
+
+        # v2.8.6: T+1 settlement ("t+0" or "t+1"). Enforced at FILL
+        # time inside _execute_fill (the single choke point for every
+        # fill path): a GTC order submitted today fills on a later
+        # calendar date, when the freeze bucket has already rolled
+        # over — submit-time checking would wrongly reject it. Real
+        # brokers reject at order entry against the sellable quantity;
+        # fill-time checking is the simulation-side approximation that
+        # handles resting orders correctly. T+1-rejected/expired orders
+        # are never auto-resubmitted; strategies and rules must
+        # re-emit. Calendar-date bucketing assumes no overnight
+        # sessions (valid for SSE/SZSE cash equities).
+        #
+        # Accounting is a broker-side day ledger, NOT a live portfolio
+        # read: the event loop applies fills to the portfolio only
+        # after process_bar returns, so the portfolio position is
+        # stale for every fill after the first within a bar. The
+        # ledger snapshots the settled position at the FIRST
+        # T+1-relevant fill touch of each date (before any same-day
+        # fill has been applied — correct even mid-batch) and tracks
+        # same-day buys/sells itself:
+        #   sellable        = settled_at_day_start - sold_today
+        #   effective long  = settled_at_day_start + bought - sold
+        # The constraint applies to sells while the effective long is
+        # positive; sells beyond it are short opens, governed by
+        # allow_short exactly as under t+0.
+        if settlement not in ("t+0", "t+1"):
+            raise ValueError(
+                f"settlement must be one of ('t+0', 't+1'), "
+                f"got {settlement!r}")
+        self.settlement = settlement
+        # symbol -> [calendar_date, settled_at_day_start, bought, sold]
+        self._t1_day_ledger: Dict[str, list] = {}
+        self._t1_warned = False
+
+        # v2.8.6: bid-ask spread model (BaseSpreadModel or None).
+        # Buys fill at price + half_spread, sells at price - half.
+        # _vol_for_spread is the per-bar volatility channel for
+        # requires_volatility spread models — set by the event loop,
+        # None while the vol pipeline is inactive or warming up. It is
+        # separate from _volatility so the impact path stays untouched.
+        self.spread_model = spread_model
+        self._vol_for_spread: Optional[float] = None
 
         # Order management
         self.order_manager = OrderManager()
@@ -401,8 +457,13 @@ class Broker:
                     order.expire("ioc_timeout")
                     processed.append(order)
                 else:
-                    # Not filled at all
-                    order.expire("ioc_timeout")
+                    # Not filled at all, or already terminated inside
+                    # _execute_fill (T+1 reject / clamp-and-expire):
+                    # only expire orders that are still active, and
+                    # always hand the order back so any partial fill
+                    # still reaches the portfolio.
+                    if order.is_active:
+                        order.expire("ioc_timeout")
                     processed.append(order)
             elif order.time_in_force == "FOK":
                 volume = bar.get('volume', float('inf'))
@@ -426,7 +487,10 @@ class Broker:
                     processed.append(order)
                     self.filled_orders += 1
                 else:
-                    order.expire("fok_price")
+                    # T+1 kills inside _execute_fill leave the order
+                    # terminal (REJECTED) — don't overwrite the reason.
+                    if order.is_active:
+                        order.expire("fok_price")
                     processed.append(order)
 
         return processed
@@ -648,6 +712,40 @@ class Broker:
                 if size <= 0:
                     return False
 
+        # v2.8.6: T+1 settlement check — _execute_fill is the single
+        # choke point all fill paths converge on (_try_fill_order, the
+        # IOC/FOK direct branch, process_immediate_orders).
+        t1_clamped = False
+        if self.settlement == "t+1" and order.is_sell:
+            sellable = self._t1_sellable(order, timestamp)
+            # Compare what this fill can actually request (callers pass
+            # order.size even for resting partials) — a fully-settled
+            # partially-filled order must not trip the constraint.
+            requested = min(size, order.remaining_size)
+            if sellable is not None and requested > sellable:
+                self._warn_t1_once(order)
+                if order.time_in_force == "FOK":
+                    # Fill-or-kill semantics: never clamp.
+                    order.reject(
+                        "T+1 settlement: requested size exceeds settled "
+                        "shares (fill-or-kill)")
+                    self.rejected_orders += 1
+                    return False
+                if sellable <= 0:
+                    if order.filled_size > 0:
+                        # Rejecting a partially-filled order would
+                        # create an inconsistent REJECTED state.
+                        order.expire("t+1_settlement")
+                    else:
+                        order.reject(
+                            "T+1 settlement: no settled shares available")
+                        self.rejected_orders += 1
+                    return False
+                # Fill the settled portion; the remainder is expired
+                # after the fill below (never left resting).
+                size = min(sellable, order.remaining_size)
+                t1_clamped = True
+
         # Calculate slippage
         slippage = self._calculate_slippage(price, size, order.side, volume)
 
@@ -658,6 +756,7 @@ class Broker:
             adjusted_price = price - slippage / size if size > 0 else price
 
         # Apply market impact (v1.9.4)
+        impact_active = self._impact_model is not None and self._adv > 0
         if self._impact_model is not None and self._adv > 0:
             impact = self._impact_model.estimate_impact(
                 size, adjusted_price, self._adv, self._volatility)
@@ -665,16 +764,51 @@ class Broker:
                 adjusted_price *= (1 + impact)
             else:
                 adjusted_price *= (1 - impact)
-            # Clamp limit/stop-limit orders to their limit price
-            # (impact cannot make fills worse than the limit guarantee)
-            if order.order_type in (OrderType.LIMIT, OrderType.STOP_LIMIT):
-                if order.is_buy and order.price is not None:
-                    adjusted_price = min(adjusted_price, order.price)
-                elif not order.is_buy and order.price is not None:
-                    adjusted_price = max(adjusted_price, order.price)
+            # market_impact_bps keeps pre-clamp "modeled impact"
+            # semantics; spread_cost below is realized post-clamp.
             if 'market_impact_bps' not in order.metadata:
                 order.metadata['market_impact_bps'] = 0.0
             order.metadata['market_impact_bps'] += impact * 10000
+
+        # Apply bid-ask spread (v2.8.6): pre-spread price is the mid.
+        pre_spread_price = adjusted_price
+        half = 0.0
+        if self.spread_model is not None:
+            half = self.spread_model.half_spread(
+                pre_spread_price, self._vol_for_spread)
+            if order.is_buy:
+                adjusted_price = pre_spread_price + half
+            else:
+                adjusted_price = pre_spread_price - half
+
+        # Single limit-price clamp after all price adjustments ("a
+        # limit order never fills worse than its limit"). Gated so the
+        # legacy slippage-only path keeps its limit +/- slippage fills:
+        # clamping those unconditionally would change default results.
+        if ((self.spread_model is not None or impact_active)
+                and order.order_type in (OrderType.LIMIT,
+                                         OrderType.STOP_LIMIT)
+                and order.price is not None):
+            if order.is_buy:
+                adjusted_price = min(adjusted_price, order.price)
+            else:
+                adjusted_price = max(adjusted_price, order.price)
+
+        # Realized spread, post-clamp and side-signed: a binding clamp
+        # reduction of slippage/impact overshoot is NOT paid spread.
+        if self.spread_model is not None:
+            if order.is_buy:
+                realized_half = min(
+                    half, max(0.0, adjusted_price - pre_spread_price))
+            else:
+                realized_half = min(
+                    half, max(0.0, pre_spread_price - adjusted_price))
+            # Cumulative at the order level, mirroring order.commission
+            # semantics; embedded in the fill price ONLY (never
+            # cash-deducted, unlike slippage).
+            order.metadata['spread_cost'] = (
+                order.metadata.get('spread_cost', 0.0)
+                + realized_half * size)
 
         # Calculate commission
         commission = self.fee_model.calculate_commission(
@@ -690,7 +824,81 @@ class Broker:
             slippage=slippage
         )
 
+        # v2.8.6: T+1 day-ledger bookkeeping after a successful fill.
+        if self.settlement == "t+1":
+            entry = self._t1_ledger_entry(order.symbol, timestamp)
+            if order.is_buy:
+                entry[2] += size
+            else:
+                entry[3] += size
+                if t1_clamped and order.is_active:
+                    # Expire the unsettled remainder immediately: a
+                    # resting clamped remainder would corrupt state
+                    # (cumulative filled_size re-applied by the
+                    # portfolio; per-bar exit rules would stack
+                    # duplicate sells).
+                    order.expire("t+1_settlement")
+
         return True
+
+    def _t1_ledger_entry(
+        self, symbol: str, timestamp: pd.Timestamp,
+    ) -> list:
+        """Get/create the day ledger entry for ``symbol``.
+
+        The settled-at-day-start snapshot is taken at the FIRST
+        T+1-relevant fill touch of each calendar date. Because the
+        event loop applies fills to the portfolio only after
+        ``process_bar`` returns, the portfolio position at that moment
+        reflects exactly the prior days' (fully settled) fills — even
+        when the touch happens mid-batch.
+        """
+        if self._portfolio is None:
+            raise RuntimeError(
+                "T+1 settlement requires a portfolio; call "
+                "set_portfolio() before processing orders")
+        today = timestamp.date()
+        entry = self._t1_day_ledger.get(symbol)
+        if entry is None or entry[0] != today:
+            pos = self._portfolio.get_position(symbol)
+            settled = (
+                float(pos.size)
+                if pos is not None and pos.size > 0 else 0.0)
+            entry = [today, settled, 0.0, 0.0]
+            self._t1_day_ledger[symbol] = entry
+        return entry
+
+    def _t1_sellable(
+        self, order: Order, timestamp: pd.Timestamp,
+    ) -> Optional[float]:
+        """Sellable quantity for a long-reducing sell under T+1.
+
+        Returns None when the constraint does not apply: the EFFECTIVE
+        long (settled-at-day-start + bought today - sold today, from
+        the broker's own day ledger, immune to the portfolio's
+        within-bar staleness) is not positive, i.e. the sell opens or
+        extends a short — governed by allow_short exactly as under
+        t+0. Quantity-based, matching the real rule; no lot/FIFO
+        tracking.
+        """
+        entry = self._t1_ledger_entry(order.symbol, timestamp)
+        effective_long = entry[1] + entry[2] - entry[3]
+        if effective_long <= 0:
+            return None
+        return float(max(0.0, entry[1] - entry[3]))
+
+    def _warn_t1_once(self, order: Order) -> None:
+        """Warn on the first T+1 rejection/clamp of this broker's run."""
+        if self._t1_warned:
+            return
+        self._t1_warned = True
+        warnings.warn(
+            f"T+1 settlement constrained a sell order for "
+            f"'{order.symbol}': shares bought today cannot be sold the "
+            f"same calendar day. Further T+1 events on this symbol are "
+            f"silent; see the order audit trail for per-order reasons.",
+            UserWarning,
+        )
 
     def _calculate_slippage(
         self,
@@ -747,6 +955,8 @@ class Broker:
         self.total_orders = 0
         self.filled_orders = 0
         self.rejected_orders = 0
+        self._t1_day_ledger.clear()
+        self._t1_warned = False
 
     def get_stats(self) -> Dict:
         """Get broker statistics."""

@@ -203,6 +203,7 @@ from .significance import (
     permutation_test,
     probabilistic_sharpe_ratio,
 )
+from .spread import BaseSpreadModel, FixedSpread, VolatilitySpread
 from .strategies import (
     ConditionalSwitch,
     PriorityCascade,
@@ -212,7 +213,7 @@ from .strategies import (
     WeightedBlend,
 )
 
-__version__ = '2.8.5'
+__version__ = '2.8.6'
 
 __all__ = [
     # Main engine
@@ -248,6 +249,11 @@ __all__ = [
     'SimpleBroker',
     'FillModel',
     'SlippageModel',
+
+    # Spread models (v2.8.6)
+    'BaseSpreadModel',
+    'FixedSpread',
+    'VolatilitySpread',
 
     # Exit rules
     'BaseExitRule',
