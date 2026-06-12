@@ -43,6 +43,7 @@ from .utils import (
     calculate_trade_metrics,
     compute_buy_and_hold,
     ensure_datetime_index,
+    infer_bars_per_year,
     validate_ohlcv,
 )
 from .utils import (
@@ -858,6 +859,14 @@ class BacktestEngine:
                     self.trading_days, sorted(data.keys()),
                     portfolio_override=self.portfolio_trading_days_override,
                 )
+            # v2.8.6: per-symbol annualization sanity check.
+            for _sym in sorted(data.keys()):
+                self._warn_annualization_mismatch(
+                    data[_sym].index,
+                    self._resolved_per_asset_td.get(
+                        _sym, self._portfolio_trading_days),
+                    symbol=_sym,
+                )
             return self._run_multi(
                 data, benchmark=benchmark,
                 benchmark_type=benchmark_type, weights=weights,
@@ -879,6 +888,11 @@ class BacktestEngine:
                 self.trading_days, [symbol],
                 portfolio_override=self.portfolio_trading_days_override,
             )
+
+        # v2.8.6: annualization sanity check (warn-only, never
+        # auto-corrects — the inference is a heuristic).
+        self._warn_annualization_mismatch(
+            data.index, self._portfolio_trading_days)
 
         # Generate signals
         signals = self._get_signals(data, symbol=symbol)
@@ -1481,6 +1495,38 @@ class BacktestEngine:
             f"{type(self.capital_allocator).__name__} is ignored. Switch "
             "to mode='event_driven' for dynamic per-bar allocation."
         )
+
+    def _warn_annualization_mismatch(
+        self,
+        index,
+        trading_days: int,
+        symbol: Optional[str] = None,
+    ) -> None:
+        """v2.8.6: warn when trading_days is far off the bar density.
+
+        ``trading_days`` is bars-per-year throughout this codebase
+        (sqrt(trading_days) Sharpe scaling), so intraday data with the
+        default 252 silently mis-annualizes by an order of magnitude
+        (crypto 1h is ~8760 bars/year). Warn-only beyond a 3x band in
+        either direction; emitted unconditionally at this single call
+        site per run (plain warnings.warn, no once-flags). Never
+        auto-corrects: the density inference is a heuristic and an
+        explicit in-band user value always wins silently.
+        """
+        inferred = infer_bars_per_year(index)
+        if inferred is None or trading_days <= 0:
+            return
+        ratio = inferred / trading_days
+        if ratio >= 3.0 or ratio <= 1.0 / 3.0:
+            where = f" for {symbol!r}" if symbol is not None else ""
+            warnings.warn(
+                f"annualization mismatch{where}: trading_days="
+                f"{trading_days}, but the data's bar density implies "
+                f"~{round(inferred)} bars/year ({ratio:.1f}x off). "
+                f"Sharpe and annualized metrics scale with "
+                f"sqrt(trading_days); pass trading_days="
+                f"{round(inferred)} if the data frequency is intended."
+            )
 
     def _warn_vectorized_max_position_size_partial(self) -> None:
         """v2.8.1 FR-G2 — special message for max_position_size.

@@ -25,11 +25,39 @@ __all__ = [
     "compute_buy_and_hold",
     "ensure_datetime_index",
     "extract_trades_vectorized",
+    "infer_bars_per_year",
     "max_drawdown",
     "sharpe_ratio",
     "sortino_ratio",
     "validate_ohlcv",
 ]
+
+
+def infer_bars_per_year(index: pd.DatetimeIndex) -> Optional[float]:
+    """Infer bars-per-year from observed bar density (v2.8.6).
+
+    ``len(index) / years_spanned`` with ``years_spanned = (last -
+    first) / 365.25 days``. Density-based rather than median-interval:
+    the median bar interval over-estimates bars/year for
+    session-bounded intraday data (RTH-only hourly data would
+    false-positive against a correct explicit ``trading_days``).
+
+    Returns None (no opinion) when the index is not a DatetimeIndex,
+    has fewer than 30 bars, or spans less than 14 days.
+
+    Used by the engine's annualization-mismatch warning, which fires
+    only beyond a 3x band — ratios inside the band stay silent by
+    design (e.g. 4-hour RTH bars at ~1.6x leave up to a ~1.27x Sharpe
+    scale error uncorrected). Weekly/monthly data warning against the
+    default 252 is a true positive: pass ~52 / ~12.
+    """
+    if not isinstance(index, pd.DatetimeIndex) or len(index) < 30:
+        return None
+    span = index[-1] - index[0]
+    if span < pd.Timedelta(days=14):
+        return None
+    years = span / pd.Timedelta(days=365.25)
+    return len(index) / float(years)
 
 
 def _resolve_trading_days(
