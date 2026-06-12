@@ -94,6 +94,11 @@ class BacktestConfig:
     # (user wins) or from the position_sizer (fallback).
     representative_notional: Optional[float] = None
     representative_size: Optional[float] = None
+    # v2.8.6: settlement constraint — "t+0" (default) or "t+1"
+    # (A-share style: shares bought today cannot be sold today).
+    # Event-driven only; the engine rejects "t+1" in vectorized mode.
+    settlement: str = "t+0"
+    asset_settlements: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass

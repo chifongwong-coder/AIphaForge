@@ -178,6 +178,8 @@ class BacktestEngine:
         portfolio_trading_days: Optional[int] = None,
         representative_notional: Optional[float] = None,
         representative_size: Optional[float] = None,
+        settlement: str = "t+0",
+        asset_settlements: Optional[Dict[str, str]] = None,
     ):
         # Fee model
         if isinstance(fee_model, str):
@@ -325,6 +327,25 @@ class BacktestEngine:
                 raise ValueError(
                     f"max_position_pct for '{sym}' must be in (0, 1.0], "
                     f"got {pct}")
+
+        # v2.8.6: settlement constraint ("t+0" or "t+1").
+        # T+1 is an exchange-level rule (SSE/SZSE cash equities): shares
+        # bought today cannot be sold the same calendar day. It applies
+        # to all participants, so it is a market-microstructure config,
+        # not an account attribute. Note t+1 does NOT imply no-shorting;
+        # pass allow_short=False as well for cash A-share realism.
+        _valid_settlements = ("t+0", "t+1")
+        if settlement not in _valid_settlements:
+            raise ValueError(
+                f"settlement must be one of {_valid_settlements}, "
+                f"got {settlement!r}")
+        self.settlement = settlement
+        self.asset_settlements: Dict[str, str] = asset_settlements or {}
+        for sym, stl in self.asset_settlements.items():
+            if stl not in _valid_settlements:
+                raise ValueError(
+                    f"asset_settlements[{sym!r}] must be one of "
+                    f"{_valid_settlements}, got {stl!r}")
 
         # Custom benchmark config defaults
         self._config_benchmark: Optional[pd.Series] = None
@@ -1538,6 +1559,14 @@ class BacktestEngine:
         # are silently dropped today. Surface these explicitly so users
         # don't get misleading "I set X but nothing changed" results.
         if self.mode == ExecutionMode.VECTORIZED:
+            # v2.8.6: T+1 cannot be honored by the vectorized core;
+            # silently ignoring it would yield optimistic results, so
+            # raise instead of warn (any "t+1", global or per-asset).
+            if (self.settlement == "t+1"
+                    or "t+1" in self.asset_settlements.values()):
+                raise ValueError(
+                    "settlement='t+1' is not supported in vectorized "
+                    "mode; use mode='event_driven'")
             self._warn_vectorized_unsupported()
 
         # v2.8.1: resolve representative notional/size for vectorized
@@ -1590,6 +1619,8 @@ class BacktestEngine:
             impact_vol_lookback=self.impact_vol_lookback,
             representative_notional=rep_notional,
             representative_size=rep_size,
+            settlement=self.settlement,
+            asset_settlements=self.asset_settlements,
         )
 
     def _resolve_representative_trade(self):
