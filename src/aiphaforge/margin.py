@@ -264,9 +264,28 @@ class FundingRateModel(PeriodicCostModel):
     - Daily bars: multiply by 3 (3 funding periods per day)
     - 1-min bars: divide by 480 (480 minutes per 8h)
 
-    ``bar_seconds`` is intentionally **ignored**: the funding rate is
-    already a per-bar quantity by design. Multiplying by elapsed time
-    again would double-scale the result.
+    v2.8.6: alternatively pass the venue-quoted 8-hour rate and your
+    bar length and let the model convert::
+
+        FundingRateModel(funding_rate_8h=0.0001,
+                         bar_interval_seconds=900)   # 15m bars: /32
+
+    ``funding_rate_8h`` and ``funding_rate_per_bar`` are mutually
+    exclusive; ``funding_rate_8h`` requires ``bar_interval_seconds``.
+    The conversion is exact linear proration
+    (``per_bar = rate_8h * bar_interval_seconds / 28800``) and assumes
+    uniformly spaced bars — data gaps under-accrue funding versus wall
+    clock, exactly as a hand-scaled per-bar rate would.
+
+    Naming note: the constructor parameter is ``bar_interval_seconds``
+    (your data's bar length, a conversion input), deliberately NOT
+    ``bar_seconds`` — that name belongs to the ``calculate_cost``
+    runtime kwarg below, which this class intentionally ignores.
+
+    ``bar_seconds`` (the ``calculate_cost`` kwarg) is intentionally
+    **ignored**: the funding rate is already a per-bar quantity by
+    design. Multiplying by elapsed time again would double-scale the
+    result.
 
     Convention (v2.2.2 Commit F clarification):
         ``calculate_cost`` returns ``abs(notional) * funding_rate_per_bar``
@@ -316,8 +335,33 @@ class FundingRateModel(PeriodicCostModel):
         inflow, because the lender always profits).
     """
 
-    def __init__(self, funding_rate_per_bar: float = 0.0001):
-        self.funding_rate_per_bar = funding_rate_per_bar
+    # Seconds in one standard 8-hour funding period.
+    _FUNDING_PERIOD_SECONDS = 28800.0
+
+    def __init__(
+        self,
+        funding_rate_per_bar: Optional[float] = None,
+        *,
+        funding_rate_8h: Optional[float] = None,
+        bar_interval_seconds: Optional[float] = None,
+    ):
+        if funding_rate_per_bar is not None and funding_rate_8h is not None:
+            raise ValueError(
+                "funding_rate_per_bar and funding_rate_8h are mutually "
+                "exclusive; pass one or the other")
+        if funding_rate_8h is not None:
+            if bar_interval_seconds is None or bar_interval_seconds <= 0:
+                raise ValueError(
+                    "funding_rate_8h requires bar_interval_seconds > 0 "
+                    "(your data's bar length, e.g. 900 for 15m bars)")
+            self.funding_rate_per_bar = (
+                funding_rate_8h * bar_interval_seconds
+                / self._FUNDING_PERIOD_SECONDS)
+        elif funding_rate_per_bar is not None:
+            self.funding_rate_per_bar = funding_rate_per_bar
+        else:
+            # Legacy no-arg default, unchanged from pre-v2.8.6.
+            self.funding_rate_per_bar = 0.0001
 
     def calculate_cost(
         self,
