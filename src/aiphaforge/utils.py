@@ -53,7 +53,10 @@ def infer_bars_per_year(index: pd.DatetimeIndex) -> Optional[float]:
     """
     if not isinstance(index, pd.DatetimeIndex) or len(index) < 30:
         return None
-    span = index[-1] - index[0]
+    # max/min rather than last/first: callers may pass not-yet-sorted
+    # raw input (multi-asset pre-normalization) and a negative span
+    # would turn into a spurious low-ratio warning.
+    span = index.max() - index.min()
     if span < pd.Timedelta(days=14):
         return None
     years = span / pd.Timedelta(days=365.25)

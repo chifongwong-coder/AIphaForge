@@ -41,8 +41,11 @@ label on vectorized cost lines.
   `BacktestResult.total_spread`, and a `Total Spread` summary line
   (event-driven only).
 - Vectorized cost path folds a global `FixedSpread`
-  (`DefaultTradeCost.half_spread_rate`, one half-spread per side,
-  applied even on the degenerate-notional branch); dynamic models and
+  (`DefaultTradeCost.half_spread_rate`): the charge in return units is
+  `|diff(positions)| * half_spread_rate` — one half-spread per side of
+  the traded equity fraction, dimensionally matching the event-driven
+  charge (positions are weight units in the vectorized core) — and
+  survives the degenerate-notional branch. Dynamic models and
   per-asset overrides warn per run and are ignored.
 - `utils.infer_bars_per_year` + engine annualization-mismatch warning
   (3x density band, suggests the inferred bars-per-year, never
@@ -67,9 +70,19 @@ label on vectorized cost lines.
 
 ### Changed
 
-- Vectorized summaries label `Total Commission` / `Total Slippage`
-  with `(approx)` via `result.metadata['cost_model']` (the
-  once-per-process warning drowns in parameter sweeps).
+- Vectorized summaries replace the per-trade cost lines with an
+  "Embedded in returns (vectorized approx)" note, driven by
+  `result.metadata['cost_model']` (vectorized costs are subtracted
+  from returns and never attributed to reconstructed trades — the
+  totals are hard zeros, and the once-per-process warning drowns in
+  parameter sweeps).
+- `settlement="t+1"` accounting is a broker-side day ledger
+  (settled-at-day-start snapshot + same-day buys/sells), immune to
+  the portfolio's within-bar staleness: same-bar buy-then-sell day
+  trades are rejected, and multiple same-bar sells consume the
+  settled quantity exactly once. Sells beyond the effective long are
+  short opens, governed by `allow_short` exactly as under t+0.
+  `Broker.__init__` validates the `settlement` value.
 - Limit/stop-limit fills are clamped to their limit price after all
   price adjustments whenever a spread or impact model is configured
   (previously the clamp only ran inside the impact branch; the

@@ -250,19 +250,122 @@ def test_t1_stop_loss_same_day_rejected_then_fills_next_day():
 def test_t1_long_to_short_flip_clamped_to_close():
     broker, portfolio = _make_broker()
     _fill_buy(broker, portfolio, 100, _D0)  # pre-held long 100
-    # Single atomic flip order: close 100 + open 80 short.
-    flip = broker.create_market_order("default", "sell", 180)
-    broker.submit_order(flip, _D1A)
-    # Make today a freeze day for SOME quantity so the constraint is
-    # active but the pre-held 100 stays sellable.
+    # Freeze-day buy FIRST (fills at _D1A), then the flip order, so
+    # the flip's fill at _D1B actually exercises the bought-today
+    # interaction (submitting the flip before the buy would let it
+    # fill during the buy's process_bar pass, ahead of the buy).
     _fill_buy(broker, portfolio, 10, _D1A)
+    # Single atomic flip order: close 110 + open 70 short.
+    flip = broker.create_market_order("default", "sell", 180)
+    broker.submit_order(flip, _D1B)
     broker.process_bar(_bar(), _D1B)
-    # sellable = 110 - 10 = 100: only the long-reducing portion fills.
+    # sellable = settled-at-day-start (100); the 10 bought today are
+    # frozen; only the long-reducing settled portion fills.
     assert flip.filled_size == pytest.approx(100.0)
     assert flip.status.value == "partially_expired"
     portfolio.update_from_order(flip, _D1B)
     position = portfolio.get_position("default")
     assert position is None or position.size >= 0  # no short today
+
+
+def test_t1_same_bar_buy_then_sell_rejected():
+    # Day-trade from flat, both orders filling in ONE process_bar
+    # batch: the portfolio is only updated after process_bar returns,
+    # so the sell-time position read is stale (None) — the broker's
+    # day ledger must still catch the freeze.
+    broker, portfolio = _make_broker()
+    buy = broker.create_market_order("default", "buy", 10)
+    sell = broker.create_market_order("default", "sell", 10)
+    broker.submit_order(buy, _D1A)
+    broker.submit_order(sell, _D1A)
+    broker.process_bar(_bar(), _D1A)
+    assert buy.is_filled
+    assert sell.status.value == "rejected"
+    assert "T+1 settlement" in sell.metadata["reject_reason"]
+
+
+def test_t1_same_bar_ioc_day_trade_rejected():
+    # Same-bar hook/agent flow via process_immediate_orders (the
+    # direct-_execute_fill path).
+    broker, portfolio = _make_broker()
+    buy = broker.create_market_order(
+        "default", "buy", 10, time_in_force="IOC")
+    sell = broker.create_market_order(
+        "default", "sell", 10, time_in_force="IOC")
+    broker.submit_order(buy, _D1A)
+    broker.submit_order(sell, _D1A)
+    broker.process_immediate_orders(_bar(), _D1A)
+    assert buy.is_filled
+    assert sell.status.value == "rejected"
+    assert "T+1 settlement" in sell.metadata["reject_reason"]
+
+
+def test_t1_same_bar_sells_consume_settled_once():
+    # Two same-bar sells against 100 settled shares: the second must
+    # see the first's consumption via the day ledger (the portfolio
+    # position is stale within the batch) and clamp to the remainder.
+    broker, portfolio = _make_broker()
+    _fill_buy(broker, portfolio, 100, _D0)
+    sell_a = broker.create_market_order("default", "sell", 60)
+    sell_b = broker.create_market_order("default", "sell", 60)
+    broker.submit_order(sell_a, _D1A)
+    broker.submit_order(sell_b, _D1A)
+    broker.process_bar(_bar(), _D1A)
+    assert sell_a.filled_size == pytest.approx(60.0)
+    assert sell_b.filled_size == pytest.approx(40.0)
+    assert sell_b.status.value == "partially_expired"
+
+
+def test_t1_settled_resting_partial_sell_no_spurious_warning():
+    import warnings as warnings_mod
+
+    # A fully-settled sell that volume-clips across bars must not trip
+    # the T+1 trigger (the comparison uses the remaining size, not the
+    # original order size) — and must not consume the once-per-broker
+    # warning that a later genuine T+1 event needs.
+    from aiphaforge.broker import Broker, FillModel
+    from aiphaforge.portfolio import Portfolio
+
+    portfolio = Portfolio(initial_capital=1_000_000)
+    broker = Broker(
+        settlement="t+1",
+        fill_model=FillModel.CURRENT_CLOSE,
+        partial_fills=True,
+        volume_limit_pct=0.1,
+        check_buying_power=False,
+    )
+    broker.set_portfolio(portfolio)
+    buy = broker.create_market_order("default", "buy", 100)
+    broker.submit_order(buy, _D0)
+    big_bar = _bar()
+    broker.process_bar(big_bar, _D0)
+    portfolio.update_from_order(buy, _D0)
+
+    # Bar volumes chosen so the second clip equals the remaining size
+    # (the pre-existing multi-bar partial-fill path crashes when the
+    # clip exceeds remaining — out of scope here; this test pins only
+    # the T+1 trigger comparison).
+    clip_bar_1 = _bar()
+    clip_bar_1["volume"] = 600.0  # max 60: fills 60 of 100
+    clip_bar_2 = _bar()
+    clip_bar_2["volume"] = 400.0  # max 40 == remaining
+    sell = broker.create_market_order("default", "sell", 100)
+    broker.submit_order(sell, _D1A)
+    with warnings_mod.catch_warnings(record=True) as caught:
+        warnings_mod.simplefilter("always")
+        broker.process_bar(clip_bar_1, _D1A)
+        broker.process_bar(clip_bar_2, _D1B)
+    t1_warnings = [w for w in caught
+                   if "T+1 settlement" in str(w.message)]
+    assert t1_warnings == []
+    assert sell.filled_size == pytest.approx(100.0)
+
+
+def test_broker_invalid_settlement_raises():
+    from aiphaforge.broker import Broker
+
+    with pytest.raises(ValueError, match="settlement"):
+        Broker(settlement="T+1")
 
 
 def test_t1_margin_liquidation_retries_after_rejection():

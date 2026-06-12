@@ -117,7 +117,7 @@ Honest limits of the simulation — know them before trusting intraday results:
 - **Session gaps are adjacent bars**: rolling indicators and bar-by-bar simulation treat overnight and lunch-break gaps as consecutive bars. Fill prices remain realistic (gaps fill at the next open); the distortion is confined to rolling windows that span sessions. Session-aware rolling helpers are deliberately out of scope.
 - **T+1 approximations**: enforcement happens at fill time (a real broker rejects at order entry against the sellable quantity — fill-time checking is what handles resting GTC orders correctly); an oversized sell fills the settled portion and expires the remainder (approximating a trader who resizes to the sellable quantity, where a real broker would reject the whole ticket); calendar-date bucketing assumes no overnight sessions (valid for SSE/SZSE cash equities — instruments with night sessions are natively T+0). Rejected/expired orders are never auto-resubmitted; strategies and exit rules re-emit on their own schedule. `t+1` does not imply no-shorting — pass `allow_short=False` for cash A-share realism.
 - **Spread modeling choices**: passive limit fills pay (up to) the half-spread rather than earning it, clamped so a limit order never fills worse than its limit; with a spread or impact model configured, limit fills are clamped on the combined adjustment, so adding a spread model can *improve* limit fills (the with/without delta is not pure spread) and the recorded `slippage` cost stays pre-clamp. The default `slippage_pct` already crudely proxies spread-crossing — reduce it when adding an explicit spread model to avoid double-counting.
-- **Vectorized costs are linear estimates**: commission/slippage in vectorized summaries carry an `(approx)` label; per-trade attribution (including `Total Spread`) needs `mode="event_driven"`.
+- **Vectorized costs are embedded in returns**: they are never attributed to reconstructed trades, so vectorized summaries replace the per-trade cost lines with an "Embedded in returns (vectorized approx)" note; per-trade attribution (including `Total Spread`) needs `mode="event_driven"`.
 
 ### Performance Analysis
 - **30+ metrics**: Sharpe, Sortino, Calmar, max drawdown, VaR, CVaR, profit factor, win rate, and more
@@ -844,8 +844,8 @@ level — but every new capability is opt-in: with default
 configuration, all markets produce numerically identical results to
 v2.8.5 (pinned by dedicated regression and snapshot tests). The only
 default-visible changes are the `load_yahoo` bug fix, a new
-annualization warning, and the `(approx)` label on vectorized cost
-lines.
+annualization warning, and the reworked cost section of vectorized
+summaries.
 
 ### Per-item summary (7 deliverables)
 
@@ -857,7 +857,7 @@ lines.
 | 4 | `engine.py`, `costs.py` | Vectorized cost path folds a global `FixedSpread` (one half-spread per side, surviving the degenerate-notional branch); dynamic spread models and per-asset overrides warn per run and are ignored. | Opt-in; warnings name the limitation. |
 | 5 | `utils.py`, `engine.py` | `infer_bars_per_year` + annualization mismatch warning: intraday data left on the default `trading_days=252` mis-scales Sharpe by an order of magnitude (crypto 1h is ~8760 bars/year); the engine now warns beyond a 3x density band and suggests the inferred value. Never auto-corrects. | **Default-visible warning** (numbers unchanged). Pass the suggested `trading_days` to silence. |
 | 6 | `margin.py` | `FundingRateModel(funding_rate_8h=..., bar_interval_seconds=...)` converts venue-quoted 8h funding rates exactly (15m bars: /32); mutually exclusive with `funding_rate_per_bar`; legacy usage unchanged. | Opt-in ergonomics. |
-| 7 | `engine.py`, `results.py` | Vectorized summaries label `Total Commission` / `Total Slippage` with `(approx)` via a per-result metadata marker (the once-per-process warning drowns in parameter sweeps). | **Default-visible label** (display text only). |
+| 7 | `engine.py`, `results.py` | Vectorized summaries replace the per-trade cost lines (hard zeros — costs are subtracted from returns, never attributed to reconstructed trades) with an "Embedded in returns (vectorized approx)" note, via a per-result metadata marker (the once-per-process warning drowns in parameter sweeps). | **Default-visible display change** (text only). |
 
 ### What v2.8.6 does NOT include
 

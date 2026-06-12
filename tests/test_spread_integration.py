@@ -65,14 +65,46 @@ def test_trade_spread_cost_recorded_and_gross_pnl_adds_back():
             t.pnl + t.commission + t.slippage_cost + t.spread_cost)
 
 
+_SNAPSHOT_CLOSES = [
+        100.00123016092391, 100.30042606816971, 100.02584117375997,
+        99.13897423972712, 98.68924146367229, 97.71542936767258,
+        97.77421662380264, 99.09342193054518, 98.60687603593607,
+        97.9969393295441, 98.47814716323813, 98.83023077296852,
+        98.93446684870653, 98.01818272571579, 97.98951481407086,
+        98.67321317465027, 97.35570837289497, 96.9112111275269,
+        95.08611766537084, 93.86781838986253, 92.15484452887414,
+        91.93845112304705, 90.7805339502349, 91.02712348714363,
+        91.16992138171926, 90.99965577559516, 88.73799279178336,
+        88.2612527639042, 88.21845560124407, 88.31847169166174,
+        86.97736570609516, 86.56281953447889, 85.7199165397864,
+        85.02937836285341, 85.93625588718035, 85.2450852992935,
+        85.21736665170462, 85.97436287255682, 85.4740773728871,
+        85.37865446661769, 85.47301937589084, 85.5275529735575,
+        84.48618439954303, 84.55053687093265, 85.70727055502503,
+        84.39146007234194, 85.11983093417341, 85.22148553141896,
+        84.67656455423861, 86.38750447033703, 87.04851773145793,
+        86.01078963575355, 86.07490551792861, 86.57272458789855,
+        86.40944492834551, 87.00156341736553, 86.94371155178061,
+        87.52578110930105, 88.79395888690561, 88.19603387702557,
+        88.37537616971093, 87.96687339898828, 88.07889871246569,
+        87.03941341205615, 86.53665036377559, 86.36703538404976,
+        87.14676983249362, 88.15053049286979, 86.99152055077259,
+        86.30298838096925, 86.86309508802161, 85.14954483924349,
+        84.75606973987001, 84.67365326203048, 85.74473146882303,
+        86.33790131078177, 86.05585381124324, 85.73925648775067,
+        85.52500894209429, 86.83798398186646,
+]
+
+
 def test_default_no_spread_snapshot_v2_8_5():
     # Snapshot captured on main @ 26a572a (v2.8.5) BEFORE this branch.
     # Do NOT regenerate expected values from production code: the point
     # is that default-config fills are byte-identical to v2.8.5. If
     # this fails, suspect the v2.8.6 broker changes, not the snapshot.
-    rng = np.random.default_rng(7)
+    # Close prices are inlined literals (originally default_rng(7)) so
+    # the pin does not depend on NumPy's generator stream stability.
     periods = 80
-    closes = 100.0 * np.exp(np.cumsum(rng.normal(0.0, 0.01, periods)))
+    closes = np.asarray(_SNAPSHOT_CLOSES)
     data = pd.DataFrame(
         {
             "open": closes,
@@ -253,8 +285,10 @@ def _vectorized_run(spread_model=None, asset_spread_models=None):
 
 
 def test_vectorized_fixed_spread_reduces_equity_by_bps():
-    # Exact fold identity at the DefaultTradeCost level: net returns
-    # drop by trade_notional * half_spread_rate / initial_capital.
+    # Exact fold identity at the DefaultTradeCost level: vectorized
+    # positions are WEIGHT units, so the per-bar spread charge in
+    # return units is |diff(positions)| * half_spread_rate — one
+    # half-spread per side of the traded equity fraction.
     from aiphaforge.costs import DefaultTradeCost
 
     idx = pd.bdate_range("2024-01-01", periods=6)
@@ -270,16 +304,52 @@ def test_vectorized_fixed_spread_reduces_equity_by_bps():
     folded = DefaultTradeCost(half_spread_rate=rate).apply_vectorized(
         returns, positions, data, ZeroFeeModel(), capital,
         representative_notional=capital)
-    expected_cost = (
-        positions.diff().abs().fillna(0) * data["close"] * rate / capital)
+    expected_cost = positions.diff().abs().fillna(0) * rate
     pd.testing.assert_series_equal(base - folded, expected_cost)
 
-    # Engine-level sanity: folding a FixedSpread strictly reduces the
-    # final equity of a round-trip vectorized run.
-    no_spread, _ = _vectorized_run(spread_model=None)
-    with_spread, _ = _vectorized_run(spread_model=FixedSpread(_BPS))
-    assert (with_spread.equity_curve.iloc[-1]
-            < no_spread.equity_curve.iloc[-1])
+
+def test_vectorized_spread_magnitude_matches_event_driven():
+    # The folded charge must be the same order as the event-driven
+    # spread cost (a dimensional bug here once made it ~1000x small:
+    # weight-unit positions were multiplied by close and divided by
+    # initial capital as if they were share counts).
+    data = make_ohlcv(60)
+    # Entry mid-window: a position held from bar 0 has no diff() entry
+    # side in the vectorized path, which would halve the comparison.
+    signals = pd.Series(0.0, index=data.index)
+    signals.iloc[10:30] = 1.0
+
+    ed_engine = BacktestEngine(
+        mode="event_driven", fee_model=ZeroFeeModel(),
+        spread_model=FixedSpread(_BPS))
+    ed_engine.set_signals(signals)
+    ed_result = ed_engine.run(data)
+    ed_cost_return = ed_result.total_spread / ed_result.initial_capital
+
+    def _vec(spread_model):
+        import warnings as warnings_mod
+
+        engine = BacktestEngine(
+            mode="vectorized", fee_model=ZeroFeeModel(),
+            spread_model=spread_model,
+            representative_notional=95_000)
+        engine.set_signals(signals)
+        with warnings_mod.catch_warnings():
+            warnings_mod.simplefilter("ignore")
+            return engine.run(data)
+
+    vec_base = _vec(None)
+    vec_spread = _vec(FixedSpread(_BPS))
+    vec_delta = (
+        vec_base.equity_curve.iloc[-1]
+        - vec_spread.equity_curve.iloc[-1]) / vec_base.equity_curve.iloc[0]
+
+    assert ed_cost_return > 0 and vec_delta > 0
+    # Event-driven sizes at ~0.95 equity (FractionSizer default) while
+    # the vectorized weight path trades the full unit weight; allow a
+    # generous band — the bug class this guards against is orders of
+    # magnitude, not percent.
+    assert vec_delta == pytest.approx(ed_cost_return, rel=0.5)
 
 
 def test_vectorized_dynamic_spread_warns_and_ignored():

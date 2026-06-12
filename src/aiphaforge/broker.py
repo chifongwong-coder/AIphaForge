@@ -5,7 +5,7 @@ Simulates order execution, slippage, and fill logic.
 """
 
 import warnings
-from datetime import date, time
+from datetime import time
 from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
@@ -52,6 +52,16 @@ class Broker:
         slippage_model: Slippage model.
         partial_fills: Whether partial fills are supported.
         volume_limit_pct: Max order size as fraction of bar volume.
+        settlement: "t+0" (default) or "t+1" (v2.8.6) — same-day sell
+            freeze for shares bought today, enforced at fill time via
+            a broker-side day ledger. Requires a portfolio. Sells
+            beyond the effective long are short opens, governed by
+            allow_short exactly as under t+0. Rejected/expired orders
+            are never auto-resubmitted.
+        spread_model: Optional BaseSpreadModel (v2.8.6) — buys fill at
+            price + half_spread, sells at price - half_spread;
+            realized spread accumulates in
+            order.metadata['spread_cost'].
 
     Example:
         >>> broker = Broker(fee_model=ChinaAShareFeeModel())
@@ -107,9 +117,27 @@ class Broker:
         # are never auto-resubmitted; strategies and rules must
         # re-emit. Calendar-date bucketing assumes no overnight
         # sessions (valid for SSE/SZSE cash equities).
+        #
+        # Accounting is a broker-side day ledger, NOT a live portfolio
+        # read: the event loop applies fills to the portfolio only
+        # after process_bar returns, so the portfolio position is
+        # stale for every fill after the first within a bar. The
+        # ledger snapshots the settled position at the FIRST
+        # T+1-relevant fill touch of each date (before any same-day
+        # fill has been applied — correct even mid-batch) and tracks
+        # same-day buys/sells itself:
+        #   sellable        = settled_at_day_start - sold_today
+        #   effective long  = settled_at_day_start + bought - sold
+        # The constraint applies to sells while the effective long is
+        # positive; sells beyond it are short opens, governed by
+        # allow_short exactly as under t+0.
+        if settlement not in ("t+0", "t+1"):
+            raise ValueError(
+                f"settlement must be one of ('t+0', 't+1'), "
+                f"got {settlement!r}")
         self.settlement = settlement
-        # symbol -> (calendar_date, qty bought that date)
-        self._bought_today: Dict[str, Tuple[date, float]] = {}
+        # symbol -> [calendar_date, settled_at_day_start, bought, sold]
+        self._t1_day_ledger: Dict[str, list] = {}
         self._t1_warned = False
 
         # v2.8.6: bid-ask spread model (BaseSpreadModel or None).
@@ -690,7 +718,11 @@ class Broker:
         t1_clamped = False
         if self.settlement == "t+1" and order.is_sell:
             sellable = self._t1_sellable(order, timestamp)
-            if sellable is not None and size > sellable:
+            # Compare what this fill can actually request (callers pass
+            # order.size even for resting partials) — a fully-settled
+            # partially-filled order must not trip the constraint.
+            requested = min(size, order.remaining_size)
+            if sellable is not None and requested > sellable:
                 self._warn_t1_once(order)
                 if order.time_in_force == "FOK":
                     # Fill-or-kill semantics: never clamp.
@@ -792,46 +824,68 @@ class Broker:
             slippage=slippage
         )
 
-        # v2.8.6: T+1 bookkeeping after a successful fill.
+        # v2.8.6: T+1 day-ledger bookkeeping after a successful fill.
         if self.settlement == "t+1":
+            entry = self._t1_ledger_entry(order.symbol, timestamp)
             if order.is_buy:
-                bucket_date, qty = self._bought_today.get(
-                    order.symbol, (None, 0.0))
-                if bucket_date != timestamp.date():
-                    qty = 0.0
-                self._bought_today[order.symbol] = (
-                    timestamp.date(), qty + size)
-            elif t1_clamped and order.is_active:
-                # Expire the unsettled remainder immediately: a resting
-                # clamped remainder would corrupt state (cumulative
-                # filled_size re-applied by the portfolio; per-bar exit
-                # rules would stack duplicate sells).
-                order.expire("t+1_settlement")
+                entry[2] += size
+            else:
+                entry[3] += size
+                if t1_clamped and order.is_active:
+                    # Expire the unsettled remainder immediately: a
+                    # resting clamped remainder would corrupt state
+                    # (cumulative filled_size re-applied by the
+                    # portfolio; per-bar exit rules would stack
+                    # duplicate sells).
+                    order.expire("t+1_settlement")
 
         return True
+
+    def _t1_ledger_entry(
+        self, symbol: str, timestamp: pd.Timestamp,
+    ) -> list:
+        """Get/create the day ledger entry for ``symbol``.
+
+        The settled-at-day-start snapshot is taken at the FIRST
+        T+1-relevant fill touch of each calendar date. Because the
+        event loop applies fills to the portfolio only after
+        ``process_bar`` returns, the portfolio position at that moment
+        reflects exactly the prior days' (fully settled) fills — even
+        when the touch happens mid-batch.
+        """
+        if self._portfolio is None:
+            raise RuntimeError(
+                "T+1 settlement requires a portfolio; call "
+                "set_portfolio() before processing orders")
+        today = timestamp.date()
+        entry = self._t1_day_ledger.get(symbol)
+        if entry is None or entry[0] != today:
+            pos = self._portfolio.get_position(symbol)
+            settled = (
+                float(pos.size)
+                if pos is not None and pos.size > 0 else 0.0)
+            entry = [today, settled, 0.0, 0.0]
+            self._t1_day_ledger[symbol] = entry
+        return entry
 
     def _t1_sellable(
         self, order: Order, timestamp: pd.Timestamp,
     ) -> Optional[float]:
         """Sellable quantity for a long-reducing sell under T+1.
 
-        Returns None when the constraint does not apply (no long
-        position: standalone short opens and short covers are never
-        constrained). Quantity-based, matching the real rule
-        (sellable = position - bought today); no lot/FIFO tracking.
+        Returns None when the constraint does not apply: the EFFECTIVE
+        long (settled-at-day-start + bought today - sold today, from
+        the broker's own day ledger, immune to the portfolio's
+        within-bar staleness) is not positive, i.e. the sell opens or
+        extends a short — governed by allow_short exactly as under
+        t+0. Quantity-based, matching the real rule; no lot/FIFO
+        tracking.
         """
-        if self._portfolio is None:
-            raise RuntimeError(
-                "T+1 settlement requires a portfolio; call "
-                "set_portfolio() before processing sell orders")
-        pos = self._portfolio.get_position(order.symbol)
-        if pos is None or not pos.is_long:
+        entry = self._t1_ledger_entry(order.symbol, timestamp)
+        effective_long = entry[1] + entry[2] - entry[3]
+        if effective_long <= 0:
             return None
-        bucket_date, bought = self._bought_today.get(
-            order.symbol, (None, 0.0))
-        if bucket_date != timestamp.date():
-            bought = 0.0
-        return max(0.0, pos.size - bought)
+        return float(max(0.0, entry[1] - entry[3]))
 
     def _warn_t1_once(self, order: Order) -> None:
         """Warn on the first T+1 rejection/clamp of this broker's run."""
@@ -901,7 +955,7 @@ class Broker:
         self.total_orders = 0
         self.filled_orders = 0
         self.rejected_orders = 0
-        self._bought_today.clear()
+        self._t1_day_ledger.clear()
         self._t1_warned = False
 
     def get_stats(self) -> Dict:

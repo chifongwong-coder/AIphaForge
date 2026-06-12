@@ -333,11 +333,6 @@ class BacktestResult:
             flat_days = self.metrics.get('flat_days', 0)
             lines.append(f"  Win/Lose/Flat:   {win_days}/{lose_days}/{flat_days} days")
 
-        # v2.8.6: vectorized results carry an approximate-cost marker;
-        # the per-trade cost lines are linear estimates there.
-        approx = (" (approx)"
-                  if self.metadata.get("cost_model") == "vectorized_approx"
-                  else "")
         lines += [
             "",
             "[Trade Statistics]",
@@ -347,16 +342,24 @@ class BacktestResult:
             f"  Profit Factor:   {self.profit_factor:.2f}",
             "",
             "[Costs]",
-            f"  Total Commission: {self.total_commission:,.2f}{approx}",
-            f"  Total Slippage:   {self.total_slippage:,.2f}{approx}",
         ]
-        # Total Spread appears only for event-driven runs with a spread
-        # model configured; in vectorized mode FixedSpread is folded
-        # into returns and not attributable per-trade, so the line is
-        # suppressed (a "0.00 (approx)" line would mislead).
-        if not approx and (self.total_spread
-                           or self.metadata.get("spread_model")):
-            lines.append(f"  Total Spread:     {self.total_spread:,.2f}")
+        # v2.8.6: vectorized costs are subtracted from returns and
+        # never attributed to reconstructed trades, so the per-trade
+        # totals here are hard zeros — printing "0.00 (approx)" would
+        # mislead (the same rationale that suppresses Total Spread).
+        # Show one honest note instead.
+        if self.metadata.get("cost_model") == "vectorized_approx":
+            lines.append(
+                "  Embedded in returns (vectorized approx); per-trade "
+                "attribution requires mode='event_driven'.")
+        else:
+            lines += [
+                f"  Total Commission: {self.total_commission:,.2f}",
+                f"  Total Slippage:   {self.total_slippage:,.2f}",
+            ]
+            if self.total_spread or self.metadata.get("spread_model"):
+                lines.append(
+                    f"  Total Spread:     {self.total_spread:,.2f}")
 
         if self.benchmark_metrics is not None:
             bm_ret = self.benchmark_metrics.get('total_return', 0)

@@ -1,8 +1,11 @@
-"""v2.8.6 Commit I — vectorized cost lines labeled (approx).
+"""v2.8.6 Commit I/N — vectorized cost reporting in summary().
 
-The once-per-process vectorized cost warning drowns in parameter
-sweeps; the ``metadata['cost_model']`` marker travels with each
-result so ``summary()`` can label the cost lines themselves.
+Vectorized costs are subtracted from returns and never attributed to
+reconstructed trades, so the per-trade totals are hard zeros; printing
+"0.00 (approx)" would mislead. The summary replaces the cost lines
+with an embedded-in-returns note, driven by the per-result
+``metadata['cost_model']`` marker (the once-per-process warning
+drowns in parameter sweeps).
 """
 from __future__ import annotations
 
@@ -24,18 +27,18 @@ def _summary(mode: str) -> str:
 
 def test_vectorized_summary_costs_marked_approx():
     summary = _summary("vectorized")
-    assert "Total Commission" in summary
-    commission_line = next(
-        line for line in summary.splitlines()
-        if "Total Commission" in line)
-    slippage_line = next(
-        line for line in summary.splitlines()
-        if "Total Slippage" in line)
-    assert commission_line.endswith("(approx)")
-    assert slippage_line.endswith("(approx)")
-    # Vectorized never shows a Total Spread line (folded into returns).
+    assert "[Costs]" in summary
+    assert "Embedded in returns (vectorized approx)" in summary
+    assert "event_driven" in summary  # actionable pointer
+    # No misleading hard-zero attribution lines.
+    assert "Total Commission" not in summary
+    assert "Total Slippage" not in summary
     assert "Total Spread" not in summary
 
 
 def test_event_driven_summary_no_approx_label():
-    assert "(approx)" not in _summary("event_driven")
+    summary = _summary("event_driven")
+    assert "Embedded in returns" not in summary
+    assert "(approx)" not in summary
+    assert "Total Commission" in summary
+    assert "Total Slippage" in summary

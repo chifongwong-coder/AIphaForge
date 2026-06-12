@@ -132,6 +132,17 @@ class BacktestEngine:
         agent_enabled_strategies: Agent-controlled strategy enable states.
         hooks: List of backtest hooks (optional).
         include_benchmark: Whether to compute buy-and-hold benchmark.
+        settlement: "t+0" (default) or "t+1" — shares bought today
+            cannot be sold the same calendar day (SSE/SZSE cash-equity
+            rule; event-driven only, vectorized raises). Pair with
+            allow_short=False for cash A-share realism.
+        asset_settlements: Per-symbol settlement overrides.
+        spread_model: Bid-ask spread model (see aiphaforge.spread).
+            Event-driven honors any model; vectorized folds a global
+            FixedSpread into the cost approximation and ignores other
+            shapes with a per-run warning.
+        asset_spread_models: Per-symbol spread-model overrides
+            (event-driven only).
 
     Example:
         >>> engine = BacktestEngine(
@@ -1829,11 +1840,12 @@ class BacktestEngine:
         if 'meta_audit' in raw and raw['meta_audit']:
             result.metadata['meta_audit'] = raw['meta_audit']
 
-        # v2.8.6: vectorized cost figures are linear estimates from a
-        # representative notional, not per-fill accounting — mark the
-        # result so summary() labels its cost lines "(approx)". The
-        # per-process warning fires once and drowns in parameter
-        # sweeps; this marker travels with every result.
+        # v2.8.6: vectorized costs are subtracted from returns and
+        # never attributed to reconstructed trades — mark the result
+        # so summary() replaces the (hard-zero) per-trade cost lines
+        # with an honest embedded-in-returns note. The per-process
+        # warning fires once and drowns in parameter sweeps; this
+        # marker travels with every result.
         if self.mode == ExecutionMode.VECTORIZED:
             result.metadata['cost_model'] = 'vectorized_approx'
 
