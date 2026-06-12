@@ -1819,6 +1819,14 @@ class BacktestEngine:
         if 'meta_audit' in raw and raw['meta_audit']:
             result.metadata['meta_audit'] = raw['meta_audit']
 
+        # v2.8.6: vectorized cost figures are linear estimates from a
+        # representative notional, not per-fill accounting — mark the
+        # result so summary() labels its cost lines "(approx)". The
+        # per-process warning fires once and drowns in parameter
+        # sweeps; this marker travels with every result.
+        if self.mode == ExecutionMode.VECTORIZED:
+            result.metadata['cost_model'] = 'vectorized_approx'
+
         # v2.8.6: record spread-model presence for event-driven
         # summaries (vectorized suppresses the Total Spread line — the
         # folded spread lives in returns, not per-trade costs).
