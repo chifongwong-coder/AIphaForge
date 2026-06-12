@@ -5,7 +5,7 @@ Simulates order execution, slippage, and fill logic.
 """
 
 import warnings
-from datetime import time
+from datetime import date, time
 from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
@@ -71,6 +71,7 @@ class Broker:
         session_end_time: Optional[time] = None,
         immediate_fill_price: str = "close",
         assigned_symbol: Optional[str] = None,
+        settlement: str = "t+0",
     ):
         self.fee_model = fee_model or SimpleFeeModel()
         self.fill_model = fill_model
@@ -92,6 +93,22 @@ class Broker:
         self._impact_model = None  # BaseImpactModel or None
         self._adv: float = 0.0    # updated per-bar by event loop
         self._volatility: float = 0.0  # updated per-bar by event loop
+
+        # v2.8.6: T+1 settlement ("t+0" or "t+1"). Enforced at FILL
+        # time inside _execute_fill (the single choke point for every
+        # fill path): a GTC order submitted today fills on a later
+        # calendar date, when the freeze bucket has already rolled
+        # over — submit-time checking would wrongly reject it. Real
+        # brokers reject at order entry against the sellable quantity;
+        # fill-time checking is the simulation-side approximation that
+        # handles resting orders correctly. T+1-rejected/expired orders
+        # are never auto-resubmitted; strategies and rules must
+        # re-emit. Calendar-date bucketing assumes no overnight
+        # sessions (valid for SSE/SZSE cash equities).
+        self.settlement = settlement
+        # symbol -> (calendar_date, qty bought that date)
+        self._bought_today: Dict[str, Tuple[date, float]] = {}
+        self._t1_warned = False
 
         # Order management
         self.order_manager = OrderManager()
@@ -401,8 +418,13 @@ class Broker:
                     order.expire("ioc_timeout")
                     processed.append(order)
                 else:
-                    # Not filled at all
-                    order.expire("ioc_timeout")
+                    # Not filled at all, or already terminated inside
+                    # _execute_fill (T+1 reject / clamp-and-expire):
+                    # only expire orders that are still active, and
+                    # always hand the order back so any partial fill
+                    # still reaches the portfolio.
+                    if order.is_active:
+                        order.expire("ioc_timeout")
                     processed.append(order)
             elif order.time_in_force == "FOK":
                 volume = bar.get('volume', float('inf'))
@@ -426,7 +448,10 @@ class Broker:
                     processed.append(order)
                     self.filled_orders += 1
                 else:
-                    order.expire("fok_price")
+                    # T+1 kills inside _execute_fill leave the order
+                    # terminal (REJECTED) — don't overwrite the reason.
+                    if order.is_active:
+                        order.expire("fok_price")
                     processed.append(order)
 
         return processed
@@ -648,6 +673,36 @@ class Broker:
                 if size <= 0:
                     return False
 
+        # v2.8.6: T+1 settlement check — _execute_fill is the single
+        # choke point all fill paths converge on (_try_fill_order, the
+        # IOC/FOK direct branch, process_immediate_orders).
+        t1_clamped = False
+        if self.settlement == "t+1" and order.is_sell:
+            sellable = self._t1_sellable(order, timestamp)
+            if sellable is not None and size > sellable:
+                self._warn_t1_once(order)
+                if order.time_in_force == "FOK":
+                    # Fill-or-kill semantics: never clamp.
+                    order.reject(
+                        "T+1 settlement: requested size exceeds settled "
+                        "shares (fill-or-kill)")
+                    self.rejected_orders += 1
+                    return False
+                if sellable <= 0:
+                    if order.filled_size > 0:
+                        # Rejecting a partially-filled order would
+                        # create an inconsistent REJECTED state.
+                        order.expire("t+1_settlement")
+                    else:
+                        order.reject(
+                            "T+1 settlement: no settled shares available")
+                        self.rejected_orders += 1
+                    return False
+                # Fill the settled portion; the remainder is expired
+                # after the fill below (never left resting).
+                size = min(sellable, order.remaining_size)
+                t1_clamped = True
+
         # Calculate slippage
         slippage = self._calculate_slippage(price, size, order.side, volume)
 
@@ -690,7 +745,59 @@ class Broker:
             slippage=slippage
         )
 
+        # v2.8.6: T+1 bookkeeping after a successful fill.
+        if self.settlement == "t+1":
+            if order.is_buy:
+                bucket_date, qty = self._bought_today.get(
+                    order.symbol, (None, 0.0))
+                if bucket_date != timestamp.date():
+                    qty = 0.0
+                self._bought_today[order.symbol] = (
+                    timestamp.date(), qty + size)
+            elif t1_clamped and order.is_active:
+                # Expire the unsettled remainder immediately: a resting
+                # clamped remainder would corrupt state (cumulative
+                # filled_size re-applied by the portfolio; per-bar exit
+                # rules would stack duplicate sells).
+                order.expire("t+1_settlement")
+
         return True
+
+    def _t1_sellable(
+        self, order: Order, timestamp: pd.Timestamp,
+    ) -> Optional[float]:
+        """Sellable quantity for a long-reducing sell under T+1.
+
+        Returns None when the constraint does not apply (no long
+        position: standalone short opens and short covers are never
+        constrained). Quantity-based, matching the real rule
+        (sellable = position - bought today); no lot/FIFO tracking.
+        """
+        if self._portfolio is None:
+            raise RuntimeError(
+                "T+1 settlement requires a portfolio; call "
+                "set_portfolio() before processing sell orders")
+        pos = self._portfolio.get_position(order.symbol)
+        if pos is None or not pos.is_long:
+            return None
+        bucket_date, bought = self._bought_today.get(
+            order.symbol, (None, 0.0))
+        if bucket_date != timestamp.date():
+            bought = 0.0
+        return max(0.0, pos.size - bought)
+
+    def _warn_t1_once(self, order: Order) -> None:
+        """Warn on the first T+1 rejection/clamp of this broker's run."""
+        if self._t1_warned:
+            return
+        self._t1_warned = True
+        warnings.warn(
+            f"T+1 settlement constrained a sell order for "
+            f"'{order.symbol}': shares bought today cannot be sold the "
+            f"same calendar day. Further T+1 events on this symbol are "
+            f"silent; see the order audit trail for per-order reasons.",
+            UserWarning,
+        )
 
     def _calculate_slippage(
         self,
@@ -747,6 +854,8 @@ class Broker:
         self.total_orders = 0
         self.filled_orders = 0
         self.rejected_orders = 0
+        self._bought_today.clear()
+        self._t1_warned = False
 
     def get_stats(self) -> Dict:
         """Get broker statistics."""

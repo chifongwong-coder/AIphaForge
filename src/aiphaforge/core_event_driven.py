@@ -89,6 +89,8 @@ def run_event_driven(
             session_end_time=config.session_end_time,
             immediate_fill_price=config.immediate_fill_price,
             assigned_symbol=symbol,
+            settlement=resolve_config(
+                config.settlement, config.asset_settlements, symbol),
         )
         brokers[symbol].set_portfolio(portfolio)
 

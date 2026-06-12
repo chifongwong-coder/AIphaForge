@@ -12,7 +12,7 @@ single parameter: IMR=1.0 is cash-only (v0.7 behavior), IMR=0.5 is
 
 import warnings
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, Optional
 
 from .orders import OrderStatus
 
@@ -93,12 +93,29 @@ class MarginCallExitRule(BasePortfolioExitRule):
 
     def __init__(self, liquidation_strategy: str = "largest_first"):
         self.strategy = liquidation_strategy
-        self._pending_liquidations: Set[str] = set()
+        # symbol -> liquidation order id. Tracking the order id (not
+        # just the symbol) lets the dedup release symbols whose order
+        # terminated WITHOUT filling in full — e.g. a fill-time T+1
+        # rejection or clamp (v2.8.6) — so the residual position is
+        # re-liquidated while the margin call persists.
+        self._pending_liquidations: Dict[str, str] = {}
 
     def check_portfolio(self, portfolio, brokers, symbols, prices, ts):
         if not portfolio.is_margin_call:
             self._pending_liquidations.clear()
             return
+
+        # Release symbols whose liquidation order is terminal but not
+        # fully filled (REJECTED, EXPIRED, or a clamped
+        # PARTIALLY_EXPIRED whose residual still needs liquidation).
+        for sym in list(self._pending_liquidations):
+            broker = brokers.get(sym)
+            order = (broker.get_order(self._pending_liquidations[sym])
+                     if broker else None)
+            if order is None:
+                continue
+            if not order.is_active and order.filled_size < order.size:
+                del self._pending_liquidations[sym]
 
         positions = list(portfolio.positions.items())
         if self.strategy == "largest_first":
@@ -119,7 +136,7 @@ class MarginCallExitRule(BasePortfolioExitRule):
             order.metadata['estimated_price'] = prices.get(sym, 0)
             brokers[sym].submit_order(order, ts)
             if order.status != OrderStatus.REJECTED:
-                self._pending_liquidations.add(sym)
+                self._pending_liquidations[sym] = order.order_id
 
 
 # ---------------------------------------------------------------------------
