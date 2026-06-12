@@ -10,6 +10,75 @@ Releases prior to v2.8.1 are not documented here; consult the git history
 
 ## [Unreleased]
 
+## [2.8.6] - 2026-06-12
+
+### Headline — framework gap fixes (T+1 settlement, spread models)
+
+Closes the gaps surfaced by application-layer intraday usage. Core
+modules change at the source level, but every new capability is
+opt-in: default-configuration results are numerically identical to
+v2.8.5 (snapshot-pinned). Default-visible changes are limited to the
+`load_yahoo` bug fix, the annualization warning, and the `(approx)`
+label on vectorized cost lines.
+
+### Added
+
+- `settlement="t+1"` + `asset_settlements` on `BacktestEngine` /
+  `BacktestConfig` / `Broker`: SSE/SZSE-style same-day sell freeze,
+  enforced at fill time inside `Broker._execute_fill` for every fill
+  path (GTC, IOC/FOK direct, immediate orders). Oversized sells fill
+  the settled portion and expire the remainder (`t+1_settlement`);
+  FOK sells exceeding the settled quantity are killed outright.
+  Vectorized mode + any `"t+1"` raises (silent optimism refused).
+  First T+1 event per symbol emits one `UserWarning`.
+- `aiphaforge.spread` (new public module): `BaseSpreadModel`,
+  `FixedSpread(spread_bps)`, `VolatilitySpread(k, min_bps, max_bps)`.
+  Event-driven fills cross half the quoted spread per side;
+  `requires_volatility` models activate the rolling Parkinson vol
+  pipeline without needing an impact model (separate per-bar channel
+  with warmup-`None` semantics). Realized spread is side-signed and
+  post-clamp; reported via `Trade.spread_cost`,
+  `BacktestResult.total_spread`, and a `Total Spread` summary line
+  (event-driven only).
+- Vectorized cost path folds a global `FixedSpread`
+  (`DefaultTradeCost.half_spread_rate`, one half-spread per side,
+  applied even on the degenerate-notional branch); dynamic models and
+  per-asset overrides warn per run and are ignored.
+- `utils.infer_bars_per_year` + engine annualization-mismatch warning
+  (3x density band, suggests the inferred bars-per-year, never
+  auto-corrects).
+- `FundingRateModel(funding_rate_8h=..., bar_interval_seconds=...)`:
+  exact linear conversion of venue-quoted 8h funding rates; mutually
+  exclusive with `funding_rate_per_bar`; legacy usage unchanged.
+- README "Modeling Boundaries" section (session gaps, T+1
+  approximations, spread modeling choices, vectorized cost
+  approximation).
+
+### Fixed
+
+- `load_yahoo` crashed on yfinance >= 1.x (`'tuple' object has no
+  attribute 'lower'`): single-symbol MultiIndex columns are flattened
+  before lowercasing; the multi-symbol fallback no longer assumes
+  MultiIndex columns.
+- `MarginCallExitRule` dedup now tracks order ids and releases
+  symbols whose liquidation order terminated without filling in full
+  (fill-time rejections previously left the position stuck,
+  never re-liquidated, while the margin call persisted).
+
+### Changed
+
+- Vectorized summaries label `Total Commission` / `Total Slippage`
+  with `(approx)` via `result.metadata['cost_model']` (the
+  once-per-process warning drowns in parameter sweeps).
+- Limit/stop-limit fills are clamped to their limit price after all
+  price adjustments whenever a spread or impact model is configured
+  (previously the clamp only ran inside the impact branch; the
+  legacy slippage-only path is untouched, preserving default-config
+  results).
+- `Trade` gains a `spread_cost` field (appended last; default 0.0 —
+  positional construction unaffected); `gross_pnl` and `to_dict`
+  include it.
+
 ## [2.8.5] - 2026-05-25
 
 ### Headline — test hygiene + factor LOW patches
