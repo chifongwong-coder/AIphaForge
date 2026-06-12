@@ -107,8 +107,17 @@ independently of input shape.
 ### Costs & Fees
 - **Multi-market presets**: US stocks, China A-shares, crypto spot, crypto futures — `get_fee_model("china")`
 - **Slippage models**: Fixed, volume-based, volatility-based
+- **Bid-ask spread models** (v2.8.6): `FixedSpread(spread_bps)` and `VolatilitySpread(k, min_bps, max_bps)` — fills cross half the quoted spread per side, orthogonal to slippage and market impact. Event-driven honors any model; vectorized folds a global `FixedSpread` only
+- **T+1 settlement** (v2.8.6): `BacktestEngine(settlement="t+1")` blocks same-calendar-day sells of shares bought that day (SSE/SZSE cash-equity rule; event-driven only). Per-asset overrides via `asset_settlements`
 - **Lot sizes**: Per-asset minimum trade units (e.g., A-share 100-share lots)
 - **Corporate actions**: `CorporateActionHook` for dividends and stock splits
+
+### Modeling Boundaries
+Honest limits of the simulation — know them before trusting intraday results:
+- **Session gaps are adjacent bars**: rolling indicators and bar-by-bar simulation treat overnight and lunch-break gaps as consecutive bars. Fill prices remain realistic (gaps fill at the next open); the distortion is confined to rolling windows that span sessions. Session-aware rolling helpers are deliberately out of scope.
+- **T+1 approximations**: enforcement happens at fill time (a real broker rejects at order entry against the sellable quantity — fill-time checking is what handles resting GTC orders correctly); an oversized sell fills the settled portion and expires the remainder (approximating a trader who resizes to the sellable quantity, where a real broker would reject the whole ticket); calendar-date bucketing assumes no overnight sessions (valid for SSE/SZSE cash equities — instruments with night sessions are natively T+0). Rejected/expired orders are never auto-resubmitted; strategies and exit rules re-emit on their own schedule. `t+1` does not imply no-shorting — pass `allow_short=False` for cash A-share realism.
+- **Spread modeling choices**: passive limit fills pay (up to) the half-spread rather than earning it, clamped so a limit order never fills worse than its limit; with a spread or impact model configured, limit fills are clamped on the combined adjustment, so adding a spread model can *improve* limit fills (the with/without delta is not pure spread) and the recorded `slippage` cost stays pre-clamp. The default `slippage_pct` already crudely proxies spread-crossing — reduce it when adding an explicit spread model to avoid double-counting.
+- **Vectorized costs are linear estimates**: commission/slippage in vectorized summaries carry an `(approx)` label; per-trade attribution (including `Total Spread`) needs `mode="event_driven"`.
 
 ### Performance Analysis
 - **30+ metrics**: Sharpe, Sortino, Calmar, max drawdown, VaR, CVaR, profit factor, win rate, and more

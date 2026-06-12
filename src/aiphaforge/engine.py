@@ -105,6 +105,16 @@ class BacktestEngine:
     """
     Backtest engine supporting vectorized and event-driven execution modes.
 
+    Modeling boundary — session gaps: rolling indicators and the
+    bar-by-bar simulation treat overnight and lunch-break gaps as
+    adjacent bars. Fill prices stay realistic (gaps fill at the next
+    open); the distortion is confined to rolling windows spanning
+    sessions. For intraday realism see ``settlement="t+1"`` (fill-time
+    enforcement; clamp-and-expire approximates broker-side whole-order
+    rejection; pair with ``allow_short=False`` for cash A-share) and
+    the spread models in ``aiphaforge.spread`` (passive limit fills
+    pay up to the half-spread, never worse than their limit).
+
     Parameters:
         fee_model: Fee model instance.
         initial_capital: Starting capital.
