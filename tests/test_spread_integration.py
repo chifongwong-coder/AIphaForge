@@ -226,3 +226,75 @@ def test_partial_fill_spread_cost_uses_filled_size():
     broker.process_bar(bar, pd.Timestamp("2024-01-02 11:00"))
     assert order.filled_size == pytest.approx(40.0)
     assert order.metadata["spread_cost"] == pytest.approx(half * 40.0)
+
+
+# ---------------------------------------------------------------------------
+# Commit F — vectorized cost path
+# ---------------------------------------------------------------------------
+
+def _vectorized_run(spread_model=None, asset_spread_models=None):
+    import warnings as warnings_mod
+
+    data = make_ohlcv(60)
+    signals = pd.Series(0.0, index=data.index)
+    signals.iloc[0:30] = 1.0
+    engine = BacktestEngine(
+        mode="vectorized",
+        fee_model=ZeroFeeModel(),
+        spread_model=spread_model,
+        asset_spread_models=asset_spread_models,
+        representative_notional=95_000,
+    )
+    engine.set_signals(signals)
+    with warnings_mod.catch_warnings(record=True) as caught:
+        warnings_mod.simplefilter("always")
+        result = engine.run(data)
+    return result, caught
+
+
+def test_vectorized_fixed_spread_reduces_equity_by_bps():
+    # Exact fold identity at the DefaultTradeCost level: net returns
+    # drop by trade_notional * half_spread_rate / initial_capital.
+    from aiphaforge.costs import DefaultTradeCost
+
+    idx = pd.bdate_range("2024-01-01", periods=6)
+    returns = pd.Series([0.0, 0.01, -0.01, 0.0, 0.02, 0.0], index=idx)
+    positions = pd.Series([0.0, 1.0, 1.0, 0.0, 0.0, 0.0], index=idx)
+    data = pd.DataFrame({"close": [100.0] * 6}, index=idx)
+    capital = 100_000.0
+    rate = _HALF_FRAC
+
+    base = DefaultTradeCost().apply_vectorized(
+        returns, positions, data, ZeroFeeModel(), capital,
+        representative_notional=capital)
+    folded = DefaultTradeCost(half_spread_rate=rate).apply_vectorized(
+        returns, positions, data, ZeroFeeModel(), capital,
+        representative_notional=capital)
+    expected_cost = (
+        positions.diff().abs().fillna(0) * data["close"] * rate / capital)
+    pd.testing.assert_series_equal(base - folded, expected_cost)
+
+    # Engine-level sanity: folding a FixedSpread strictly reduces the
+    # final equity of a round-trip vectorized run.
+    no_spread, _ = _vectorized_run(spread_model=None)
+    with_spread, _ = _vectorized_run(spread_model=FixedSpread(_BPS))
+    assert (with_spread.equity_curve.iloc[-1]
+            < no_spread.equity_curve.iloc[-1])
+
+
+def test_vectorized_dynamic_spread_warns_and_ignored():
+    base, _ = _vectorized_run(spread_model=None)
+    result, caught = _vectorized_run(
+        spread_model=VolatilitySpread(k=0.1, min_bps=5))
+    messages = [str(w.message) for w in caught]
+    assert any("FixedSpread only" in m for m in messages)
+    pd.testing.assert_series_equal(result.equity_curve, base.equity_curve)
+
+
+def test_vectorized_asset_spread_overrides_warn_and_ignored():
+    base, _ = _vectorized_run(spread_model=None)
+    result, caught = _vectorized_run(
+        asset_spread_models={"X": FixedSpread(_BPS)})
+    messages = [str(w.message) for w in caught]
+    assert any("asset_spread_models" in m for m in messages)
+    pd.testing.assert_series_equal(result.equity_curve, base.equity_curve)

@@ -130,13 +130,22 @@ class DefaultTradeCost(BaseTradeCost):
         cost_normalization: Literal[
             "initial_capital", "current_equity"
         ] = "initial_capital",
+        half_spread_rate: float = 0.0,
     ):
         if cost_normalization not in ("initial_capital", "current_equity"):
             raise ValueError(
                 f"cost_normalization must be 'initial_capital' or "
                 f"'current_equity'; got {cost_normalization!r}"
             )
+        if half_spread_rate < 0:
+            raise ValueError(
+                f"half_spread_rate must be >= 0, got {half_spread_rate}")
         self.cost_normalization = cost_normalization
+        # v2.8.6: per-side spread fraction folded into the linear cost
+        # approximation (set by the engine from a global FixedSpread:
+        # spread_bps / 2 / 1e4 — one half-spread per fill, matching the
+        # event-driven path since trade_size counts each side).
+        self.half_spread_rate = half_spread_rate
 
     def apply_vectorized(
         self,
@@ -240,6 +249,17 @@ class DefaultTradeCost(BaseTradeCost):
                     UserWarning,
                     stacklevel=2,
                 )
+            # v2.8.6: spread is a pure rate on the ACTUAL trade
+            # notional — it needs no representative notional, so it
+            # still applies on the degenerate branch (when close data
+            # exists to price it).
+            if (self.half_spread_rate > 0
+                    and close is not None
+                    and np.isfinite(median_close)):
+                spread_cost = (
+                    trade_size * data["close"] * self.half_spread_rate)
+                return self._apply_normalized_cost(
+                    returns, spread_cost, initial_capital)
             return returns
 
         commission_rate = fee_model.estimate_commission_rate(
@@ -250,8 +270,19 @@ class DefaultTradeCost(BaseTradeCost):
 
         # Notional value of each trade (trade_size * price)
         trade_notional = trade_size * data["close"]
-        gross_cost = trade_notional * (commission_rate + slippage_rate)
+        gross_cost = trade_notional * (
+            commission_rate + slippage_rate + self.half_spread_rate)
 
+        return self._apply_normalized_cost(
+            returns, gross_cost, initial_capital)
+
+    def _apply_normalized_cost(
+        self,
+        returns: pd.Series,
+        gross_cost: pd.Series,
+        initial_capital: float,
+    ) -> pd.Series:
+        """Subtract dollar costs from returns per cost_normalization."""
         # v2.8.2 M5: cost_normalization dispatch.
         if self.cost_normalization == "current_equity":
             # Running equity from cumulative PRE-cost (gross) returns.

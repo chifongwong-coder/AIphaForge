@@ -1549,6 +1549,27 @@ class BacktestEngine:
                         "switch to mode='event_driven' to honor it."
                     )
 
+        # v2.8.6: spread models — standalone check, NOT part of
+        # _VECTORIZED_UNSUPPORTED_FIELDS: a global FixedSpread IS
+        # honored (folded into the linear cost approximation); only
+        # dynamic models and per-asset overrides are ignored.
+        from .spread import FixedSpread
+        if (self.spread_model is not None
+                and not isinstance(self.spread_model, FixedSpread)):
+            warnings.warn(
+                "vectorized mode folds FixedSpread only; "
+                f"spread_model={type(self.spread_model).__name__} is "
+                "ignored. Switch to mode='event_driven' for dynamic "
+                "spread models."
+            )
+        if self.asset_spread_models:
+            warnings.warn(
+                "vectorized mode cannot fold per-asset spread "
+                "overrides; asset_spread_models is ignored (the global "
+                "FixedSpread, if any, still folds). Switch to "
+                "mode='event_driven' to honor per-asset spreads."
+            )
+
     def _build_config(
         self,
         benchmark: Optional[pd.Series] = None,
@@ -1582,6 +1603,16 @@ class BacktestEngine:
         # cost estimation. User-passed engine kwargs win; otherwise
         # derive from the sizer.
         rep_notional, rep_size = self._resolve_representative_trade()
+
+        # v2.8.6: fold a global FixedSpread into the vectorized cost
+        # approximation (one half-spread per side). Assigned
+        # UNCONDITIONALLY on every call so a spread_model mutation
+        # between runs never leaves a stale rate on the shared
+        # DefaultTradeCost instance.
+        from .spread import FixedSpread
+        self._trade_cost.half_spread_rate = (
+            self.spread_model.spread_bps / 2.0 / 1e4
+            if isinstance(self.spread_model, FixedSpread) else 0.0)
 
         return BacktestConfig(
             initial_capital=self.initial_capital,
