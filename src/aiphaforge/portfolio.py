@@ -351,7 +351,8 @@ class Portfolio:
         price: float,
         timestamp: pd.Timestamp,
         commission: float = 0.0,
-        slippage: float = 0.0
+        slippage: float = 0.0,
+        spread_cost: float = 0.0,
     ) -> Optional[Trade]:
         """
         Update a position.
@@ -367,6 +368,10 @@ class Portfolio:
             timestamp: Timestamp.
             commission: Commission.
             slippage: Slippage cost.
+            spread_cost: Realized bid-ask spread (v2.8.6). Embedded in
+                ``price`` already, so it is allocated to trades for
+                reporting only — it never touches cash and is NOT part
+                of the fees subtracted from trade PnL.
 
         Returns:
             Optional[Trade]: Trade record if a (partial or full) close occurred.
@@ -406,6 +411,7 @@ class Portfolio:
                 'size': abs(size_change),
                 'entry_commission': commission,
                 'entry_slippage': slippage,
+                'entry_spread': spread_cost,
             }
 
         # --- Add-to-position (same direction) ---
@@ -432,6 +438,8 @@ class Portfolio:
             entry_info['size'] = abs(position.size)
             entry_info['entry_commission'] += commission
             entry_info['entry_slippage'] += slippage
+            entry_info['entry_spread'] = (
+                entry_info.get('entry_spread', 0.0) + spread_cost)
 
         elif is_reducing and symbol in self._pending_entries:
             entry_info = self._pending_entries[symbol]
@@ -439,19 +447,25 @@ class Portfolio:
             pending_size = entry_info['size']
 
             # Calculate proportional entry fees for the closed portion
+            entry_spread = entry_info.get('entry_spread', 0.0)
             if pending_size > 0:
                 if self.fee_allocation == "first_close":
                     alloc_entry_commission = entry_info['entry_commission']
                     alloc_entry_slippage = entry_info['entry_slippage']
+                    alloc_entry_spread = entry_spread
                 else:
                     # Proportional allocation
                     close_ratio = closed_qty / pending_size
                     alloc_entry_commission = entry_info['entry_commission'] * close_ratio
                     alloc_entry_slippage = entry_info['entry_slippage'] * close_ratio
+                    alloc_entry_spread = entry_spread * close_ratio
             else:
                 alloc_entry_commission = 0.0
                 alloc_entry_slippage = 0.0
+                alloc_entry_spread = 0.0
 
+            # Spread is price-embedded (already inside `realized`), so
+            # it is deliberately NOT part of total_fees.
             total_fees = commission + slippage + alloc_entry_commission + alloc_entry_slippage
 
             # Determine whether this is a full close, partial close, or reversal
@@ -473,6 +487,7 @@ class Portfolio:
                     commission=commission + alloc_entry_commission,
                     slippage_cost=slippage + alloc_entry_slippage,
                     reason="signal",
+                    spread_cost=spread_cost + alloc_entry_spread,
                 )
                 self.trade_history.append(trade)
 
@@ -493,6 +508,7 @@ class Portfolio:
                     commission=commission + alloc_entry_commission,
                     slippage_cost=slippage + alloc_entry_slippage,
                     reason="signal",
+                    spread_cost=spread_cost + alloc_entry_spread,
                 )
                 self.trade_history.append(trade)
 
@@ -501,9 +517,12 @@ class Portfolio:
                 if self.fee_allocation == "first_close":
                     entry_info['entry_commission'] = 0.0
                     entry_info['entry_slippage'] = 0.0
+                    entry_info['entry_spread'] = 0.0
                 else:
                     entry_info['entry_commission'] -= alloc_entry_commission
                     entry_info['entry_slippage'] -= alloc_entry_slippage
+                    entry_info['entry_spread'] = (
+                        entry_spread - alloc_entry_spread)
 
             else:
                 # --- Reversal (position crossed zero) ---
@@ -517,8 +536,10 @@ class Portfolio:
 
                 close_commission = commission * close_share
                 close_slippage = slippage * close_share
+                close_spread = spread_cost * close_share
                 new_entry_commission = commission * new_entry_share
                 new_entry_slippage = slippage * new_entry_share
+                new_entry_spread = spread_cost * new_entry_share
 
                 close_total_fees = close_commission + close_slippage + alloc_entry_commission + alloc_entry_slippage
 
@@ -538,6 +559,7 @@ class Portfolio:
                     commission=close_commission + alloc_entry_commission,
                     slippage_cost=close_slippage + alloc_entry_slippage,
                     reason="signal",
+                    spread_cost=close_spread + alloc_entry_spread,
                 )
                 self.trade_history.append(trade)
 
@@ -549,6 +571,7 @@ class Portfolio:
                     'size': abs(position.size),
                     'entry_commission': new_entry_commission,
                     'entry_slippage': new_entry_slippage,
+                    'entry_spread': new_entry_spread,
                 }
 
         return trade
@@ -581,7 +604,8 @@ class Portfolio:
             price=order.filled_price,
             timestamp=timestamp,
             commission=order.commission,
-            slippage=order.slippage
+            slippage=order.slippage,
+            spread_cost=order.metadata.get('spread_cost', 0.0),
         )
 
     # ========== Price Updates ==========

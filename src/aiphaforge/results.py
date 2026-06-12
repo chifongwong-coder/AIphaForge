@@ -79,6 +79,11 @@ class Trade:
     reason: str = "signal"
     holding_bars: int = 0
     metadata: Dict[str, Any] = field(default_factory=dict)
+    # v2.8.6: realized bid-ask spread. Embedded in the fill prices (so
+    # ``pnl`` already reflects it) and informational only — never
+    # cash-deducted, unlike slippage. Appended last to preserve
+    # positional construction.
+    spread_cost: float = 0.0
 
     def __post_init__(self):
         if self.direction not in (1, -1):
@@ -96,7 +101,8 @@ class Trade:
     @property
     def gross_pnl(self) -> float:
         """Gross P&L (before fees)."""
-        return self.pnl + self.commission + self.slippage_cost
+        return (self.pnl + self.commission + self.slippage_cost
+                + self.spread_cost)
 
     @property
     def is_winner(self) -> bool:
@@ -120,6 +126,7 @@ class Trade:
             'pnl_pct': self.pnl_pct,
             'commission': self.commission,
             'slippage_cost': self.slippage_cost,
+            'spread_cost': self.spread_cost,
             'reason': self.reason,
             'holding_bars': self.holding_bars,
             'net_pnl_pct': self.net_pnl_pct,
@@ -232,6 +239,11 @@ class BacktestResult:
         return sum(t.slippage_cost for t in self.trades)
 
     @property
+    def total_spread(self) -> float:
+        """Total realized bid-ask spread across trades (v2.8.6)."""
+        return sum(t.spread_cost for t in self.trades)
+
+    @property
     def sharpe_ratio(self) -> float:
         return self.metrics.get('sharpe_ratio', 0.0)
 
@@ -269,6 +281,7 @@ class BacktestResult:
             'win_rate': self.win_rate,
             'total_commission': self.total_commission,
             'total_slippage': self.total_slippage,
+            'total_spread': self.total_spread,
             'start_date': str(self.start_date) if self.start_date else None,
             'end_date': str(self.end_date) if self.end_date else None,
             'strategy_name': self.strategy_name,
@@ -320,6 +333,11 @@ class BacktestResult:
             flat_days = self.metrics.get('flat_days', 0)
             lines.append(f"  Win/Lose/Flat:   {win_days}/{lose_days}/{flat_days} days")
 
+        # v2.8.6: vectorized results carry an approximate-cost marker;
+        # the per-trade cost lines are linear estimates there.
+        approx = (" (approx)"
+                  if self.metadata.get("cost_model") == "vectorized_approx"
+                  else "")
         lines += [
             "",
             "[Trade Statistics]",
@@ -329,9 +347,16 @@ class BacktestResult:
             f"  Profit Factor:   {self.profit_factor:.2f}",
             "",
             "[Costs]",
-            f"  Total Commission: {self.total_commission:,.2f}",
-            f"  Total Slippage:   {self.total_slippage:,.2f}",
+            f"  Total Commission: {self.total_commission:,.2f}{approx}",
+            f"  Total Slippage:   {self.total_slippage:,.2f}{approx}",
         ]
+        # Total Spread appears only for event-driven runs with a spread
+        # model configured; in vectorized mode FixedSpread is folded
+        # into returns and not attributable per-trade, so the line is
+        # suppressed (a "0.00 (approx)" line would mislead).
+        if not approx and (self.total_spread
+                           or self.metadata.get("spread_model")):
+            lines.append(f"  Total Spread:     {self.total_spread:,.2f}")
 
         if self.benchmark_metrics is not None:
             bm_ret = self.benchmark_metrics.get('total_return', 0)

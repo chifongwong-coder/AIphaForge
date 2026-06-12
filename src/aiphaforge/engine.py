@@ -180,6 +180,8 @@ class BacktestEngine:
         representative_size: Optional[float] = None,
         settlement: str = "t+0",
         asset_settlements: Optional[Dict[str, str]] = None,
+        spread_model=None,
+        asset_spread_models: Optional[Dict] = None,
     ):
         # Fee model
         if isinstance(fee_model, str):
@@ -346,6 +348,13 @@ class BacktestEngine:
                 raise ValueError(
                     f"asset_settlements[{sym!r}] must be one of "
                     f"{_valid_settlements}, got {stl!r}")
+
+        # v2.8.6: bid-ask spread models (see spread.py). Event-driven
+        # honors any BaseSpreadModel; vectorized folds a global
+        # FixedSpread into the linear cost approximation and ignores
+        # everything else with a per-run warning.
+        self.spread_model = spread_model
+        self.asset_spread_models: Dict = asset_spread_models or {}
 
         # Custom benchmark config defaults
         self._config_benchmark: Optional[pd.Series] = None
@@ -1621,6 +1630,8 @@ class BacktestEngine:
             representative_size=rep_size,
             settlement=self.settlement,
             asset_settlements=self.asset_settlements,
+            spread_model=self.spread_model,
+            asset_spread_models=self.asset_spread_models,
         )
 
     def _resolve_representative_trade(self):
@@ -1730,6 +1741,15 @@ class BacktestEngine:
         # Attach MetaContext audit trail (v1.2)
         if 'meta_audit' in raw and raw['meta_audit']:
             result.metadata['meta_audit'] = raw['meta_audit']
+
+        # v2.8.6: record spread-model presence for event-driven
+        # summaries (vectorized suppresses the Total Spread line — the
+        # folded spread lives in returns, not per-trade costs).
+        if (self.mode == ExecutionMode.EVENT_DRIVEN
+                and (self.spread_model is not None
+                     or self.asset_spread_models)):
+            result.metadata['spread_model'] = repr(
+                self.spread_model or self.asset_spread_models)
 
         # Annualisation (v1.9.5). Multi-asset path overrides per_asset_trading_days
         # and populates per_asset_metrics after _build_result returns.

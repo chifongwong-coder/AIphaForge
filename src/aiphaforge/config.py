@@ -99,6 +99,11 @@ class BacktestConfig:
     # Event-driven only; the engine rejects "t+1" in vectorized mode.
     settlement: str = "t+0"
     asset_settlements: Dict[str, str] = field(default_factory=dict)
+    # v2.8.6: bid-ask spread models (BaseSpreadModel; typed Any to
+    # keep config import-light). Event-driven honors any model;
+    # vectorized folds a global FixedSpread only.
+    spread_model: Any = None
+    asset_spread_models: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

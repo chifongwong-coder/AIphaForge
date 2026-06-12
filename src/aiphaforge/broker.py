@@ -72,6 +72,7 @@ class Broker:
         immediate_fill_price: str = "close",
         assigned_symbol: Optional[str] = None,
         settlement: str = "t+0",
+        spread_model: Optional[object] = None,
     ):
         self.fee_model = fee_model or SimpleFeeModel()
         self.fill_model = fill_model
@@ -109,6 +110,15 @@ class Broker:
         # symbol -> (calendar_date, qty bought that date)
         self._bought_today: Dict[str, Tuple[date, float]] = {}
         self._t1_warned = False
+
+        # v2.8.6: bid-ask spread model (BaseSpreadModel or None).
+        # Buys fill at price + half_spread, sells at price - half.
+        # _vol_for_spread is the per-bar volatility channel for
+        # requires_volatility spread models — set by the event loop,
+        # None while the vol pipeline is inactive or warming up. It is
+        # separate from _volatility so the impact path stays untouched.
+        self.spread_model = spread_model
+        self._vol_for_spread: Optional[float] = None
 
         # Order management
         self.order_manager = OrderManager()
@@ -713,23 +723,59 @@ class Broker:
             adjusted_price = price - slippage / size if size > 0 else price
 
         # Apply market impact (v1.9.4)
-        if self._impact_model is not None and self._adv > 0:
+        impact_active = self._impact_model is not None and self._adv > 0
+        if impact_active:
             impact = self._impact_model.estimate_impact(
                 size, adjusted_price, self._adv, self._volatility)
             if order.is_buy:
                 adjusted_price *= (1 + impact)
             else:
                 adjusted_price *= (1 - impact)
-            # Clamp limit/stop-limit orders to their limit price
-            # (impact cannot make fills worse than the limit guarantee)
-            if order.order_type in (OrderType.LIMIT, OrderType.STOP_LIMIT):
-                if order.is_buy and order.price is not None:
-                    adjusted_price = min(adjusted_price, order.price)
-                elif not order.is_buy and order.price is not None:
-                    adjusted_price = max(adjusted_price, order.price)
+            # market_impact_bps keeps pre-clamp "modeled impact"
+            # semantics; spread_cost below is realized post-clamp.
             if 'market_impact_bps' not in order.metadata:
                 order.metadata['market_impact_bps'] = 0.0
             order.metadata['market_impact_bps'] += impact * 10000
+
+        # Apply bid-ask spread (v2.8.6): pre-spread price is the mid.
+        pre_spread_price = adjusted_price
+        half = 0.0
+        if self.spread_model is not None:
+            half = self.spread_model.half_spread(
+                pre_spread_price, self._vol_for_spread)
+            if order.is_buy:
+                adjusted_price = pre_spread_price + half
+            else:
+                adjusted_price = pre_spread_price - half
+
+        # Single limit-price clamp after all price adjustments ("a
+        # limit order never fills worse than its limit"). Gated so the
+        # legacy slippage-only path keeps its limit +/- slippage fills:
+        # clamping those unconditionally would change default results.
+        if ((self.spread_model is not None or impact_active)
+                and order.order_type in (OrderType.LIMIT,
+                                         OrderType.STOP_LIMIT)
+                and order.price is not None):
+            if order.is_buy:
+                adjusted_price = min(adjusted_price, order.price)
+            else:
+                adjusted_price = max(adjusted_price, order.price)
+
+        # Realized spread, post-clamp and side-signed: a binding clamp
+        # reduction of slippage/impact overshoot is NOT paid spread.
+        if self.spread_model is not None:
+            if order.is_buy:
+                realized_half = min(
+                    half, max(0.0, adjusted_price - pre_spread_price))
+            else:
+                realized_half = min(
+                    half, max(0.0, pre_spread_price - adjusted_price))
+            # Cumulative at the order level, mirroring order.commission
+            # semantics; embedded in the fill price ONLY (never
+            # cash-deducted, unlike slippage).
+            order.metadata['spread_cost'] = (
+                order.metadata.get('spread_cost', 0.0)
+                + realized_half * size)
 
         # Calculate commission
         commission = self.fee_model.calculate_commission(
