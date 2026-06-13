@@ -10,7 +10,7 @@ import pytest
 
 from aiphaforge.alpha.labels import forward_returns
 from aiphaforge.alpha.metrics import coverage, ic, rank_ic
-from aiphaforge.alpha.rank_stats import midranks, tie_corrected_spearman
+from aiphaforge.stats import midranks, tie_corrected_spearman
 
 
 def _wide(periods: int = 10, n_symbols: int = 5, seed: int = 0) -> pd.DataFrame:

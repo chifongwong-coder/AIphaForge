@@ -98,7 +98,6 @@ class TestReportCarriesWarning:
 
 class TestVersion:
     def test_version_is_current_release(self):
-        # Updated by v2.8.6 patch bump (framework gap fixes:
-        # T+1 settlement, spread models, loader/usability fixes).
+        # Updated by v2.9.0 (shared-primitives hoist to aiphaforge.stats).
         import aiphaforge
-        assert aiphaforge.__version__ == "2.8.6"
+        assert aiphaforge.__version__ == "2.9.0"

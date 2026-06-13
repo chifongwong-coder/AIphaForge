@@ -22,12 +22,11 @@ from typing import TYPE_CHECKING, Any, Iterable, Literal, Mapping, Optional
 
 import pandas as pd
 
-# `IntegrityCheckResult` is reused from probes.transforms — the
-# shape (passed: bool, errors: list[str]) is exactly what
-# is_conformant returns. Importing it at runtime is fine because
-# transforms.py uses TYPE_CHECKING for its calendar-side type hints
-# (no cycle).
-from aiphaforge.probes.transforms import IntegrityCheckResult
+# `IntegrityCheckResult` (shape: passed: bool, errors: list[str]) is
+# exactly what is_conformant returns. As of v2.9.0 it lives in the
+# neutral aiphaforge.stats module, so importing it here no longer
+# creates a calendars -> probes reverse dependency.
+from aiphaforge.stats import IntegrityCheckResult
 
 if TYPE_CHECKING:
     pass

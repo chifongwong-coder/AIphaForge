@@ -39,17 +39,20 @@ from typing import (
 import numpy as np
 import pandas as pd
 
-# Reuse the engine's existing OHLC-preserving block-bootstrap primitive.
-from aiphaforge.significance import (
+# OHLC-preserving block-bootstrap primitives + the integrity-check
+# result type live in the neutral aiphaforge.stats module (v2.9.0 hoist).
+from aiphaforge.stats import (
+    IntegrityCheckResult,
     _block_bootstrap_indices,
     _reconstruct_ohlcv,
 )
 
 if TYPE_CHECKING:
-    # Calendar types live in aiphaforge.calendars (v2.1). They are
-    # loaded lazily via TYPE_CHECKING because calendars/core.py
-    # imports IntegrityCheckResult from THIS module — avoiding a
-    # cyclic import at module-load time.
+    # Calendar types live in aiphaforge.calendars (v2.1), loaded lazily
+    # via TYPE_CHECKING to keep this module free of a runtime calendars
+    # import. (As of v2.9.0 IntegrityCheckResult lives in
+    # aiphaforge.stats, so calendars/core.py no longer imports from
+    # this module — the old reverse dependency is gone.)
     from aiphaforge.calendars.core import TradingCalendar
 
 # v2.8.1 H8: public surface lock.
@@ -908,14 +911,6 @@ _STAGE_ORDER: dict[TransformCategory, int] = {
     "level": 1,
     "series": 2,
 }
-
-
-@dataclass
-class IntegrityCheckResult:
-    """Outcome of running OHLC integrity checks on a transformed frame."""
-
-    passed: bool
-    errors: list[str]
 
 
 def validate_ohlcv_integrity(
