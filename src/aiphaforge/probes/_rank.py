@@ -29,6 +29,12 @@ from aiphaforge.probes.questions import (
     _make_question_id,
 )
 
+# Rank-correlation primitives now live in aiphaforge.stats (v2.9.0
+# hoist). Re-imported here so internal callers and the historical
+# ``from aiphaforge.probes._rank import midranks, tie_corrected_spearman``
+# path keep working; both stay in this module's ``__all__``.
+from aiphaforge.stats import midranks, tie_corrected_spearman  # noqa: F401
+
 if TYPE_CHECKING:
     from aiphaforge.probes.models import AnswerRecord
 
@@ -194,53 +200,8 @@ class RankCutoffSpec:
 
 
 # ---------- Spearman tie-corrected rho ----------
-
-
-def tie_corrected_spearman(
-    x_ranks: np.ndarray,
-    y_ranks: np.ndarray,
-) -> float:
-    """Compute the tie-corrected Spearman rho.
-
-    Uses the standard Kendall (1948) / Olds (1949) form, equivalent
-    to scipy's spearmanr under the hood. Matches scipy to ~1e-12.
-
-    Formula:
-      rho = ((N^3 - N) - 6*sum(d^2) - (T_x + T_y)/2)
-            / sqrt( ((N^3 - N) - T_x) * ((N^3 - N) - T_y) )
-
-    where T = sum_g (t_g^3 - t_g) over tie groups in each ranking.
-    """
-    n = len(x_ranks)
-    if n != len(y_ranks):
-        raise ValueError("rank arrays must have equal length")
-    if n < 2:
-        return 0.0
-
-    def _tie_term(ranks: np.ndarray) -> float:
-        # Count tie-group sizes by integer bucketing of mid-ranks.
-        # Mid-ranks of tied pairs share the same value.
-        unique, counts = np.unique(ranks, return_counts=True)
-        return float(
-            np.sum((counts.astype(float) ** 3) - counts.astype(float))
-        )
-
-    d = x_ranks.astype(float) - y_ranks.astype(float)
-    sum_d2 = float(np.sum(d ** 2))
-    n3_n = float(n ** 3 - n)
-    t_x = _tie_term(x_ranks)
-    t_y = _tie_term(y_ranks)
-    numerator = n3_n - 6.0 * sum_d2 - 0.5 * (t_x + t_y)
-    denom = math.sqrt(max((n3_n - t_x), 0.0) * max((n3_n - t_y), 0.0))
-    if denom == 0:
-        return 0.0
-    return numerator / denom
-
-
-def midranks(values: Sequence[float]) -> np.ndarray:
-    """Return mid-ranks of values (1-indexed, ties get average rank)."""
-    arr = np.asarray(values, dtype=float)
-    return pd.Series(arr).rank(method="average").to_numpy()
+# ``tie_corrected_spearman`` and ``midranks`` moved to aiphaforge.stats
+# (v2.9.0 hoist); imported above and re-exported via ``__all__``.
 
 
 # ---------- Null-quantile lookup ----------

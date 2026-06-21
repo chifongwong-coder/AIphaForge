@@ -46,6 +46,7 @@ from aiphaforge.probes._rank import (
     RankAnswer,
     RankContinuationProbe,
     RankCutoffSpec,
+    midranks,
     normalize_symbol,
     parse_rank_answer,
     resolve_rank_answer,
@@ -178,6 +179,7 @@ __all__ = [
     "sign_test_p",
     "tango_paired_diff_ci",  # v2.8.1: deprecation alias; v2.9 removes.
     "wald_paired_diff_ci",
+    "midranks",
     "score_rank_answer",
     "tie_corrected_spearman",
     "build_question_set",

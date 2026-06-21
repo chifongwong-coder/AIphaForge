@@ -9,7 +9,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from aiphaforge.alpha.rank_stats import midranks, tie_corrected_spearman
+from aiphaforge.stats import midranks, tie_corrected_spearman
 
 
 def _validate_columns(

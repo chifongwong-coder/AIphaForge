@@ -71,6 +71,8 @@ _LOCKED_MODULES = [
     "factor_strategy", "signal_strategy",
     # v2.8.6 — new public module, locked at introduction (1)
     "spread",
+    # v2.9.0 — neutral shared-primitives module (hoist), locked at introduction (1)
+    "stats",
 ]
 
 
