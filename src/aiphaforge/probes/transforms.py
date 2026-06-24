@@ -813,7 +813,7 @@ class BlockBootstrap:
     """Stationary block bootstrap of bars, reusing the engine's
     OHLC-reconstruction-aware primitive.
 
-    Delegates to ``aiphaforge.significance._block_bootstrap_indices``
+    Delegates to ``aiphaforge.stats._block_bootstrap_indices``
     + ``_reconstruct_ohlcv``.
 
     Anchoring property: the cumulative-product anchor is
