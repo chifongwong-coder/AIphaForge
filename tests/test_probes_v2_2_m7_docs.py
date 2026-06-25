@@ -98,6 +98,6 @@ class TestReportCarriesWarning:
 
 class TestVersion:
     def test_version_is_current_release(self):
-        # Updated by v2.9.0 (shared-primitives hoist to aiphaforge.stats).
+        # Updated by v2.9.1 (significance split into a subpackage).
         import aiphaforge
-        assert aiphaforge.__version__ == "2.9.0"
+        assert aiphaforge.__version__ == "2.9.1"
