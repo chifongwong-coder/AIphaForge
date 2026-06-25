@@ -119,7 +119,13 @@ def test_default_no_spread_snapshot_v2_8_5():
     signals.iloc[5:20] = 1.0
     signals.iloc[40:60] = 1.0
 
-    engine = BacktestEngine(mode="event_driven")  # all defaults
+    # resize_on_repeat_signal=True pins the legacy level-triggered fills
+    # this snapshot was captured under (v2.8.5). The v2.9.1.1 default is
+    # edge-triggered (repeated unchanged signals no longer re-rebalance);
+    # that new default is covered by tests/test_signal_edge_trigger.py.
+    # This snapshot remains the v2.8.5 broker-behavior regression guard.
+    engine = BacktestEngine(mode="event_driven",
+                            resize_on_repeat_signal=True)
     engine.set_signals(signals)
     result = engine.run(data)
 
