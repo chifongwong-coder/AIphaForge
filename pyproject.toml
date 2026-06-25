@@ -91,7 +91,13 @@ filterwarnings = [
 ]
 
 [tool.mypy]
-python_version = "3.10"
+# Analysis target is 3.12: recent NumPy ships PEP 695 ``type`` aliases in its
+# bundled stubs, which mypy rejects as a fatal syntax error when the target is
+# < 3.12 (this is a stub-parse error, not suppressible via follow-imports).
+# Runtime compatibility down to the 3.10 floor is covered by the pytest matrix
+# (3.10/3.11/3.12), not by this static-analysis target. The 138-error advisory
+# baseline is unchanged between the 3.10 and 3.12 targets.
+python_version = "3.12"
 warn_return_any = true
 warn_unused_configs = true
 # v2.8.4 M14: third-party stubs (older pandas, scipy, etc.) are not
