@@ -158,6 +158,10 @@ def run_event_driven(
                 f"for symbol '{sym}'."
             )
 
+    # v2.9.1.1: last signal value acted on per symbol, for edge-triggered
+    # signal processing (see config.resize_on_repeat_signal).
+    last_acted_signal: Dict[str, float] = {}
+
     # --- Initialize last known prices ---
     last_known: Dict[str, float] = {}
     for sym in symbols:
@@ -527,6 +531,21 @@ def run_event_driven(
                         raw_sig = config.signal_transform(raw_sig)
                         if pd.isna(raw_sig):
                             continue
+                    # v2.9.1.1: edge-triggered signals. A repeated, unchanged
+                    # NON-FLAT signal is a no-op (held, like NaN) rather than
+                    # re-rebalancing a moving FIXED_FRACTION target every bar.
+                    # Flat signals (0) are left level-triggered: flat is an
+                    # unambiguous fixed target (position 0), so repeating it
+                    # keeps retrying an unfilled close (e.g. a T+1-rejected
+                    # sell) and no-ops once already flat — neither churns.
+                    # resize_on_repeat_signal=True restores fully
+                    # level-triggered re-sizing.
+                    if not config.resize_on_repeat_signal \
+                            and abs(raw_sig) >= 1e-8:
+                        prev = last_acted_signal.get(sym)
+                        if prev is not None and abs(raw_sig - prev) <= 1e-9:
+                            continue
+                    last_acted_signal[sym] = raw_sig
                     current_signals[sym] = raw_sig
 
                 # Warn if hooks submitted orders AND signals are active

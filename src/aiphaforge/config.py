@@ -77,6 +77,12 @@ class BacktestConfig:
     # Signal (v0.9)
     signal_transform: Optional[Any] = None  # Callable[[float], float]
     is_weight_mode: bool = False
+    # v2.9.1.1: edge-triggered size-mode signals. When False (default), a
+    # non-NaN signal whose value is unchanged from the last acted signal for a
+    # symbol is a no-op (held, like NaN) instead of re-rebalancing a moving
+    # FIXED_FRACTION target every bar. True restores the legacy level-triggered
+    # behavior for callers who intentionally rebalance via repeated signals.
+    resize_on_repeat_signal: bool = False
     # Turnover (v0.9.1)
     turnover_config: Any = None  # TurnoverConfig
     # Risk rules (v1.1)
