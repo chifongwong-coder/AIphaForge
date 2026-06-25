@@ -189,6 +189,7 @@ class BacktestEngine:
         max_position_pct: float = 1.0,
         asset_max_position_pcts: Optional[Dict] = None,
         signal_transform=None,
+        resize_on_repeat_signal: bool = False,
         turnover_config=None,
         risk_rules=None,
         trailing_stop_rule=None,
@@ -286,6 +287,7 @@ class BacktestEngine:
             raise ValueError(f"lot_size must be an int >= 1, got {lot_size!r}")
         self.lot_size = lot_size
         self.signal_transform = signal_transform
+        self.resize_on_repeat_signal = resize_on_repeat_signal
         self.turnover_config = turnover_config
         self.risk_rules = risk_rules
         self.trailing_stop_rule = trailing_stop_rule
@@ -1717,6 +1719,7 @@ class BacktestEngine:
             max_position_pct=self.max_position_pct,
             asset_max_position_pcts=self.asset_max_position_pcts,
             signal_transform=self.signal_transform,
+            resize_on_repeat_signal=self.resize_on_repeat_signal,
             turnover_config=self.turnover_config,
             risk_rules=self.risk_rules,
             trailing_stop_rule=self.trailing_stop_rule,
